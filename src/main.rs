@@ -1,20 +1,31 @@
 use chess::{
-    Board, ChessMove, Color, File, GameResult, MoveGen, Piece, Rank, Square, BitBoard,
+    Board, ChessMove, Color, File, GameResult, MoveGen, Piece, Rank, Square, BitBoard, BoardStatus,
 };
 use rand::Rng;
 use std::collections::HashMap;
 use std::time::Instant;
 use std::sync::Mutex;
 use lazy_static::lazy_static;
-const MAX_DEPTH: usize = 20;
+const MAX_DEPTH: usize = 40;
 const TIME_LIMIT: f64 = 5.0;
 const ASPIRATION_WINDOW: i32 = 30;
-const LATE_MOVE_PRUNING_THRESHOLD: usize = 8;
-const FUTILITY_MARGIN_DEPTH1: i32 = 300;
-const FUTILITY_MARGIN_DEPTH2: i32 = 500;
 const DELTA_MARGIN: i32 = 200;
 const STATS: bool = true;
 const CONTEMPT: i32 = 25;
+const LMR_FULL_DEPTH_MOVES: usize = 4;
+const LMR_REDUCTION_LIMIT: usize = 3;
+const NULL_MOVE_DEPTH: usize = 3;
+const IID_DEPTH: usize = 4;
+const RAZOR_DEPTH: usize = 4;
+const RAZOR_MARGIN: i32 = 400;
+const REVERSE_FUTILITY_DEPTH: usize = 6;
+const REVERSE_FUTILITY_MARGIN: i32 = 120;
+const FUTILITY_DEPTH: usize = 4;
+const FUTILITY_MARGINS: [i32; 5] = [0, 200, 400, 600, 800];
+const LMP_DEPTH: usize = 4;
+const LMP_MOVE_COUNTS: [usize; 5] = [0, 3, 6, 12, 18];
+const SEE_QUIET_THRESHOLD: i32 = -60;
+const SEE_CAPTURE_THRESHOLD: i32 = -100;
 lazy_static! {
     static ref VALUES: HashMap<Piece, i32> = {
         let mut m = HashMap::new();
@@ -1126,35 +1137,6 @@ fn evaluate_pawn_structure(board: &Board) -> i32 {
         score
     }
 }
-
-fn is_passed_pawn(board: &Board, square: Square, color: Color) -> bool {
-    let file = square.get_file();
-    let rank_idx = square.get_rank() as usize;
-    let enemy_color = !color;
-    let enemy_pawns_bb = *board.pieces(Piece::Pawn) & board.color_combined(enemy_color);
-    if color == Color::White {
-        for r in (rank_idx + 1)..8 {
-            for f in std::cmp::max(0, file as i32 - 1)..=std::cmp::min(7, file as i32 + 1) {
-                let sq = Square::make_square(Rank::from_index(r), File::from_index(f as usize));
-                if (enemy_pawns_bb & BitBoard::from_square(sq)) != BitBoard(0) { // Use != BitBoard(0)
-                    return false;
-                }
-            }
-        }
-        true
-    } else {
-        for r in (0..rank_idx).rev() {
-            for f in std::cmp::max(0, file as i32 - 1)..=std::cmp::min(7, file as i32 + 1) {
-                let sq = Square::make_square(Rank::from_index(r), File::from_index(f as usize));
-                if (enemy_pawns_bb & BitBoard::from_square(sq)) != BitBoard(0) { // Use != BitBoard(0)
-                    return false;
-                }
-            }
-        }
-        true
-    }
-}
-
 const EVAL_CACHE_MAX: usize = 20000;
 fn evaluate(board: &Board) -> i32 {
     let key = board.to_string();
@@ -1256,24 +1238,30 @@ fn evaluate(board: &Board) -> i32 {
 fn order_moves(board: &Board, moves: Vec<ChessMove>, hash_move: Option<ChessMove>, depth: usize) -> Vec<ChessMove> {
     let mut scored_moves: Vec<(ChessMove, i32)> = moves.into_iter().map(|mv| {
         let score = if Some(mv) == hash_move {
-            30000
+            1000000
         } else if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
             let see_value = see(board, mv);
             if see_value >= 0 {
-                20000 + see_value
+                900000 + see_value
             } else {
-                5000 + see_value
+                100000 + see_value
             }
         } else {
             let new_board = board.make_move_new(mv);
-            if *new_board.checkers() != BitBoard(0) { // Use != BitBoard(0)
-                15000
+            if *new_board.checkers() != BitBoard(0) {
+                800000
             } else {
                 let history = HISTORY_HEURISTIC.lock().unwrap();
                 if depth < 64 {
                     let killers = KILLER_MOVES.lock().unwrap();
-                    if killers.len() > depth && killers[depth].contains(&mv) {
-                        10000
+                    if killers.len() > depth {
+                        if killers[depth].len() > 0 && killers[depth][0] == mv {
+                            700000
+                        } else if killers[depth].len() > 1 && killers[depth][1] == mv {
+                            600000
+                        } else {
+                            *history.get(&mv).unwrap_or(&0)
+                        }
                     } else {
                         *history.get(&mv).unwrap_or(&0)
                     }
@@ -1287,228 +1275,297 @@ fn order_moves(board: &Board, moves: Vec<ChessMove>, hash_move: Option<ChessMove
     scored_moves.sort_by(|a, b| b.1.cmp(&a.1));
     scored_moves.into_iter().map(|(mv, _)| mv).collect()
 }
+
 fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats: &mut HashMap<&str, usize>, root_color: Color) -> i32 {
     *stats.entry("nodes").or_insert(0) += 1;
     *stats.entry("qnodes").or_insert(0) += 1;
+    
     if start_time.elapsed().as_secs_f64() > TIME_LIMIT {
         return alpha;
     }
+    
     let stand_pat = evaluate(board);
+    
     if stand_pat >= beta {
         return beta;
     }
+    
+    let big_delta = 900;
+    if stand_pat < alpha - big_delta {
+        return alpha;
+    }
+    
     if stand_pat > alpha {
         alpha = stand_pat;
     }
+    
     let mut captures = Vec::new();
     let movegen = MoveGen::new_legal(board);
+    
     for mv in movegen {
         if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
             let see_value = see(board, mv);
-            if see_value >= -50 {
+            if see_value >= SEE_CAPTURE_THRESHOLD || mv.get_promotion().is_some() {
                 captures.push((mv, see_value));
             }
         }
     }
+    
     captures.sort_by(|a, b| b.1.cmp(&a.1));
+    
     for (mv, see_value) in captures {
         if stand_pat + see_value + DELTA_MARGIN < alpha {
             continue;
         }
+        
         let new_board = board.make_move_new(mv);
         let score = -quiesce(&new_board, -beta, -alpha, start_time, stats, root_color);
+        
         if score >= beta {
             return beta;
         }
+        
         if score > alpha {
             alpha = score;
         }
     }
+    
     alpha
 }
-fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: Instant, ply: usize, stats: &mut HashMap<&str, usize>, root_color: Color, tt: &mut TranspositionTable) -> i32 {
+
+fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_time: Instant, ply: usize, stats: &mut HashMap<&str, usize>, root_color: Color, tt: &mut TranspositionTable) -> i32 {
+    let is_pv = beta - alpha > 1;
+    let is_root = ply == 0;
+    
     *stats.entry("nodes").or_insert(0) += 1;
+    
     if start_time.elapsed().as_secs_f64() > TIME_LIMIT {
         return alpha;
     }
-    let is_checkmate = (*board.checkers() != BitBoard(0)) && { // Use != BitBoard(0)
-        let mut moves = MoveGen::new_legal(board);
-        moves.next().is_none()
-    };
-    if is_checkmate {
-        return -30000 + ply as i32;
-    }
-    let is_stalemate = *board.checkers() == BitBoard(0) && { // Use == BitBoard(0)
-        let mut moves = MoveGen::new_legal(board);
-        moves.next().is_none()
-    };
-    if is_stalemate {
-        if board.side_to_move() == root_color {
-            return -CONTEMPT;
-        } else {
-            return CONTEMPT;
+    
+    if ply > 0 {
+        if board.status() == BoardStatus::Checkmate {
+            return -30000 + ply as i32;
+        }
+        
+        if board.status() == BoardStatus::Stalemate {
+            return if board.side_to_move() == root_color { -CONTEMPT } else { CONTEMPT };
+        }
+        
+        alpha = alpha.max(-30000 + ply as i32);
+        beta = beta.min(30000 - ply as i32 - 1);
+        
+        if alpha >= beta {
+            return alpha;
         }
     }
+    
     let board_hash = compute_zobrist_hash(board);
+    let mut hash_move = None;
+    
     if let Some(tt_value) = tt.get(board_hash, depth, alpha, beta) {
         *stats.entry("tt_hits").or_insert(0) += 1;
-        return tt_value;
+        if !is_pv || (tt_value <= alpha || tt_value >= beta) {
+            return tt_value;
+        }
     }
-    let static_eval = if depth <= 2 && *board.checkers() == BitBoard(0) { // Use == BitBoard(0)
-        Some(evaluate(board))
-    } else {
-        None
-    };
-    if depth >= 3 &&
-       *board.checkers() == BitBoard(0) &&
-       (board.combined() & board.color_combined(board.side_to_move())).0 !=
-       ((board.pieces(Piece::King) | board.pieces(Piece::Pawn)) & board.color_combined(board.side_to_move())).0 &&
-       static_eval.is_some() && static_eval.unwrap() >= beta
-    {
-        let eval_for_reduction = static_eval.unwrap();
-        let r_value = (3 + depth / 4 + std::cmp::min(3, ((eval_for_reduction - beta) / 200) as usize)).min(depth);
-        let r = r_value;
-
+    
+    hash_move = tt.get_move(board_hash);
+    
+    let in_check = *board.checkers() != BitBoard(0);
+    let static_eval = if in_check { -30000 + ply as i32 } else { evaluate(board) };
+    
+    if depth == 0 {
+        return quiesce(board, alpha, beta, start_time, stats, root_color);
+    }
+    
+    let improving = !in_check && ply >= 2;
+    
+    if !is_pv && !in_check {
+        if depth <= RAZOR_DEPTH && static_eval + RAZOR_MARGIN < alpha {
+            let razor_alpha = alpha - RAZOR_MARGIN;
+            let razor_score = quiesce(board, razor_alpha, razor_alpha + 1, start_time, stats, root_color);
+            if razor_score <= razor_alpha {
+                return razor_score;
+            }
+        }
         
-        if let Some(null_board) = board.null_move() {
-            let r_depth = depth.saturating_sub(r);
-            let null_score = -negamax(
-                &null_board,
-                r_depth,
-                -beta,
-                -beta + 1,
-                start_time,
-                ply + 1,
-                stats,
-                root_color,
-                tt,
-            );
-
-            if null_score >= beta {
-                let verification_depth = (depth - r).saturating_sub(1);
+        if depth <= REVERSE_FUTILITY_DEPTH && static_eval - REVERSE_FUTILITY_MARGIN * depth as i32 >= beta {
+            return static_eval;
+        }
+        
+        if depth >= NULL_MOVE_DEPTH && static_eval >= beta {
+            let has_non_pawn_pieces = (board.combined() & board.color_combined(board.side_to_move())).0 !=
+                ((board.pieces(Piece::King) | board.pieces(Piece::Pawn)) & board.color_combined(board.side_to_move())).0;
                 
-                let should_verify = verification_depth > 0 && (depth >= 12 || eval_for_reduction - beta > 200);
-
-                if should_verify {
-                    let verification_score = negamax(
-                        board,
-                        verification_depth,
-                        beta - 1,
-                        beta,
+            if has_non_pawn_pieces {
+                let r = 3 + depth / 4 + ((static_eval - beta) / 200).min(3) as usize;
+                
+                if let Some(null_board) = board.null_move() {
+                    let null_score = -negamax(
+                        &null_board,
+                        depth.saturating_sub(r),
+                        -beta,
+                        -beta + 1,
                         start_time,
-                        ply,
+                        ply + 1,
                         stats,
                         root_color,
                         tt,
                     );
-                    if verification_score >= beta {
-                        tt.store(board_hash, depth, beta, TTFlag::Lower, None);
-                        return beta;
+                    
+                    if null_score >= beta {
+                        if depth < 12 {
+                            return null_score;
+                        }
+                        
+                        let verification_depth = depth.saturating_sub(r + 1);
+                        let verification_score = negamax(
+                            board,
+                            verification_depth,
+                            beta - 1,
+                            beta,
+                            start_time,
+                            ply,
+                            stats,
+                            root_color,
+                            tt,
+                        );
+                        
+                        if verification_score >= beta {
+                            return null_score;
+                        }
                     }
-                } else {
-                    tt.store(board_hash, depth, beta, TTFlag::Lower, None);
-                    return beta;
                 }
             }
         }
-        // No need for an else branch here, as None from null_move() means NMP cannot be applied,
-        // and we simply continue with the normal search.
-    }   
-    if depth == 0 {
-        return quiesce(board, alpha, beta, start_time, stats, root_color);
     }
+    
+    if is_pv && depth >= IID_DEPTH && hash_move.is_none() {
+        negamax(board, depth - 2, alpha, beta, start_time, ply, stats, root_color, tt);
+        hash_move = tt.get_move(board_hash);
+    }
+    
     let alpha_orig = alpha;
-    let hash_move = tt.get_move(board_hash);
     let mut moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
+    
     if moves.is_empty() {
-        return if *board.checkers() != BitBoard(0) { -30000 + ply as i32 } else { 0 }; // Use != BitBoard(0)
+        return if in_check { -30000 + ply as i32 } else { 0 };
     }
+    
     moves = order_moves(board, moves, hash_move, ply);
+    
     let mut best_value = -31000;
     let mut best_move = None;
+    let mut moves_searched = 0;
     
     for (i, mv) in moves.iter().enumerate() {
-        if depth <= 2 && static_eval.is_some() && i > 0 && *board.checkers() == BitBoard(0) && // Use == BitBoard(0)
-           board.piece_on(mv.get_dest()).is_none() && mv.get_promotion().is_none() {
-            let new_board = board.make_move_new(*mv);
-            if *new_board.checkers() == BitBoard(0) { // Use == BitBoard(0)
-                if depth == 1 {
-                    if static_eval.unwrap() + FUTILITY_MARGIN_DEPTH1 < alpha {
-                        continue;
-                    }
-                } else if depth == 2 {
-                    if static_eval.unwrap() + FUTILITY_MARGIN_DEPTH2 < alpha {
-                        continue;
-                    }
-                }
-            }
-        }
-        if depth >= 2 && i >= LATE_MOVE_PRUNING_THRESHOLD && *board.checkers() == BitBoard(0) && // Use == BitBoard(0)
-           board.piece_on(mv.get_dest()).is_none() && mv.get_promotion().is_none() {
-            let new_board = board.make_move_new(*mv);
-            if *new_board.checkers() == BitBoard(0) { // Use == BitBoard(0)
+        let is_quiet = board.piece_on(mv.get_dest()).is_none() && mv.get_promotion().is_none();
+        
+        if !is_pv && !in_check && is_quiet && depth <= FUTILITY_DEPTH && i > 0 {
+            let futility_value = static_eval + FUTILITY_MARGINS[depth.min(4)] + 200;
+            if futility_value <= alpha {
                 continue;
             }
         }
+        
+        if !is_pv && depth <= LMP_DEPTH && is_quiet && i >= LMP_MOVE_COUNTS[depth.min(4)] {
+            continue;
+        }
+        
+        if depth >= 4 && !is_pv && is_quiet && i >= 3 {
+            let see_value = see(board, *mv);
+            if see_value < SEE_QUIET_THRESHOLD {
+                continue;
+            }
+        }
+        
         let new_board = board.make_move_new(*mv);
-        let mut reduction = 0;
+        let gives_check = *new_board.checkers() != BitBoard(0);
+        
         let mut extension = 0;
-        if let Some(piece) = new_board.piece_on(mv.get_dest()) {
-            if piece == Piece::Pawn && board.piece_on(mv.get_dest()).is_none() && mv.get_promotion().is_none() {
-                let piece_color = if (*new_board.color_combined(Color::White) & BitBoard::from_square(mv.get_dest())) != BitBoard(0) { // Use != BitBoard(0)
-                    Color::White
-                } else {
-                    Color::Black
-                };
-                if is_passed_pawn(&new_board, mv.get_dest(), piece_color) {
-                    extension = 1;
-                }
+        if gives_check {
+            extension = 1;
+        } else if let Some(piece) = board.piece_on(mv.get_source()) {
+            if piece == Piece::Pawn && (mv.get_dest().get_rank() == Rank::Eighth || mv.get_dest().get_rank() == Rank::First) {
+                extension = 1;
             }
         }
-        if depth >= 3 && i >= 4 && *new_board.checkers() == BitBoard(0) && // Use == BitBoard(0)
-           board.piece_on(mv.get_dest()).is_none() && mv.get_promotion().is_none() {
-            reduction = std::cmp::min((depth as i32) / 3, 2) as usize;
+        
+        let mut new_depth = depth - 1 + extension;
+        let mut do_full_search = true;
+        
+        if depth >= 3 && i >= LMR_FULL_DEPTH_MOVES && is_quiet && !gives_check {
+            let mut r = 1;
+            if i >= 6 { r += 1; }
+            if i >= 12 { r += 1; }
+            if !improving { r += 1; }
+            
+            r = r.min(LMR_REDUCTION_LIMIT).min(new_depth);
+            
+            new_depth = new_depth.saturating_sub(r);
+            do_full_search = false;
         }
-        let score = if i == 0 {
-            -negamax(&new_board, depth - 1 + extension, -beta, -alpha, start_time, ply + 1, stats, root_color, tt)
+        
+        let mut score = if i == 0 {
+            -negamax(&new_board, new_depth, -beta, -alpha, start_time, ply + 1, stats, root_color, tt)
         } else {
-            let mut score = -negamax(&new_board, depth - 1 - reduction + extension, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt);
-            if score > alpha && reduction > 0 {
-                score = -negamax(&new_board, depth - 1 + extension, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt);
+            let mut search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt);
+            
+            if !do_full_search && search_score > alpha {
+                new_depth = depth - 1 + extension;
+                search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt);
             }
-            if score > alpha && score < beta {
-                score = -negamax(&new_board, depth - 1 + extension, -beta, -alpha, start_time, ply + 1, stats, root_color, tt);
+            
+            if is_pv && search_score > alpha && search_score < beta {
+                search_score = -negamax(&new_board, new_depth, -beta, -alpha, start_time, ply + 1, stats, root_color, tt);
             }
-            score
+            
+            search_score
         };
+        
+        moves_searched += 1;
+        
         if score > best_value {
             best_value = score;
             best_move = Some(*mv);
         }
+        
         if score > alpha {
             alpha = score;
-            if board.piece_on(mv.get_dest()).is_none() && mv.get_promotion().is_none() {
+            
+            if is_quiet {
                 {
                     let mut killers = KILLER_MOVES.lock().unwrap();
                     if ply < 64 && killers.len() > ply {
-                        if !killers[ply].contains(mv) {
-                            killers[ply].insert(0, *mv);
-                            if killers[ply].len() > 2 {
-                                killers[ply].pop();
+                        if killers[ply].is_empty() || killers[ply][0] != *mv {
+                            if killers[ply].len() >= 2 {
+                                killers[ply][1] = killers[ply][0];
+                            } else if killers[ply].len() == 1 {
+                                let first_killer = killers[ply][0];  // Store the value first
+                                killers[ply].push(first_killer);     // Then use it
+                            }
+                            if killers[ply].is_empty() {
+                                killers[ply].push(*mv);
+                            } else {
+                                killers[ply][0] = *mv;
                             }
                         }
                     }
                 }
+                
                 {
                     let mut history = HISTORY_HEURISTIC.lock().unwrap();
                     *history.entry(*mv).or_insert(0) += (depth * depth) as i32;
                 }
             }
         }
+        
         if alpha >= beta {
             break;
         }
     }
+    
     let flag = if best_value <= alpha_orig {
         TTFlag::Upper
     } else if best_value >= beta {
@@ -1516,23 +1573,33 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
     } else {
         TTFlag::Exact
     };
+    
     tt.store(board_hash, depth, best_value, flag, best_move);
+    
     best_value
 }
+
 fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
     let start_time = Instant::now();
     let mut best_move = None;
     let mut best_score = 0;
     let root_color = board.side_to_move();
+    
     {
         let mut killers = KILLER_MOVES.lock().unwrap();
         killers.clear();
         killers.resize(MAX_DEPTH, Vec::new());
     }
+    
+    {
+        let mut history = HISTORY_HEURISTIC.lock().unwrap();
+        history.clear();
+    }
+    
     let movegen = MoveGen::new_legal(board);
     for mv in movegen {
         let new_board = board.make_move_new(mv);
-        let is_checkmate = (*new_board.checkers() != BitBoard(0)) && { // Use != BitBoard(0)
+        let is_checkmate = (*new_board.checkers() != BitBoard(0)) && {
             let mut moves = MoveGen::new_legal(&new_board);
             moves.next().is_none()
         };
@@ -1540,28 +1607,46 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
             return Some(mv);
         }
     }
-    let mut tt = TranspositionTable::new(128);
+    
+    let mut tt = TranspositionTable::new(1024);
+    
     for depth in 1..=MAX_DEPTH {
         if start_time.elapsed().as_secs_f64() > max_time * 0.85 {
             break;
         }
+        
         let mut stats: HashMap<&str, usize> = HashMap::new();
         let start_depth_time = Instant::now();
-        let (alpha, beta) = if depth <= 3 {
+        
+        let (mut alpha, mut beta) = if depth <= 4 {
             (-31000, 31000)
         } else {
             (best_score - ASPIRATION_WINDOW, best_score + ASPIRATION_WINDOW)
         };
+        
+        let mut aspirations_failed = 0;
         let mut found = false;
-        for _attempt in 0..4 {
+        
+        loop {
             let score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut tt);
+            
+            // Check if we've run out of time during search
+            if start_time.elapsed().as_secs_f64() > max_time * 0.95 {
+                break;
+            }
+            
             if score <= alpha {
+                let multiplier = (aspirations_failed + 1).min(4) as i32;
+                alpha = alpha.saturating_sub(ASPIRATION_WINDOW * multiplier).max(-31000);
+                aspirations_failed += 1;
             } else if score >= beta {
+                let multiplier = (aspirations_failed + 1).min(4) as i32;
+                beta = beta.saturating_add(ASPIRATION_WINDOW * multiplier).min(31000);
+                aspirations_failed += 1;
             } else {
                 best_score = score;
                 let board_hash = compute_zobrist_hash(board);
-                let move_ = tt.get_move(board_hash);
-                if let Some(mv) = move_ {
+                if let Some(mv) = tt.get_move(board_hash) {
                     let movegen = MoveGen::new_legal(board);
                     if movegen.into_iter().any(|legal_move| legal_move == mv) {
                         best_move = Some(mv);
@@ -1570,19 +1655,34 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                 found = true;
                 break;
             }
+            
+            if aspirations_failed > 4 {
+                alpha = -31000;
+                beta = 31000;
+                // Force a final search with full window
+                let final_score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut tt);
+                best_score = final_score;
+                let board_hash = compute_zobrist_hash(board);
+                if let Some(mv) = tt.get_move(board_hash) {
+                    let movegen = MoveGen::new_legal(board);
+                    if movegen.into_iter().any(|legal_move| legal_move == mv) {
+                        best_move = Some(mv);
+                    }
+                }
+                break;
+            }
         }
-        if !found {
-        }
+        
         if best_score.abs() > 29000 {
             break;
         }
+        
         if STATS {
             let mut pv = Vec::new();
             let mut temp_board = *board;
             for _ in 0..depth {
                 let h = compute_zobrist_hash(&temp_board);
-                let move_ = tt.get_move(h);
-                if let Some(mv) = move_ {
+                if let Some(mv) = tt.get_move(h) {
                     let movegen = MoveGen::new_legal(&temp_board);
                     if movegen.into_iter().any(|legal_move| legal_move == mv) {
                         pv.push(mv);
@@ -1594,11 +1694,13 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                     break;
                 }
             }
+            
             let depth_time = start_depth_time.elapsed().as_secs_f64();
             let nodes = *stats.get("nodes").unwrap_or(&0);
             let qnodes = *stats.get("qnodes").unwrap_or(&0);
             let tt_hits = *stats.get("tt_hits").unwrap_or(&0);
             let nps = if depth_time > 0.0 { (nodes as f64 / depth_time) as usize } else { 0 };
+            
             println!(
                 "Depth: {}, Score: {}, Time: {:.2}s, Nodes: {}, QNodes: {}, TThits: {}, NPS: {}, PV: {}",
                 depth,
@@ -1612,6 +1714,7 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
             );
         }
     }
+    
     best_move.or_else(|| {
         let moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
         if moves.is_empty() {
