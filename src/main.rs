@@ -213,6 +213,7 @@ lazy_static! {
     static ref MATERIAL_HASH_TABLE: Mutex<MaterialHashTable> = Mutex::new(MaterialHashTable::new(16));
     static ref KILLER_MOVES: Mutex<Vec<Vec<ChessMove>>> = Mutex::new(Vec::new());
     static ref HISTORY_HEURISTIC: Mutex<HashMap<ChessMove, i32>> = Mutex::new(HashMap::new());
+    static ref TRANSPOSITION_TABLE: Mutex<TranspositionTable> = Mutex::new(TranspositionTable::new(1024));
 }
 struct TranspositionTable {
     table: HashMap<u64, TTEntry>,
@@ -533,14 +534,14 @@ fn evaluate_pawn_structure(board: &Board) -> i32 {
                 for adj_file_idx in [(file_idx as i32 - 1), (file_idx as i32 + 1)] {
                     if adj_file_idx >= 0 && adj_file_idx < 8 {
                         let adj_file = File::from_index(adj_file_idx as usize);
-                        for check_rank in 0..rank_idx {
-                            let check_sq = Square::make_square(Rank::from_index(check_rank), adj_file);
-                            if (white_pawns_bb & BitBoard::from_square(check_sq)) != BitBoard(0) {
+                        for r in 0..rank_idx {
+                            let adj_sq = Square::make_square(Rank::from_index(r), adj_file);
+                            if (white_pawns_bb & BitBoard::from_square(adj_sq)) != BitBoard(0) {
                                 is_black_hole = false;
                             }
                         }
-                        for check_rank in (rank_idx + 1)..8 {
-                            let check_sq = Square::make_square(Rank::from_index(check_rank), adj_file);
+                        for r in (rank_idx + 1)..8 {
+                            let check_sq = Square::make_square(Rank::from_index(r), adj_file);
                             if (black_pawns_bb & BitBoard::from_square(check_sq)) != BitBoard(0) {
                                 is_white_hole = false;
                             }
@@ -1608,7 +1609,8 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
         }
     }
     
-    let mut tt = TranspositionTable::new(1024);
+    // use the single global transposition table
+    let mut tt_guard = TRANSPOSITION_TABLE.lock().unwrap();
     
     for depth in 1..=MAX_DEPTH {
         if start_time.elapsed().as_secs_f64() > max_time * 0.85 {
@@ -1628,7 +1630,7 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
         let mut found = false;
         
         loop {
-            let score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut tt);
+            let score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut *tt_guard);
             
             // Check if we've run out of time during search
             if start_time.elapsed().as_secs_f64() > max_time * 0.95 {
@@ -1646,7 +1648,7 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
             } else {
                 best_score = score;
                 let board_hash = compute_zobrist_hash(board);
-                if let Some(mv) = tt.get_move(board_hash) {
+                if let Some(mv) = tt_guard.get_move(board_hash) {
                     let movegen = MoveGen::new_legal(board);
                     if movegen.into_iter().any(|legal_move| legal_move == mv) {
                         best_move = Some(mv);
@@ -1660,10 +1662,10 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                 alpha = -31000;
                 beta = 31000;
                 // Force a final search with full window
-                let final_score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut tt);
+                let final_score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut *tt_guard);
                 best_score = final_score;
                 let board_hash = compute_zobrist_hash(board);
-                if let Some(mv) = tt.get_move(board_hash) {
+                if let Some(mv) = tt_guard.get_move(board_hash) {
                     let movegen = MoveGen::new_legal(board);
                     if movegen.into_iter().any(|legal_move| legal_move == mv) {
                         best_move = Some(mv);
@@ -1682,7 +1684,7 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
             let mut temp_board = *board;
             for _ in 0..depth {
                 let h = compute_zobrist_hash(&temp_board);
-                if let Some(mv) = tt.get_move(h) {
+                if let Some(mv) = tt_guard.get_move(h) {
                     let movegen = MoveGen::new_legal(&temp_board);
                     if movegen.into_iter().any(|legal_move| legal_move == mv) {
                         pv.push(mv);
@@ -1753,7 +1755,7 @@ fn compute_zobrist_hash(board: &Board) -> u64 {
     }
     h
 }
-fn negaknight_v10(board: &Board) -> Option<ChessMove> {
+fn RustKnight(board: &Board) -> Option<ChessMove> {
     iterative_deepening(board, TIME_LIMIT)
 }
 fn print_board(board: &Board) {
@@ -1782,7 +1784,7 @@ fn get_move(board: &Board) -> Option<ChessMove> {
     }
 }
 fn play_game() {
-    println!("NegaKnightV10 - Enhanced Positional Chess Engine");
+    println!("RustKnight - Enhanced Positional Chess Engine");
     println!("Enter moves in UCI (e2e4) or SAN (Nf3) format");
     use std::io::{self, Write};
     print!("Play as (w)hite or (b)lack? ");
@@ -1810,7 +1812,7 @@ fn play_game() {
             }
         } else {
             println!("Engine thinking...");
-            let mv = negaknight_v10(&board).expect("Engine failed to find a move");
+            let mv = RustKnight(&board).expect("Engine failed to find a move");
             println!("Engine: {}", mv);
             mv
         };
