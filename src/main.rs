@@ -1,11 +1,13 @@
 use chess::{
-    Board, ChessMove, Color, File, GameResult, MoveGen, Piece, Rank, Square, BitBoard, BoardStatus,
+    Board, ChessMove, Color, File, MoveGen, Piece, Rank, Square, BitBoard, BoardStatus,
 };
 use rand::Rng;
 use std::collections::HashMap;
-use std::time::Instant;
 use std::sync::Mutex;
 use lazy_static::lazy_static;
+use std::io::{self, BufRead};
+use std::time::Instant;
+use std::str::FromStr;
 const MAX_DEPTH: usize = 40;
 const TIME_LIMIT: f64 = 5.0;
 const ASPIRATION_WINDOW: i32 = 30;
@@ -401,7 +403,7 @@ fn see(board: &Board, mv: ChessMove) -> i32 {
     if let Some(promotion) = mv.get_promotion() {
         captured_value += VALUES[&promotion] - VALUES[&Piece::Pawn];
     }
-    let mut attackers_bb = board.combined() ^ BitBoard::from_square(from_sq);
+    let attackers_bb = board.combined() ^ BitBoard::from_square(from_sq);
     let mut side = !board.side_to_move();
     let mut gains = vec![captured_value];
     let mut depth = 1;
@@ -1508,7 +1510,7 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
             do_full_search = false;
         }
         
-        let mut score = if i == 0 {
+        let score = if i == 0 {
             -negamax(&new_board, new_depth, -beta, -alpha, start_time, ply + 1, stats, root_color, tt)
         } else {
             let mut search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt);
@@ -1697,23 +1699,14 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                 }
             }
             
-            let depth_time = start_depth_time.elapsed().as_secs_f64();
+            let depth_time_ms = (start_depth_time.elapsed().as_secs_f64() * 1000.0) as u64; // UCI uses milliseconds
             let nodes = *stats.get("nodes").unwrap_or(&0);
-            let qnodes = *stats.get("qnodes").unwrap_or(&0);
-            let tt_hits = *stats.get("tt_hits").unwrap_or(&0);
-            let nps = if depth_time > 0.0 { (nodes as f64 / depth_time) as usize } else { 0 };
-            
-            println!(
-                "Depth: {}, Score: {}, Time: {:.2}s, Nodes: {}, QNodes: {}, TThits: {}, NPS: {}, PV: {}",
-                depth,
-                best_score,
-                depth_time,
-                nodes,
-                qnodes,
-                tt_hits,
-                nps,
-                pv.iter().map(|m| format!("{}", m)).collect::<Vec<_>>().join(" ")
-            );
+            let nps = if depth_time_ms > 0 { nodes * 1000 / depth_time_ms as usize } else { 0 };
+            let pv_string = pv.iter().map(|m| format!("{}", m)).collect::<Vec<_>>().join(" ");
+
+
+            println!("info depth {} seldepth {} score cp {} nodes {} nps {} time {} pv {}", 
+                     depth, depth, best_score, nodes, nps, depth_time_ms, pv_string);
         }
     }
     
@@ -1755,108 +1748,235 @@ fn compute_zobrist_hash(board: &Board) -> u64 {
     }
     h
 }
-fn RustKnight(board: &Board) -> Option<ChessMove> {
-    iterative_deepening(board, TIME_LIMIT)
+struct UCIEngine {
+    board: Board,
+    debug: bool,
 }
-fn print_board(board: &Board) {
-    println!("
-{}
-", board);
-}
-fn get_move(board: &Board) -> Option<ChessMove> {
-    use std::io::{self, Write};
-    loop {
-        print!("Your move: ");
-        io::stdout().flush().unwrap();
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).expect("Failed to read line");
-        let input = input.trim();
-        if input.to_lowercase() == "quit" {
-            return None;
+
+impl UCIEngine {
+    fn new() -> Self {
+        UCIEngine {
+            board: Board::default(),
+            debug: false,
         }
-        if let Ok(mv) = input.parse::<ChessMove>() {
-            let movegen = MoveGen::new_legal(board);
-            if movegen.into_iter().any(|legal_move| legal_move == mv) {
-                return Some(mv);
-            }
-        }
-        println!("Illegal move!");
     }
-}
-fn play_game() {
-    println!("RustKnight - Enhanced Positional Chess Engine");
-    println!("Enter moves in UCI (e2e4) or SAN (Nf3) format");
-    use std::io::{self, Write};
-    print!("Play as (w)hite or (b)lack? ");
-    io::stdout().flush().unwrap();
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).expect("Failed to read line");
-    let player_white = input.trim().to_lowercase().starts_with('w');
-    let mut board = Board::default();
-    let mut game_result = None;
-    while {
-        let has_legal_moves = MoveGen::new_legal(&board).next().is_some();
-        *board.checkers() != BitBoard(0) || has_legal_moves // Use != BitBoard(0)
-    } {
-        print_board(&board);
-        let move_ = if (board.side_to_move() == Color::White) == player_white {
-            match get_move(&board) {
-                Some(mv) => {
-                    println!("You: {}", mv);
-                    mv
-                },
-                None => {
-                    println!("Game quit!");
-                    return;
+
+    fn handle_uci(&self) {
+        println!("id name RustKnight");
+        println!("id author Anish");
+        println!("uciok");
+    }
+
+    fn handle_isready(&self) {
+        println!("readyok");
+    }
+
+    fn handle_position(&mut self, tokens: &[&str]) {
+        if tokens.len() < 2 {
+            return;
+        }
+
+        match tokens[1] {
+            "startpos" => {
+                self.board = Board::default();
+                if tokens.len() > 2 && tokens[2] == "moves" {
+                    for move_str in &tokens[3..] {
+                        if let Ok(chess_move) = ChessMove::from_str(move_str) {
+                            self.board = self.board.make_move_new(chess_move);
+                        }
+                    }
                 }
             }
-        } else {
-            println!("Engine thinking...");
-            let mv = RustKnight(&board).expect("Engine failed to find a move");
-            println!("Engine: {}", mv);
-            mv
-        };
-        board = board.make_move_new(move_);
-        let is_checkmate = (*board.checkers() != BitBoard(0)) && MoveGen::new_legal(&board).next().is_none(); // Use != BitBoard(0)
-        let is_stalemate = *board.checkers() == BitBoard(0) && MoveGen::new_legal(&board).next().is_none(); // Use == BitBoard(0)
-        if is_checkmate {
-            game_result = Some(if board.side_to_move() == Color::White {
-                GameResult::BlackCheckmates
-            } else {
-                GameResult::WhiteCheckmates
-            });
-            break;
-        } else if is_stalemate {
-            game_result = Some(GameResult::Stalemate);
-            break;
+            "fen" => {
+                if tokens.len() < 8 {
+                    return;
+                }
+                let fen = tokens[2..8].join(" ");
+                if let Ok(board) = Board::from_str(&fen) {
+                    self.board = board;
+                    
+                    let mut moves_start = None;
+                    for (i, &token) in tokens.iter().enumerate() {
+                        if token == "moves" {
+                            moves_start = Some(i + 1);
+                            break;
+                        }
+                    }
+                    
+                    if let Some(start) = moves_start {
+                        for move_str in &tokens[start..] {
+                            if let Ok(chess_move) = ChessMove::from_str(move_str) {
+                                self.board = self.board.make_move_new(chess_move);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    print_board(&board);
-    let result = match game_result {
-        Some(GameResult::WhiteCheckmates) => {
-            println!("Game over: 1-0");
-            println!("White wins by checkmate!");
-            "1-0"
-        },
-        Some(GameResult::BlackCheckmates) => {
-            println!("Game over: 0-1");
-            println!("Black wins by checkmate!");
-            "0-1"
-        },
-        Some(GameResult::Stalemate) => {
-            println!("Game over: 1/2-1/2");
-            println!("Draw by stalemate!");
-            "1/2-1/2"
-        },
-        Some(GameResult::WhiteResigns) | Some(GameResult::BlackResigns) | Some(GameResult::DrawAccepted) | Some(GameResult::DrawDeclared) | None => {
-            println!("Game over: 1/2-1/2");
-            println!("Draw!");
-            "1/2-1/2"
+
+    fn calculate_time_budget(&self, wtime: Option<u64>, btime: Option<u64>, winc: Option<u64>, binc: Option<u64>, movetime: Option<u64>) -> f64 {
+        if let Some(mt) = movetime {
+            return (mt as f64) / 1000.0;
         }
-    };
-    println!("
-Game result: {}", result);
+
+        let (time_left, increment) = match self.board.side_to_move() {
+            Color::White => (wtime.unwrap_or(0), winc.unwrap_or(0)),
+            Color::Black => (btime.unwrap_or(0), binc.unwrap_or(0)),
+        };
+
+        if time_left == 0 {
+            return 1.0;
+        }
+
+        let base_time = (time_left as f64) / 1000.0;
+        let inc_time = (increment as f64) / 1000.0;
+
+        let moves_to_go = 40;
+        let time_per_move = (base_time / moves_to_go as f64) + (inc_time * 0.8);
+
+        time_per_move.max(0.01).min(base_time * 0.1)
+    }
+
+    fn handle_go(&self, tokens: &[&str]) {
+        let mut wtime = None;
+        let mut btime = None;
+        let mut winc = None;
+        let mut binc = None;
+        let mut movetime = None;
+        let mut depth: Option<u32> = None;
+        let mut infinite = false;
+
+        let mut i = 1;
+        while i < tokens.len() {
+            match tokens[i] {
+                "wtime" => {
+                    if i + 1 < tokens.len() {
+                        wtime = tokens[i + 1].parse().ok();
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "btime" => {
+                    if i + 1 < tokens.len() {
+                        btime = tokens[i + 1].parse().ok();
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "winc" => {
+                    if i + 1 < tokens.len() {
+                        winc = tokens[i + 1].parse().ok();
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "binc" => {
+                    if i + 1 < tokens.len() {
+                        binc = tokens[i + 1].parse().ok();
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "movetime" => {
+                    if i + 1 < tokens.len() {
+                        movetime = tokens[i + 1].parse().ok();
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "depth" => {
+                    if i + 1 < tokens.len() {
+                        depth = tokens[i + 1].parse().ok();
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "infinite" => {
+                    infinite = true;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+
+        let max_time = if infinite {
+            f64::INFINITY
+        } else {
+            self.calculate_time_budget(wtime, btime, winc, binc, movetime)
+        };
+
+        if let Some(best_move) = iterative_deepening(&self.board, max_time) {
+            println!("bestmove {}", best_move);
+        } else {
+            println!("bestmove 0000");
+        }
+    }
+
+    fn handle_debug(&mut self, tokens: &[&str]) {
+        if tokens.len() > 1 {
+            self.debug = tokens[1] == "on";
+        }
+    }
+
+    fn run(&mut self) {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => break,
+            };
+
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+
+            match tokens[0] {
+                "uci" => self.handle_uci(),
+                "debug" => self.handle_debug(&tokens),
+                "isready" => self.handle_isready(),
+                "setoption" => {},
+                "register" => {},
+                "ucinewgame" => {
+                    self.board = Board::default();
+                    {
+                        let mut tt = TRANSPOSITION_TABLE.lock().unwrap();
+                        tt.clear();
+                    }
+                    {
+                        let mut killers = KILLER_MOVES.lock().unwrap();
+                        killers.clear();
+                        killers.resize(MAX_DEPTH, Vec::new());
+                    }
+                    {
+                        let mut history = HISTORY_HEURISTIC.lock().unwrap();
+                        history.clear();
+                    }
+                }
+                "position" => self.handle_position(&tokens),
+                "go" => self.handle_go(&tokens),
+                "stop" => {},
+                "ponderhit" => {},
+                "quit" => break,
+                _ => {
+                    if self.debug {
+                        eprintln!("Unknown command: {}", tokens[0]);
+                    }
+                }
+            }
+        }
+    }
 }
+
 fn main() {
-    play_game();
+    let mut engine = UCIEngine::new();
+    engine.run();
 }
