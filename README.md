@@ -1,2 +1,2 @@
-# RustyKnight
-A simple Rust based chess engine
+# RustKnight
+A simple UCI chess engine written in rust
