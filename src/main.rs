@@ -195,7 +195,7 @@ lazy_static! {
                 -20,-30,-30,-40,-40,-30,-30,-20,
                 -10,-20,-20,-20,-20,-20,-20,-10,
                 20,20,0,0,0,0,20,20,
-                20,30,10,0,0,10,30,20
+                20,30,-5,0,0,-5,30,20
             ]);
             sub.insert("eg", vec![
                 -50,-40,-30,-20,-20,-30,-40,-50,
@@ -1140,6 +1140,53 @@ fn evaluate_pawn_structure(board: &Board) -> i32 {
         score
     }
 }
+fn evaluate_rooks(board: &Board) -> i32 {
+    let mut score = 0;
+    
+    let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+    let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+    
+    let white_rooks = board.pieces(Piece::Rook) & board.color_combined(Color::White);
+    let black_rooks = board.pieces(Piece::Rook) & board.color_combined(Color::Black);
+    
+    for sq in white_rooks {
+        let file = sq.get_file();
+        let file_mask = BitBoard::new(0x0101010101010101u64 << file.to_index());
+        
+        let white_pawns_on_file = (white_pawns & file_mask).popcnt();
+        let black_pawns_on_file = (black_pawns & file_mask).popcnt();
+        
+        if white_pawns_on_file == 0 && black_pawns_on_file == 0 {
+            score += 25;
+        } else if white_pawns_on_file == 0 {
+            score += 15;
+        }
+        
+        if sq.get_rank() == Rank::Seventh {
+            score += 20;
+        }
+    }
+    
+    for sq in black_rooks {
+        let file = sq.get_file();
+        let file_mask = BitBoard::new(0x0101010101010101u64 << file.to_index());
+        
+        let white_pawns_on_file = (white_pawns & file_mask).popcnt();
+        let black_pawns_on_file = (black_pawns & file_mask).popcnt();
+        
+        if white_pawns_on_file == 0 && black_pawns_on_file == 0 {
+            score -= 25;
+        } else if black_pawns_on_file == 0 {
+            score -= 15;
+        }
+        
+        if sq.get_rank() == Rank::Second {
+            score -= 20;
+        }
+    }
+    
+    score
+}
 const EVAL_CACHE_MAX: usize = 20000;
 fn evaluate(board: &Board) -> i32 {
     let key = board.to_string();
@@ -1220,7 +1267,7 @@ fn evaluate(board: &Board) -> i32 {
         }
     }
     score += evaluate_pawn_structure(board);
-    
+    score += evaluate_rooks(board);
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
         score += 30;
     }
@@ -1762,7 +1809,7 @@ impl UCIEngine {
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnight");
+        println!("id name RustKnightv1.4");
         println!("id author Anish");
         println!("uciok");
     }
@@ -1908,7 +1955,7 @@ impl UCIEngine {
         }
 
         let max_time = if infinite {
-            f64::INFINITY
+            10000000.0
         } else {
             self.calculate_time_budget(wtime, btime, winc, binc, movetime)
         };
