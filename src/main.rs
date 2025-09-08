@@ -195,7 +195,7 @@ lazy_static! {
                 -20,-30,-30,-40,-40,-30,-30,-20,
                 -10,-20,-20,-20,-20,-20,-20,-10,
                 20,20,0,0,0,0,20,20,
-                20,30,-5,0,0,-5,30,20
+                20,30,10,0,0,-5,30,20
             ]);
             sub.insert("eg", vec![
                 -50,-40,-30,-20,-20,-30,-40,-50,
@@ -351,6 +351,7 @@ impl MaterialHashTable {
         }
     }
 }
+
 fn compute_material_key(board: &Board) -> u64 {
     let mut key = 0u64;
     for &piece in &[Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen] {
@@ -1628,7 +1629,6 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
     
     best_value
 }
-
 fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
     let start_time = Instant::now();
     let mut best_move = None;
@@ -1658,7 +1658,6 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
         }
     }
     
-    // use the single global transposition table
     let mut tt_guard = TRANSPOSITION_TABLE.lock().unwrap();
     
     for depth in 1..=MAX_DEPTH {
@@ -1676,55 +1675,122 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
         };
         
         let mut aspirations_failed = 0;
-        let mut found = false;
+        let mut depth_best_move = None;
+        let mut depth_best_score = best_score;
+        let mut aspiration_found_valid_result = false;  // Track if aspiration found something good
         
         loop {
+            let board_hash = compute_zobrist_hash(board);
+            
             let score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut *tt_guard);
             
-            // Check if we've run out of time during search
             if start_time.elapsed().as_secs_f64() > max_time * 0.95 {
                 break;
             }
             
             if score <= alpha {
+                println!("info string depth {} failed low (score={}, alpha={})", depth, score, alpha);
                 let multiplier = (aspirations_failed + 1).min(4) as i32;
                 alpha = alpha.saturating_sub(ASPIRATION_WINDOW * multiplier).max(-31000);
                 aspirations_failed += 1;
             } else if score >= beta {
+                println!("info string depth {} failed high (score={}, beta={})", depth, score, beta);
                 let multiplier = (aspirations_failed + 1).min(4) as i32;
                 beta = beta.saturating_add(ASPIRATION_WINDOW * multiplier).min(31000);
                 aspirations_failed += 1;
             } else {
-                best_score = score;
-                let board_hash = compute_zobrist_hash(board);
-                if let Some(mv) = tt_guard.get_move(board_hash) {
-                    let movegen = MoveGen::new_legal(board);
-                    if movegen.into_iter().any(|legal_move| legal_move == mv) {
-                        best_move = Some(mv);
+                // SUCCESSFUL ASPIRATION SEARCH
+                println!("info string depth {} aspiration success (score={})", depth, score);
+                
+                // Only accept non-mate scores from aspiration search, or mate-for-us scores
+                if score.abs() < 30000 || score > 30000 {
+                    depth_best_score = score;
+                    aspiration_found_valid_result = true;
+                    
+                    if let Some(mv) = tt_guard.get_move(board_hash) {
+                        let movegen = MoveGen::new_legal(board);
+                        if movegen.into_iter().any(|legal_move| legal_move == mv) {
+                            depth_best_move = Some(mv);
+                            println!("info string depth {} aspiration found move: {}", depth, mv);
+                        }
                     }
+                } else {
+                    println!("info string depth {} aspiration found mate-against-us, ignoring", depth);
                 }
-                found = true;
                 break;
             }
             
             if aspirations_failed > 4 {
+                println!("info string depth {} doing full window search", depth);
                 alpha = -31000;
                 beta = 31000;
-                // Force a final search with full window
+                
                 let final_score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut *tt_guard);
-                best_score = final_score;
-                let board_hash = compute_zobrist_hash(board);
-                if let Some(mv) = tt_guard.get_move(board_hash) {
-                    let movegen = MoveGen::new_legal(board);
-                    if movegen.into_iter().any(|legal_move| legal_move == mv) {
-                        best_move = Some(mv);
+                
+                println!("info string depth {} full window result: score={}, aspiration_valid={}", 
+                         depth, final_score, aspiration_found_valid_result);
+                
+                // Decision logic for accepting full window result:
+                let should_accept_full_window = if !aspiration_found_valid_result {
+                    // No valid aspiration result, accept anything
+                    println!("info string depth {} no valid aspiration result, accepting full window", depth);
+                    true
+                } else if final_score < -30000 {
+                    // Full window found mate-against-us, definitely keep aspiration
+                    println!("info string depth {} full window found mate-against-us, keeping aspiration", depth);
+                    false
+                }  else if final_score > depth_best_score + 100 {
+                    // Full window is significantly better (normal case)
+                    println!("info string depth {} full window significantly better ({} vs {})", 
+                             depth, final_score, depth_best_score);
+                    true
+                } else {
+                    // Keep aspiration result
+                    println!("info string depth {} keeping aspiration result ({} vs {})", 
+                             depth, depth_best_score, final_score);
+                    false
+                };
+                
+                if should_accept_full_window {
+                    depth_best_score = final_score;
+                    
+                    if let Some(mv) = tt_guard.get_move(board_hash) {
+                        let movegen = MoveGen::new_legal(board);
+                        if movegen.into_iter().any(|legal_move| legal_move == mv) {
+                            depth_best_move = Some(mv);
+                            println!("info string depth {} full window found move: {}", depth, mv);
+                        }
                     }
                 }
                 break;
             }
         }
         
-        if best_score.abs() > 29000 {
+        // Update overall best if we found a valid move for this depth
+        if let Some(mv) = depth_best_move {
+            // Additional check: don't accept mate-against-us scores unless we have no choice
+            if depth_best_score < -30000 && best_move.is_some() {
+                println!("info string depth {} refusing mate-against-us score, keeping previous best", depth);
+                break;
+            }
+            
+            best_move = Some(mv);
+            best_score = depth_best_score;
+            println!("info string depth {} completed, final move: {} (score={})", depth, mv, best_score);
+        } else {
+            println!("info string depth {} incomplete, no valid move found", depth);
+            break;
+        }
+        
+        // Break if we found a mate-for-us
+        if best_score > 30000 {
+            println!("info string found mate-for-us, stopping search");
+            break;
+        }
+        
+        // Break if we're getting mate-against-us scores (something's wrong)
+        if best_score < -30000 {
+            println!("info string getting mate-against-us scores, stopping search");
             break;
         }
         
@@ -1746,15 +1812,18 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                 }
             }
             
-            let depth_time_ms = (start_depth_time.elapsed().as_secs_f64() * 1000.0) as u64; // UCI uses milliseconds
+            let depth_time_ms = (start_depth_time.elapsed().as_secs_f64() * 1000.0) as u64;
             let nodes = *stats.get("nodes").unwrap_or(&0);
             let nps = if depth_time_ms > 0 { nodes * 1000 / depth_time_ms as usize } else { 0 };
             let pv_string = pv.iter().map(|m| format!("{}", m)).collect::<Vec<_>>().join(" ");
 
-
             println!("info depth {} seldepth {} score cp {} nodes {} nps {} time {} pv {}", 
                      depth, depth, best_score, nodes, nps, depth_time_ms, pv_string);
         }
+    }
+    
+    if let Some(chosen_move) = best_move {
+        println!("info string final choice: {}", chosen_move);
     }
     
     best_move.or_else(|| {
@@ -1762,9 +1831,8 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
         if moves.is_empty() {
             None
         } else {
-            use rand::seq::SliceRandom;
-            let mut rng = rand::thread_rng();
-            Some(*moves.choose(&mut rng).unwrap())
+            println!("info string fallback to first legal move: {}", moves[0]);
+            Some(moves[0])
         }
     })
 }
@@ -1809,7 +1877,7 @@ impl UCIEngine {
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnightv1.4");
+        println!("id name RustKnightv1.5");
         println!("id author Anish");
         println!("uciok");
     }
