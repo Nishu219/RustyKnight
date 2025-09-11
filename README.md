@@ -100,7 +100,7 @@ RustyKnight implements several search algorithms and pruning techniques:
 ## Code Structure
 
 All main logic is implemented in [`src/main.rs`](src/main.rs).  
-For details, refer to function definitions such as `evaluate`, `negamax`, `order_moves`, `quiesce`, `see`, `evaluate_pawn_structure`, and `iterative_deepening`.
+For details, refer to function definitions such as `evaluate`, `negamax`, `order_moves`, `quiesce`,  `evaluate_pawn_structure`, and `iterative_deepening`.
 
 ---
 
