@@ -49,6 +49,9 @@ The engine assesses rook positioning and activity with the following heuristics:
 - **Rooks on Open Files:** A rook on a file with no pawns is valued highly (+25 for each side).
 - **Rooks on Semi-Open Files:** A rook on a file with only friendly pawns is valuable (+15 for each side).
 - **Rooks on the Seventh Rank:** A rook on the opponent's second to last rank is a powerful piece, often controlling key squares and attacking pawns (+20 for white on the 7th rank, +20 for black on the 2nd rank).
+
+### 7. Mobility Evaluation
+- **Mobility Evaluation:** Rewards pieces (knights, bishops, rooks, and queens) based on the number of legal moves available to them.
 ---
 
 ## Search Methods
