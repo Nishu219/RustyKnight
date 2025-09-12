@@ -212,7 +212,7 @@ lazy_static! {
         });
         m
     };
-    static ref EVAL_CACHE: Mutex<HashMap<String, i32>> = Mutex::new(HashMap::new());
+    static ref EVAL_CACHE: Mutex<HashMap<u64, i32>> = Mutex::new(HashMap::new());
     static ref MATERIAL_HASH_TABLE: Mutex<MaterialHashTable> = Mutex::new(MaterialHashTable::new(16));
     static ref KILLER_MOVES: Mutex<Vec<Vec<ChessMove>>> = Mutex::new(Vec::new());
     static ref HISTORY_HEURISTIC: Mutex<HashMap<ChessMove, i32>> = Mutex::new(HashMap::new());
@@ -1217,7 +1217,7 @@ fn evaluate_mobility(board: &Board, color: Color) -> i32 {
 }
 const EVAL_CACHE_MAX: usize = 20000;
 fn evaluate(board: &Board) -> i32 {
-    let key = board.to_string();
+    let key = compute_zobrist_hash(board);
     {
         let cache = EVAL_CACHE.lock().unwrap();
         if let Some(&cached) = cache.get(&key) {
@@ -1293,9 +1293,9 @@ fn evaluate(board: &Board) -> i32 {
                 score -= pst_value;
             }
         }
-    }
-    let color = board.side_to_move();
-    score += evaluate_mobility(board, color);
+    }   
+    score += evaluate_mobility(board, Color::White);
+    score -= evaluate_mobility(board, Color::Black);
     score += evaluate_pawn_structure(board);
     score += evaluate_rooks(board);
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
@@ -1431,10 +1431,6 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
         if board.status() == BoardStatus::Stalemate {
             return if board.side_to_move() == root_color { -CONTEMPT } else { CONTEMPT };
         }
-        
-        alpha = alpha.max(-30000 + ply as i32);
-        beta = beta.min(30000 - ply as i32 - 1);
-        
         if alpha >= beta {
             return alpha;
         }
@@ -1662,19 +1658,7 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
     let start_time = Instant::now();
     let mut best_move = None;
     let mut best_score = 0;
-    let root_color = board.side_to_move();
-    
-    {
-        let mut killers = KILLER_MOVES.lock().unwrap();
-        killers.clear();
-        killers.resize(MAX_DEPTH, Vec::new());
-    }
-    
-    {
-        let mut history = HISTORY_HEURISTIC.lock().unwrap();
-        history.clear();
-    }
-    
+    let root_color = board.side_to_move();    
     let movegen = MoveGen::new_legal(board);
     for mv in movegen {
         let new_board = board.make_move_new(mv);
@@ -1906,7 +1890,7 @@ impl UCIEngine {
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnightv1.6");
+        println!("id name RustKnightv1.7");
         println!("id author Anish");
         println!("uciok");
     }
