@@ -17,40 +17,20 @@ The evaluation function determines the quality of a position using the following
 - Evaluates piece activity and placement using middle-game and end-game tables.
 - The final piece square value is a blend based on the phase of the game.
 
-### 3. Pawn Structure Evaluation
-The engine evaluates many aspects of pawn structure, including:
-- **Pawn Islands:** Groups of connected pawns separated by empty files.
-- **Passed Pawns:** Pawns with no opposing pawns ahead on the same or adjacent files.
-- **Candidate Pawns:** Passed pawns with potential to promote.
-- **Hidden Passed Pawns:** Passed pawns blocked by own pieces.
-- **Backward Pawns:** Pawns that cannot advance or be supported by other pawns.
-- **Connected Pawns:** Pawns adjacent to each other, supporting one another.
-- **Isolated Pawns:** Pawns with no friendly pawns on adjacent files.
-- **Doubled Pawns:** Multiple pawns on the same file.
-- **Faker Pawns:** Pawns that look passed but are easily attacked or blocked.
-- **Weak Pawns:** Pawns that are easy to attack and not well-defended.
-- **Pawn Majority:** More pawns on one side (queenside or kingside) compared to the opponent.
-- **Center Pawns:** Pawns occupying the central files and ranks.
-- **Pawn Race Potential:** Assessment of pawn promotion races in endgames.
-- **Sentry Pawns:** Pawns controlling key squares (rare, receives special bonuses).
-- **Chains:** Pawns supporting each other diagonally.
-- **Minority Attacks:** Pawns attacking with fewer in number than their opponent on a given flank.
-- **Hanging Pairs:** Pairs of pawns that are not supported and are on adjacent files.
-
-### 4. Special Position Detection
+### 3. Special Position Detection
 - **Checkmate:** Assigns a large positive/negative score depending on the side to move.
 - **Stalemate:** Assigns a contempt value (draw score).
 
-### 5. Caching
+### 4. Caching
 - **Evaluation Cache:** Caches previously evaluated positions for efficiency.
 
-### 6. Rook Evaluation
+### 5. Rook Evaluation
 The engine assesses rook positioning and activity with the following heuristics:
 - **Rooks on Open Files:** A rook on a file with no pawns is valued highly (+25 for each side).
 - **Rooks on Semi-Open Files:** A rook on a file with only friendly pawns is valuable (+15 for each side).
 - **Rooks on the Seventh Rank:** A rook on the opponent's second to last rank is a powerful piece, often controlling key squares and attacking pawns (+20 for white on the 7th rank, +20 for black on the 2nd rank).
 
-### 7. Mobility Evaluation
+### 6. Mobility Evaluation
 - **Mobility Evaluation:** Rewards pieces (knights, bishops, rooks, and queens) based on the number of legal moves available to them.
 ---
 
