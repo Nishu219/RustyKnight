@@ -288,26 +288,7 @@ impl TranspositionTable {
         self.table.get(&key).and_then(|entry| entry.move_)
     }
 }
-const PAWN_HASH_SIZE: usize = 16384;
-static mut PAWN_HASH_TABLE: [[(u64, i32, usize); 2]; PAWN_HASH_SIZE] = [[(0, 0, 0); 2]; PAWN_HASH_SIZE];
-static mut PAWN_HASH_AGE: usize = 0;
-fn compute_pawn_hash(board: &Board) -> u64 {
-    let mut h = 0;
-    for sq_idx in 0..64 {
-        let square = unsafe { Square::new(sq_idx) }; // Square::new is unsafe
-        if let Some(piece) = board.piece_on(square) {
-            if piece == Piece::Pawn {
-                let piece_color = if (*board.color_combined(Color::White) & BitBoard::from_square(square)) != BitBoard(0) { // Use != BitBoard(0)
-                    Color::White
-                } else {
-                    Color::Black
-                };
-                h ^= ZOBRIST_PIECES[&(Piece::Pawn, piece_color)][sq_idx as usize];
-            }
-        }
-    }
-    h
-}
+
 struct MaterialHashTable {
     table: Vec<[(u64, i32, usize); 2]>,
     age: usize,
@@ -441,707 +422,7 @@ fn see(board: &Board, mv: ChessMove) -> i32 {
     gains[0]
 }
 
-fn evaluate_pawn_structure(board: &Board) -> i32 {
-    unsafe {
-        let pawn_key = compute_pawn_hash(board);
-        let index = (pawn_key as usize) % PAWN_HASH_SIZE;
-        let bucket = &PAWN_HASH_TABLE[index];
-        if bucket[0].0 == pawn_key {
-            return bucket[0].1;
-        }
-        if bucket[1].0 == pawn_key {
-            return bucket[1].1;
-        }
-        
-        let mut score = 0;
-        let white_pawns_bb = *board.pieces(Piece::Pawn) & board.color_combined(Color::White);
-        let black_pawns_bb = *board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
-        let all_pawns_bb = white_pawns_bb | black_pawns_bb;
-        let all_pieces_bb = board.combined();
-        
-        let mut white_file_masks = [BitBoard(0); 8];
-        let mut black_file_masks = [BitBoard(0); 8];
-        let mut white_rank_masks = [BitBoard(0); 8];
-        let mut black_rank_masks = [BitBoard(0); 8];
-        
-        for file_idx in 0..8 {
-            white_file_masks[file_idx] = chess::get_file(File::from_index(file_idx)) & white_pawns_bb;
-            black_file_masks[file_idx] = chess::get_file(File::from_index(file_idx)) & black_pawns_bb;
-        }
-        
-        for rank_idx in 0..8 {
-            white_rank_masks[rank_idx] = chess::get_rank(Rank::from_index(rank_idx)) & white_pawns_bb;
-            black_rank_masks[rank_idx] = chess::get_rank(Rank::from_index(rank_idx)) & black_pawns_bb;
-        }
-        
-        let mut white_pawn_islands = 0;
-        let mut black_pawn_islands = 0;
-        let mut in_white_island = false;
-        let mut in_black_island = false;
-        
-        for file_idx in 0..8 {
-            let has_white_pawn = white_file_masks[file_idx] != BitBoard(0);
-            let has_black_pawn = black_file_masks[file_idx] != BitBoard(0);
-            
-            if has_white_pawn && !in_white_island {
-                white_pawn_islands += 1;
-                in_white_island = true;
-            } else if !has_white_pawn {
-                in_white_island = false;
-            }
-            
-            if has_black_pawn && !in_black_island {
-                black_pawn_islands += 1;
-                in_black_island = true;
-            } else if !has_black_pawn {
-                in_black_island = false;
-            }
-        }
-        
-        score -= (white_pawn_islands - 1) * 8;
-        score += (black_pawn_islands - 1) * 8;
-        
-        let center_files = [File::D, File::E];
-        let mut white_center_pawns = 0;
-        let mut black_center_pawns = 0;
-        
-        for &file in &center_files {
-            let center_file_bb = chess::get_file(file);
-            let center_ranks = [Rank::Fourth, Rank::Fifth];
-            for &rank in &center_ranks {
-                let center_square = Square::make_square(rank, file);
-                if (white_pawns_bb & BitBoard::from_square(center_square)) != BitBoard(0) {
-                    white_center_pawns += 1;
-                }
-                if (black_pawns_bb & BitBoard::from_square(center_square)) != BitBoard(0) {
-                    black_center_pawns += 1;
-                }
-            }
-        }
-        
-        score += white_center_pawns * 15;
-        score -= black_center_pawns * 15;
-        
-        let mut white_holes = BitBoard(0);
-        let mut black_holes = BitBoard(0);
-        
-        for file_idx in 0..8 {
-            let file = File::from_index(file_idx);
-            for rank_idx in 2..6 {
-                let rank = Rank::from_index(rank_idx);
-                let sq = Square::make_square(rank, file);
-                let sq_bb = BitBoard::from_square(sq);
-                
-                let mut is_white_hole = true;
-                let mut is_black_hole = true;
-                
-                for adj_file_idx in [(file_idx as i32 - 1), (file_idx as i32 + 1)] {
-                    if adj_file_idx >= 0 && adj_file_idx < 8 {
-                        let adj_file = File::from_index(adj_file_idx as usize);
-                        for r in 0..rank_idx {
-                            let adj_sq = Square::make_square(Rank::from_index(r), adj_file);
-                            if (white_pawns_bb & BitBoard::from_square(adj_sq)) != BitBoard(0) {
-                                is_black_hole = false;
-                            }
-                        }
-                        for r in (rank_idx + 1)..8 {
-                            let check_sq = Square::make_square(Rank::from_index(r), adj_file);
-                            if (black_pawns_bb & BitBoard::from_square(check_sq)) != BitBoard(0) {
-                                is_white_hole = false;
-                            }
-                        }
-                    }
-                }
-                
-                if is_white_hole && (all_pawns_bb & sq_bb) == BitBoard(0) {
-                    white_holes |= sq_bb;
-                }
-                if is_black_hole && (all_pawns_bb & sq_bb) == BitBoard(0) {
-                    black_holes |= sq_bb;
-                }
-            }
-        }
-        
-        score += white_holes.popcnt() as i32 * 12;
-        score -= black_holes.popcnt() as i32 * 12;
-        
-        let mut white_pawn_majority = 0;
-        let mut black_pawn_majority = 0;
-        
-        let queenside_files = [0, 1, 2, 3];
-        let kingside_files = [4, 5, 6, 7];
-        
-        let mut white_queenside = 0;
-        let mut black_queenside = 0;
-        let mut white_kingside = 0;
-        let mut black_kingside = 0;
-        
-        for &file_idx in &queenside_files {
-            white_queenside += white_file_masks[file_idx].popcnt();
-            black_queenside += black_file_masks[file_idx].popcnt();
-        }
-        
-        for &file_idx in &kingside_files {
-            white_kingside += white_file_masks[file_idx].popcnt();
-            black_kingside += black_file_masks[file_idx].popcnt();
-        }
-        
-        if white_queenside > black_queenside {
-            white_pawn_majority += (white_queenside - black_queenside) as i32;
-        }
-        if white_kingside > black_kingside {
-            white_pawn_majority += (white_kingside - black_kingside) as i32;
-        }
-        if black_queenside > white_queenside {
-            black_pawn_majority += (black_queenside - white_queenside) as i32;
-        }
-        if black_kingside > white_kingside {
-            black_pawn_majority += (black_kingside - white_kingside) as i32;
-        }
-        
-        score += white_pawn_majority * 8;
-        score -= black_pawn_majority * 8;
-        
-        for sq in white_pawns_bb {
-            let file = sq.get_file();
-            let rank_idx = sq.get_rank() as usize;
-            let file_idx = file as usize;
-            
-            let mut is_passed = true;
-            let mut is_backward = false;
-            let mut is_candidate = false;
-            let mut is_hidden_passed = false;
-            let mut is_sentry = false;
-            let mut is_faker = false;
-            let mut is_weak = false;
-            let mut has_support = false;
-            let mut is_connected = false;
-            let mut blocking_pieces = 0;
-            
-            for enemy_sq in black_pawns_bb {
-                let enemy_file = enemy_sq.get_file();
-                let enemy_rank_idx = enemy_sq.get_rank() as usize;
-                let enemy_file_idx = enemy_file as usize;
-                
-                if (enemy_file_idx as i32 - file_idx as i32).abs() <= 1 && enemy_rank_idx > rank_idx {
-                    is_passed = false;
-                    
-                    if enemy_rank_idx == rank_idx + 1 && (enemy_file_idx as i32 - file_idx as i32).abs() == 1 {
-                        for adj_file_idx in [file_idx as i32 - 1, file_idx as i32 + 1] {
-                            if adj_file_idx >= 0 && adj_file_idx < 8 {
-                                let adj_file = File::from_index(adj_file_idx as usize);
-                                for r in 0..rank_idx {
-                                    let adj_sq = Square::make_square(Rank::from_index(r), adj_file);
-                                    if (white_pawns_bb & BitBoard::from_square(adj_sq)) != BitBoard(0) {
-                                        has_support = true;
-                                        break;
-                                    }
-                                }
-                                if has_support {
-                                    break;
-                                }
-                            }
-                        }
-                        if !has_support {
-                            is_backward = true;
-                        }
-                    }
-                }
-            }
-            
-            for adj_file_idx in [file_idx as i32 - 1, file_idx as i32 + 1] {
-                if adj_file_idx >= 0 && adj_file_idx < 8 {
-                    let adj_file = File::from_index(adj_file_idx as usize);
-                    
-                    if (white_file_masks[adj_file_idx as usize] & 
-                        chess::get_rank(Rank::from_index(rank_idx))) != BitBoard(0) {
-                        is_connected = true;
-                    }
-                    
-                    for r in (rank_idx + 1)..8 {
-                        let check_sq = Square::make_square(Rank::from_index(r), adj_file);
-                        if (white_pawns_bb & BitBoard::from_square(check_sq)) != BitBoard(0) {
-                            has_support = true;
-                        }
-                    }
-                }
-            }
-            
-            if !is_passed {
-                let mut attackers = 0;
-                let mut defenders = 0;
-                
-                for enemy_sq in black_pawns_bb {
-                    let enemy_file_idx = enemy_sq.get_file() as usize;
-                    let enemy_rank_idx = enemy_sq.get_rank() as usize;
-                    
-                    if (enemy_file_idx as i32 - file_idx as i32).abs() <= 1 && 
-                       enemy_rank_idx > rank_idx {
-                        attackers += 1;
-                    }
-                }
-                
-                for friend_sq in white_pawns_bb {
-                    let friend_file_idx = friend_sq.get_file() as usize;
-                    let friend_rank_idx = friend_sq.get_rank() as usize;
-                    
-                    if (friend_file_idx as i32 - file_idx as i32).abs() <= 1 && 
-                       friend_rank_idx >= rank_idx {
-                        defenders += 1;
-                    }
-                }
-                
-                if defenders >= attackers {
-                    is_candidate = true;
-                }
-            }
-            
-            for check_rank in (rank_idx + 1)..8 {
-                let check_sq = Square::make_square(Rank::from_index(check_rank), file);
-                if (all_pieces_bb & BitBoard::from_square(check_sq)) != BitBoard(0) {
-                    blocking_pieces += 1;
-                }
-            }
-            
-            if blocking_pieces > 0 && is_passed {
-                is_hidden_passed = true;
-            }
-            
-            if rank_idx >= 4 && !is_passed {
-                let mut can_advance = true;
-                for r in (rank_idx + 1)..8 {
-                    let advance_sq = Square::make_square(Rank::from_index(r), file);
-                    if (black_pawns_bb & BitBoard::from_square(advance_sq)) != BitBoard(0) {
-                        can_advance = false;
-                        break;
-                    }
-                }
-                if can_advance {
-                    is_sentry = true;
-                }
-            }
-            
-            if rank_idx <= 3 && !has_support && !is_connected {
-                let mut enemy_attacks = false;
-                for enemy_sq in black_pawns_bb {
-                    let enemy_file_idx = enemy_sq.get_file() as usize;
-                    let enemy_rank_idx = enemy_sq.get_rank() as usize;
-                    
-                    if (enemy_file_idx as i32 - file_idx as i32).abs() == 1 && 
-                       enemy_rank_idx == rank_idx + 1 {
-                        enemy_attacks = true;
-                        break;
-                    }
-                }
-                if enemy_attacks {
-                    is_faker = true;
-                }
-            }
-            
-            if is_backward || (!has_support && !is_connected) {
-                is_weak = true;
-            }
-            
-            let file_bb = chess::get_file(file);
-            let doubled = (white_pawns_bb & file_bb).popcnt() > 1;
-            
-            let mut isolated = true;
-            for adj_file_idx in [file_idx as i32 - 1, file_idx as i32 + 1] {
-                if adj_file_idx >= 0 && adj_file_idx < 8 {
-                    let adj_file_bb = chess::get_file(File::from_index(adj_file_idx as usize));
-                    if (white_pawns_bb & adj_file_bb) != BitBoard(0) {
-                        isolated = false;
-                        break;
-                    }
-                }
-            }
-            
-            if is_passed {
-                let passed_bonus = [0, 5, 10, 20, 35, 60, 100, 200][rank_idx];
-                score += passed_bonus;
-                
-                if is_hidden_passed {
-                    score += passed_bonus / 2;
-                }
-            }
-            
-            if is_candidate {
-                let candidate_bonus = [0, 2, 4, 8, 16, 32, 64, 128][rank_idx];
-                score += candidate_bonus;
-            }
-            
-            if doubled {
-                score -= 15;
-            }
-            
-            if isolated {
-                score -= 10;
-                if file_idx == 0 || file_idx == 7 {
-                    score -= 5;
-                }
-            }
-            
-            if is_backward {
-                score -= 25;
-            }
-            
-            if is_connected {
-                score += 8;
-                if rank_idx >= 4 {
-                    score += (rank_idx - 3) as i32 * 4;
-                }
-            }
-            
-            if is_sentry {
-                score += 12;
-            }
-            
-            if is_faker {
-                score -= 15;
-            }
-            
-            if is_weak {
-                score -= 8;
-            }
-            
-            if blocking_pieces > 0 {
-                score -= blocking_pieces * 3;
-            }
-            
-            if white_file_masks[file_idx].popcnt() == 1 && 
-               (file_idx == 0 || white_file_masks[file_idx - 1] == BitBoard(0)) &&
-               (file_idx == 7 || white_file_masks[file_idx + 1] == BitBoard(0)) {
-                score -= 5;
-            }
-        }
-        
-        for sq in black_pawns_bb {
-            let file = sq.get_file();
-            let rank_idx = sq.get_rank() as usize;
-            let file_idx = file as usize;
-            
-            let mut is_passed = true;
-            let mut is_backward = false;
-            let mut is_candidate = false;
-            let mut is_hidden_passed = false;
-            let mut is_sentry = false;
-            let mut is_faker = false;
-            let mut is_weak = false;
-            let mut has_support = false;
-            let mut is_connected = false;
-            let mut blocking_pieces = 0;
-            
-            for enemy_sq in white_pawns_bb {
-                let enemy_file = enemy_sq.get_file();
-                let enemy_rank_idx = enemy_sq.get_rank() as usize;
-                let enemy_file_idx = enemy_file as usize;
-                
-                if (enemy_file_idx as i32 - file_idx as i32).abs() <= 1 && enemy_rank_idx < rank_idx {
-                    is_passed = false;
-                    
-                    if enemy_rank_idx == rank_idx - 1 && (enemy_file_idx as i32 - file_idx as i32).abs() == 1 {
-                        for adj_file_idx in [file_idx as i32 - 1, file_idx as i32 + 1] {
-                            if adj_file_idx >= 0 && adj_file_idx < 8 {
-                                let adj_file = File::from_index(adj_file_idx as usize);
-                                for r in (rank_idx + 1)..8 {
-                                    let adj_sq = Square::make_square(Rank::from_index(r), adj_file);
-                                    if (black_pawns_bb & BitBoard::from_square(adj_sq)) != BitBoard(0) {
-                                        has_support = true;
-                                        break;
-                                    }
-                                }
-                                if has_support {
-                                    break;
-                                }
-                            }
-                        }
-                        if !has_support {
-                            is_backward = true;
-                        }
-                    }
-                }
-            }
-            
-            for adj_file_idx in [file_idx as i32 - 1, file_idx as i32 + 1] {
-                if adj_file_idx >= 0 && adj_file_idx < 8 {
-                    let adj_file = File::from_index(adj_file_idx as usize);
-                    
-                    if (black_file_masks[adj_file_idx as usize] & 
-                        chess::get_rank(Rank::from_index(rank_idx))) != BitBoard(0) {
-                        is_connected = true;
-                    }
-                    
-                    for r in 0..rank_idx {
-                        let check_sq = Square::make_square(Rank::from_index(r), adj_file);
-                        if (black_pawns_bb & BitBoard::from_square(check_sq)) != BitBoard(0) {
-                            has_support = true;
-                        }
-                    }
-                }
-            }
-            
-            if !is_passed {
-                let mut attackers = 0;
-                let mut defenders = 0;
-                
-                for enemy_sq in white_pawns_bb {
-                    let enemy_file_idx = enemy_sq.get_file() as usize;
-                    let enemy_rank_idx = enemy_sq.get_rank() as usize;
-                    
-                    if (enemy_file_idx as i32 - file_idx as i32).abs() <= 1 && 
-                       enemy_rank_idx < rank_idx {
-                        attackers += 1;
-                    }
-                }
-                
-                for friend_sq in black_pawns_bb {
-                    let friend_file_idx = friend_sq.get_file() as usize;
-                    let friend_rank_idx = friend_sq.get_rank() as usize;
-                    
-                    if (friend_file_idx as i32 - file_idx as i32).abs() <= 1 && 
-                       friend_rank_idx <= rank_idx {
-                        defenders += 1;
-                    }
-                }
-                
-                if defenders >= attackers {
-                    is_candidate = true;
-                }
-            }
-            
-            for check_rank in 0..rank_idx {
-                let check_sq = Square::make_square(Rank::from_index(check_rank), file);
-                if (all_pieces_bb & BitBoard::from_square(check_sq)) != BitBoard(0) {
-                    blocking_pieces += 1;
-                }
-            }
-            
-            if blocking_pieces > 0 && is_passed {
-                is_hidden_passed = true;
-            }
-            
-            if rank_idx <= 3 && !is_passed {
-                let mut can_advance = true;
-                for r in 0..rank_idx {
-                    let advance_sq = Square::make_square(Rank::from_index(r), file);
-                    if (white_pawns_bb & BitBoard::from_square(advance_sq)) != BitBoard(0) {
-                        can_advance = false;
-                        break;
-                    }
-                }
-                if can_advance {
-                    is_sentry = true;
-                }
-            }
-            
-            if rank_idx >= 4 && !has_support && !is_connected {
-                let mut enemy_attacks = false;
-                for enemy_sq in white_pawns_bb {
-                    let enemy_file_idx = enemy_sq.get_file() as usize;
-                    let enemy_rank_idx = enemy_sq.get_rank() as usize;
-                    
-                    if (enemy_file_idx as i32 - file_idx as i32).abs() == 1 && 
-                       enemy_rank_idx == rank_idx - 1 {
-                        enemy_attacks = true;
-                        break;
-                    }
-                }
-                if enemy_attacks {
-                    is_faker = true;
-                }
-            }
-            
-            if is_backward || (!has_support && !is_connected) {
-                is_weak = true;
-            }
-            
-            let file_bb = chess::get_file(file);
-            let doubled = (black_pawns_bb & file_bb).popcnt() > 1;
-            
-            let mut isolated = true;
-            for adj_file_idx in [file_idx as i32 - 1, file_idx as i32 + 1] {
-                if adj_file_idx >= 0 && adj_file_idx < 8 {
-                    let adj_file_bb = chess::get_file(File::from_index(adj_file_idx as usize));
-                    if (black_pawns_bb & adj_file_bb) != BitBoard(0) {
-                        isolated = false;
-                        break;
-                    }
-                }
-            }
-            
-            if is_passed {
-                let passed_bonus = [0, 5, 10, 20, 35, 60, 100, 200][7 - rank_idx];
-                score -= passed_bonus;
-                
-                if is_hidden_passed {
-                    score -= passed_bonus / 2;
-                }
-            }
-            
-            if is_candidate {
-                let candidate_bonus = [0, 2, 4, 8, 16, 32, 64, 128][7 - rank_idx];
-                score -= candidate_bonus;
-            }
-            
-            if doubled {
-                score += 15;
-            }
-            
-            if isolated {
-                score += 10;
-                if file_idx == 0 || file_idx == 7 {
-                    score += 5;
-                }
-            }
-            
-            if is_backward {
-                score += 25;
-            }
-            
-            if is_connected {
-                score -= 8;
-                if rank_idx <= 3 {
-                    score -= (4 - rank_idx) as i32 * 4;
-                }
-            }
-            
-            if is_sentry {
-                score -= 12;
-            }
-            
-            if is_faker {
-                score += 15;
-            }
-            
-            if is_weak {
-                score += 8;
-            }
-            
-            if blocking_pieces > 0 {
-                score += blocking_pieces * 3;
-            }
-            
-            if black_file_masks[file_idx].popcnt() == 1 && 
-               (file_idx == 0 || black_file_masks[file_idx - 1] == BitBoard(0)) &&
-               (file_idx == 7 || black_file_masks[file_idx + 1] == BitBoard(0)) {
-                score += 5;
-            }
-        }
-        
-        let mut hanging_pairs = 0;
-        for file_idx in 2..6 {
-            if white_file_masks[file_idx] != BitBoard(0) && 
-               white_file_masks[file_idx + 1] != BitBoard(0) &&
-               white_file_masks[file_idx - 1] == BitBoard(0) &&
-               white_file_masks[file_idx + 2] == BitBoard(0) {
-                hanging_pairs += 1;
-            }
-        }
-        score -= hanging_pairs * 20;
-        
-        hanging_pairs = 0;
-        for file_idx in 2..6 {
-            if black_file_masks[file_idx] != BitBoard(0) && 
-               black_file_masks[file_idx + 1] != BitBoard(0) &&
-               black_file_masks[file_idx - 1] == BitBoard(0) &&
-               black_file_masks[file_idx + 2] == BitBoard(0) {
-                hanging_pairs += 1;
-            }
-        }
-        score += hanging_pairs * 20;
-        
-        let mut white_minority_attack = 0;
-        let mut black_minority_attack = 0;
-        
-        if white_queenside < black_queenside && white_queenside > 0 {
-            white_minority_attack = 1;
-        }
-        if black_queenside < white_queenside && black_queenside > 0 {
-            black_minority_attack = 1;
-        }
-        
-        score += white_minority_attack * 15;
-        score -= black_minority_attack * 15;
-        
-        let mut white_chains = 0;
-        let mut black_chains = 0;
-        
-        for sq in white_pawns_bb {
-            let file_idx = sq.get_file() as usize;
-            let rank_idx = sq.get_rank() as usize;
-            
-            if rank_idx > 0 {
-                for adj_file_idx in [file_idx as i32 - 1, file_idx as i32 + 1] {
-                    if adj_file_idx >= 0 && adj_file_idx < 8 {
-                        let support_sq = Square::make_square(
-                            Rank::from_index(rank_idx - 1), 
-                            File::from_index(adj_file_idx as usize)
-                        );
-                        if (white_pawns_bb & BitBoard::from_square(support_sq)) != BitBoard(0) {
-                            white_chains += 1;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        
-        for sq in black_pawns_bb {
-            let file_idx = sq.get_file() as usize;
-            let rank_idx = sq.get_rank() as usize;
-            
-            if rank_idx < 7 {
-                for adj_file_idx in [file_idx as i32 - 1, file_idx as i32 + 1] {
-                    if adj_file_idx >= 0 && adj_file_idx < 8 {
-                        let support_sq = Square::make_square(
-                            Rank::from_index(rank_idx + 1), 
-                            File::from_index(adj_file_idx as usize)
-                        );
-                        if (black_pawns_bb & BitBoard::from_square(support_sq)) != BitBoard(0) {
-                            black_chains += 1;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        
-        score += white_chains * 6;
-        score -= black_chains * 6;
-        
-        let mut white_race_potential = 0;
-        let mut black_race_potential = 0;
-        
-        for sq in white_pawns_bb {
-            let rank_idx = sq.get_rank() as usize;
-            if rank_idx >= 4 {
-                white_race_potential += (8 - rank_idx) as i32;
-            }
-        }
-        
-        for sq in black_pawns_bb {
-            let rank_idx = sq.get_rank() as usize;
-            if rank_idx <= 3 {
-                black_race_potential += rank_idx as i32;
-            }
-        }
-        
-        if white_race_potential > black_race_potential {
-            score += (white_race_potential - black_race_potential) * 2;
-        } else {
-            score -= (black_race_potential - white_race_potential) * 2;
-        }
-        
-        PAWN_HASH_AGE += 1;
-        if PAWN_HASH_TABLE[index][0].2 < PAWN_HASH_TABLE[index][1].2 {
-            PAWN_HASH_TABLE[index][0] = (pawn_key, score, PAWN_HASH_AGE);
-        } else {
-            PAWN_HASH_TABLE[index][1] = (pawn_key, score, PAWN_HASH_AGE);
-        }
-        
-        score
-    }
-}
+
 fn evaluate_rooks(board: &Board) -> i32 {
     let mut score = 0;
     
@@ -1296,7 +577,6 @@ fn evaluate(board: &Board) -> i32 {
     }   
     score += evaluate_mobility(board, Color::White);
     score -= evaluate_mobility(board, Color::Black);
-    score += evaluate_pawn_structure(board);
     score += evaluate_rooks(board);
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
         score += 30;
@@ -1356,11 +636,11 @@ fn order_moves(board: &Board, moves: Vec<ChessMove>, hash_move: Option<ChessMove
     scored_moves.into_iter().map(|(mv, _)| mv).collect()
 }
 
-fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats: &mut HashMap<&str, usize>, root_color: Color) -> i32 {
+fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats: &mut HashMap<&str, usize>, root_color: Color, max_time: f64) -> i32 {
     *stats.entry("nodes").or_insert(0) += 1;
     *stats.entry("qnodes").or_insert(0) += 1;
     
-    if start_time.elapsed().as_secs_f64() > TIME_LIMIT {
+    if start_time.elapsed().as_secs_f64() > max_time {
         return alpha;
     }
     
@@ -1399,7 +679,7 @@ fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats:
         }
         
         let new_board = board.make_move_new(mv);
-        let score = -quiesce(&new_board, -beta, -alpha, start_time, stats, root_color);
+        let score = -quiesce(&new_board, -beta, -alpha, start_time, stats, root_color, max_time);
         
         if score >= beta {
             return beta;
@@ -1413,13 +693,13 @@ fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats:
     alpha
 }
 
-fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_time: Instant, ply: usize, stats: &mut HashMap<&str, usize>, root_color: Color, tt: &mut TranspositionTable) -> i32 {
+fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_time: Instant, ply: usize, stats: &mut HashMap<&str, usize>, root_color: Color, tt: &mut TranspositionTable, max_time: f64) -> i32 {
     let is_pv = beta - alpha > 1;
     let is_root = ply == 0;
     
     *stats.entry("nodes").or_insert(0) += 1;
     
-    if start_time.elapsed().as_secs_f64() > TIME_LIMIT {
+    if start_time.elapsed().as_secs_f64() > max_time {
         return alpha;
     }
     
@@ -1452,7 +732,7 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
     let static_eval = if in_check { -30000 + ply as i32 } else { evaluate(board) };
     
     if depth == 0 {
-        return quiesce(board, alpha, beta, start_time, stats, root_color);
+        return quiesce(board, alpha, beta, start_time, stats, root_color, max_time);
     }
     
     let improving = !in_check && ply >= 2;
@@ -1460,7 +740,7 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
     if !is_pv && !in_check {
         if depth <= RAZOR_DEPTH && static_eval + RAZOR_MARGIN < alpha {
             let razor_alpha = alpha - RAZOR_MARGIN;
-            let razor_score = quiesce(board, razor_alpha, razor_alpha + 1, start_time, stats, root_color);
+            let razor_score = quiesce(board, razor_alpha, razor_alpha + 1, start_time, stats, root_color, max_time);
             if razor_score <= razor_alpha {
                 return razor_score;
             }
@@ -1488,6 +768,7 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
                         stats,
                         root_color,
                         tt,
+                        max_time
                     );
                     
                     if null_score >= beta {
@@ -1506,6 +787,7 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
                             stats,
                             root_color,
                             tt,
+                            max_time
                         );
                         
                         if verification_score >= beta {
@@ -1518,7 +800,7 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
     }
     
     if is_pv && depth >= IID_DEPTH && hash_move.is_none() {
-        negamax(board, depth - 2, alpha, beta, start_time, ply, stats, root_color, tt);
+        negamax(board, depth - 2, alpha, beta, start_time, ply, stats, root_color, tt, max_time);
         hash_move = tt.get_move(board_hash);
     }
     
@@ -1584,17 +866,17 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
         }
         
         let score = if i == 0 {
-            -negamax(&new_board, new_depth, -beta, -alpha, start_time, ply + 1, stats, root_color, tt)
+            -negamax(&new_board, new_depth, -beta, -alpha, start_time, ply + 1, stats, root_color, tt, max_time)
         } else {
-            let mut search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt);
+            let mut search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt, max_time);
             
             if !do_full_search && search_score > alpha {
                 new_depth = depth - 1 + extension;
-                search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt);
+                search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt, max_time);
             }
             
             if is_pv && search_score > alpha && search_score < beta {
-                search_score = -negamax(&new_board, new_depth, -beta, -alpha, start_time, ply + 1, stats, root_color, tt);
+                search_score = -negamax(&new_board, new_depth, -beta, -alpha, start_time, ply + 1, stats, root_color, tt, max_time);
             }
             
             search_score
@@ -1695,7 +977,7 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
         loop {
             let board_hash = compute_zobrist_hash(board);
             
-            let score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut *tt_guard);
+            let score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut *tt_guard, max_time);
             
             if start_time.elapsed().as_secs_f64() > max_time * 0.95 {
                 break;
@@ -1738,7 +1020,7 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                 alpha = -31000;
                 beta = 31000;
                 
-                let final_score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut *tt_guard);
+                let final_score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut *tt_guard, max_time);
                 
                 println!("info string depth {} full window result: score={}, aspiration_valid={}", 
                          depth, final_score, aspiration_found_valid_result);
@@ -1890,7 +1172,7 @@ impl UCIEngine {
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnightv1.7");
+        println!("id name RustKnightv1.7.1");
         println!("id author Anish");
         println!("uciok");
     }
