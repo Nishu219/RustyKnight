@@ -92,4 +92,4 @@ Contributions are welcome! Please open issues or pull requests to suggest improv
 
 ## License
 
-This project is open source and available under the MIT License.
+This project is open source and available under the GPL 3.0 License.
