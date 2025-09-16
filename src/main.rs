@@ -10,7 +10,6 @@ use std::time::Instant;
 use std::str::FromStr;
 const MAX_DEPTH: usize = 40;
 const TIME_LIMIT: f64 = 5.0;
-const ASPIRATION_WINDOW: i32 = 30;
 const DELTA_MARGIN: i32 = 200;
 const STATS: bool = true;
 const CONTEMPT: i32 = 25;
@@ -636,12 +635,13 @@ fn order_moves(board: &Board, moves: Vec<ChessMove>, hash_move: Option<ChessMove
     scored_moves.into_iter().map(|(mv, _)| mv).collect()
 }
 
-fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats: &mut HashMap<&str, usize>, root_color: Color, max_time: f64) -> i32 {
+fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats: &mut HashMap<&str, usize>, root_color: Color, max_time: f64, timeout_occurred: &mut bool) -> i32 {
     *stats.entry("nodes").or_insert(0) += 1;
     *stats.entry("qnodes").or_insert(0) += 1;
     
     if start_time.elapsed().as_secs_f64() > max_time {
-        return alpha;
+        *timeout_occurred = true;
+        return evaluate(board);
     }
     
     let stand_pat = evaluate(board);
@@ -674,12 +674,20 @@ fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats:
     captures.sort_by(|a, b| b.1.cmp(&a.1));
     
     for (mv, see_value) in captures {
+        if *timeout_occurred {
+            break;
+        }
+        
         if stand_pat + see_value + DELTA_MARGIN < alpha {
             continue;
         }
         
         let new_board = board.make_move_new(mv);
-        let score = -quiesce(&new_board, -beta, -alpha, start_time, stats, root_color, max_time);
+        let score = -quiesce(&new_board, -beta, -alpha, start_time, stats, root_color, max_time, timeout_occurred);
+        
+        if *timeout_occurred {
+            break;
+        }
         
         if score >= beta {
             return beta;
@@ -693,14 +701,15 @@ fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats:
     alpha
 }
 
-fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_time: Instant, ply: usize, stats: &mut HashMap<&str, usize>, root_color: Color, tt: &mut TranspositionTable, max_time: f64) -> i32 {
+fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_time: Instant, ply: usize, stats: &mut HashMap<&str, usize>, root_color: Color, tt: &mut TranspositionTable, max_time: f64, timeout_occurred: &mut bool) -> i32 {
     let is_pv = beta - alpha > 1;
     let is_root = ply == 0;
     
     *stats.entry("nodes").or_insert(0) += 1;
     
     if start_time.elapsed().as_secs_f64() > max_time {
-        return alpha;
+        *timeout_occurred = true;
+        return if ply > 0 { evaluate(board) } else { 0 };
     }
     
     if ply > 0 {
@@ -732,7 +741,7 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
     let static_eval = if in_check { -30000 + ply as i32 } else { evaluate(board) };
     
     if depth == 0 {
-        return quiesce(board, alpha, beta, start_time, stats, root_color, max_time);
+        return quiesce(board, alpha, beta, start_time, stats, root_color, max_time, timeout_occurred);
     }
     
     let improving = !in_check && ply >= 2;
@@ -740,7 +749,10 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
     if !is_pv && !in_check {
         if depth <= RAZOR_DEPTH && static_eval + RAZOR_MARGIN < alpha {
             let razor_alpha = alpha - RAZOR_MARGIN;
-            let razor_score = quiesce(board, razor_alpha, razor_alpha + 1, start_time, stats, root_color, max_time);
+            let razor_score = quiesce(board, razor_alpha, razor_alpha + 1, start_time, stats, root_color, max_time, timeout_occurred);
+            if *timeout_occurred {
+                return evaluate(board);
+            }
             if razor_score <= razor_alpha {
                 return razor_score;
             }
@@ -768,8 +780,13 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
                         stats,
                         root_color,
                         tt,
-                        max_time
+                        max_time,
+                        timeout_occurred
                     );
+                    
+                    if *timeout_occurred {
+                        return evaluate(board);
+                    }
                     
                     if null_score >= beta {
                         if depth < 12 {
@@ -787,8 +804,13 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
                             stats,
                             root_color,
                             tt,
-                            max_time
+                            max_time,
+                            timeout_occurred
                         );
+                        
+                        if *timeout_occurred {
+                            return evaluate(board);
+                        }
                         
                         if verification_score >= beta {
                             return null_score;
@@ -800,8 +822,10 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
     }
     
     if is_pv && depth >= IID_DEPTH && hash_move.is_none() {
-        negamax(board, depth - 2, alpha, beta, start_time, ply, stats, root_color, tt, max_time);
-        hash_move = tt.get_move(board_hash);
+        negamax(board, depth - 2, alpha, beta, start_time, ply, stats, root_color, tt, max_time, timeout_occurred);
+        if !*timeout_occurred {
+            hash_move = tt.get_move(board_hash);
+        }
     }
     
     let alpha_orig = alpha;
@@ -818,6 +842,10 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
     let mut moves_searched = 0;
     
     for (i, mv) in moves.iter().enumerate() {
+        if *timeout_occurred {
+            break;
+        }
+        
         let is_quiet = board.piece_on(mv.get_dest()).is_none() && mv.get_promotion().is_none();
         
         if !is_pv && !in_check && is_quiet && depth <= FUTILITY_DEPTH && i > 0 {
@@ -866,21 +894,31 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
         }
         
         let score = if i == 0 {
-            -negamax(&new_board, new_depth, -beta, -alpha, start_time, ply + 1, stats, root_color, tt, max_time)
+            -negamax(&new_board, new_depth, -beta, -alpha, start_time, ply + 1, stats, root_color, tt, max_time, timeout_occurred)
         } else {
-            let mut search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt, max_time);
+            let mut search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt, max_time, timeout_occurred);
             
-            if !do_full_search && search_score > alpha {
-                new_depth = depth - 1 + extension;
-                search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt, max_time);
+            if *timeout_occurred {
+                evaluate(board)
+            } else {
+                if !do_full_search && search_score > alpha {
+                    new_depth = depth - 1 + extension;
+                    search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt, max_time, timeout_occurred);
+                }
+                
+                if *timeout_occurred {
+                    evaluate(board)
+                } else if is_pv && search_score > alpha && search_score < beta {
+                    -negamax(&new_board, new_depth, -beta, -alpha, start_time, ply + 1, stats, root_color, tt, max_time, timeout_occurred)
+                } else {
+                    search_score
+                }
             }
-            
-            if is_pv && search_score > alpha && search_score < beta {
-                search_score = -negamax(&new_board, new_depth, -beta, -alpha, start_time, ply + 1, stats, root_color, tt, max_time);
-            }
-            
-            search_score
         };
+        
+        if *timeout_occurred {
+            break;
+        }
         
         moves_searched += 1;
         
@@ -900,8 +938,8 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
                             if killers[ply].len() >= 2 {
                                 killers[ply][1] = killers[ply][0];
                             } else if killers[ply].len() == 1 {
-                                let first_killer = killers[ply][0];  // Store the value first
-                                killers[ply].push(first_killer);     // Then use it
+                                let first_killer = killers[ply][0];
+                                killers[ply].push(first_killer);
                             }
                             if killers[ply].is_empty() {
                                 killers[ply].push(*mv);
@@ -924,31 +962,31 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
         }
     }
     
-    let flag = if best_value <= alpha_orig {
-        TTFlag::Upper
-    } else if best_value >= beta {
-        TTFlag::Lower
-    } else {
-        TTFlag::Exact
-    };
-    
-    tt.store(board_hash, depth, best_value, flag, best_move);
+    if !*timeout_occurred {
+        let flag = if best_value <= alpha_orig {
+            TTFlag::Upper
+        } else if best_value >= beta {
+            TTFlag::Lower
+        } else {
+            TTFlag::Exact
+        };
+        
+        tt.store(board_hash, depth, best_value, flag, best_move);
+    }
     
     best_value
 }
+
 fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
     let start_time = Instant::now();
     let mut best_move = None;
     let mut best_score = 0;
-    let root_color = board.side_to_move();    
+    let root_color = board.side_to_move();
+    
     let movegen = MoveGen::new_legal(board);
     for mv in movegen {
         let new_board = board.make_move_new(mv);
-        let is_checkmate = (*new_board.checkers() != BitBoard(0)) && {
-            let mut moves = MoveGen::new_legal(&new_board);
-            moves.next().is_none()
-        };
-        if is_checkmate {
+        if new_board.status() == BoardStatus::Checkmate {
             return Some(mv);
         }
     }
@@ -956,179 +994,100 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
     let mut tt_guard = TRANSPOSITION_TABLE.lock().unwrap();
     
     for depth in 1..=MAX_DEPTH {
-        if start_time.elapsed().as_secs_f64() > max_time * 0.85 {
+        if start_time.elapsed().as_secs_f64() > max_time * 0.8 {
             break;
         }
         
         let mut stats: HashMap<&str, usize> = HashMap::new();
-        let start_depth_time = Instant::now();
+        let mut timeout_occurred = false;
         
-        let (mut alpha, mut beta) = if depth <= 4 {
+        let (alpha, beta) = if depth <= 4 || best_move.is_none() {
             (-31000, 31000)
         } else {
-            (best_score - ASPIRATION_WINDOW, best_score + ASPIRATION_WINDOW)
+            (best_score - 50, best_score + 50)
         };
         
-        let mut aspirations_failed = 0;
-        let mut depth_best_move = None;
-        let mut depth_best_score = best_score;
-        let mut aspiration_found_valid_result = false;  // Track if aspiration found something good
+        let score = negamax(
+            board, 
+            depth, 
+            alpha, 
+            beta, 
+            start_time, 
+            0, 
+            &mut stats, 
+            root_color, 
+            &mut *tt_guard, 
+            max_time,
+            &mut timeout_occurred
+        );
         
-        loop {
-            let board_hash = compute_zobrist_hash(board);
-            
-            let score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut *tt_guard, max_time);
-            
-            if start_time.elapsed().as_secs_f64() > max_time * 0.95 {
-                break;
-            }
-            
-            if score <= alpha {
-                println!("info string depth {} failed low (score={}, alpha={})", depth, score, alpha);
-                let multiplier = (aspirations_failed + 1).min(4) as i32;
-                alpha = alpha.saturating_sub(ASPIRATION_WINDOW * multiplier).max(-31000);
-                aspirations_failed += 1;
-            } else if score >= beta {
-                println!("info string depth {} failed high (score={}, beta={})", depth, score, beta);
-                let multiplier = (aspirations_failed + 1).min(4) as i32;
-                beta = beta.saturating_add(ASPIRATION_WINDOW * multiplier).min(31000);
-                aspirations_failed += 1;
-            } else {
-                // SUCCESSFUL ASPIRATION SEARCH
-                println!("info string depth {} aspiration success (score={})", depth, score);
-                
-                // Only accept non-mate scores from aspiration search, or mate-for-us scores
-                if score.abs() < 30000 || score > 30000 {
-                    depth_best_score = score;
-                    aspiration_found_valid_result = true;
-                    
-                    if let Some(mv) = tt_guard.get_move(board_hash) {
-                        let movegen = MoveGen::new_legal(board);
-                        if movegen.into_iter().any(|legal_move| legal_move == mv) {
-                            depth_best_move = Some(mv);
-                            println!("info string depth {} aspiration found move: {}", depth, mv);
-                        }
-                    }
-                } else {
-                    println!("info string depth {} aspiration found mate-against-us, ignoring", depth);
-                }
-                break;
-            }
-            
-            if aspirations_failed > 4 {
-                println!("info string depth {} doing full window search", depth);
-                alpha = -31000;
-                beta = 31000;
-                
-                let final_score = negamax(board, depth, alpha, beta, start_time, 0, &mut stats, root_color, &mut *tt_guard, max_time);
-                
-                println!("info string depth {} full window result: score={}, aspiration_valid={}", 
-                         depth, final_score, aspiration_found_valid_result);
-                
-                // Decision logic for accepting full window result:
-                let should_accept_full_window = if !aspiration_found_valid_result {
-                    // No valid aspiration result, accept anything
-                    println!("info string depth {} no valid aspiration result, accepting full window", depth);
-                    true
-                } else if final_score < -30000 {
-                    // Full window found mate-against-us, definitely keep aspiration
-                    println!("info string depth {} full window found mate-against-us, keeping aspiration", depth);
-                    false
-                }  else if final_score > depth_best_score + 100 {
-                    // Full window is significantly better (normal case)
-                    println!("info string depth {} full window significantly better ({} vs {})", 
-                             depth, final_score, depth_best_score);
-                    true
-                } else {
-                    // Keep aspiration result
-                    println!("info string depth {} keeping aspiration result ({} vs {})", 
-                             depth, depth_best_score, final_score);
-                    false
-                };
-                
-                if should_accept_full_window {
-                    depth_best_score = final_score;
-                    
-                    if let Some(mv) = tt_guard.get_move(board_hash) {
-                        let movegen = MoveGen::new_legal(board);
-                        if movegen.into_iter().any(|legal_move| legal_move == mv) {
-                            depth_best_move = Some(mv);
-                            println!("info string depth {} full window found move: {}", depth, mv);
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        
-        // Update overall best if we found a valid move for this depth
-        if let Some(mv) = depth_best_move {
-            // Additional check: don't accept mate-against-us scores unless we have no choice
-            if depth_best_score < -30000 && best_move.is_some() {
-                println!("info string depth {} refusing mate-against-us score, keeping previous best", depth);
-                break;
-            }
-            
-            best_move = Some(mv);
-            best_score = depth_best_score;
-            println!("info string depth {} completed, final move: {} (score={})", depth, mv, best_score);
+        let final_score = if timeout_occurred || score <= alpha || score >= beta {
+            timeout_occurred = false;
+            negamax(
+                board, 
+                depth, 
+                -31000, 
+                31000, 
+                start_time, 
+                0, 
+                &mut stats, 
+                root_color, 
+                &mut *tt_guard, 
+                max_time,
+                &mut timeout_occurred
+            )
         } else {
-            println!("info string depth {} incomplete, no valid move found", depth);
-            break;
-        }
+            score
+        };
         
-        // Break if we found a mate-for-us
-        if best_score > 30000 {
-            println!("info string found mate-for-us, stopping search");
-            break;
-        }
-        
-        // Break if we're getting mate-against-us scores (something's wrong)
-        if best_score < -30000 {
-            println!("info string getting mate-against-us scores, stopping search");
-            break;
-        }
-        
-        if STATS {
-            let mut pv = Vec::new();
-            let mut temp_board = *board;
-            for _ in 0..depth {
-                let h = compute_zobrist_hash(&temp_board);
-                if let Some(mv) = tt_guard.get_move(h) {
-                    let movegen = MoveGen::new_legal(&temp_board);
-                    if movegen.into_iter().any(|legal_move| legal_move == mv) {
-                        pv.push(mv);
-                        temp_board = temp_board.make_move_new(mv);
-                    } else {
+        if !timeout_occurred {
+            let board_hash = compute_zobrist_hash(board);
+            if let Some(mv) = tt_guard.get_move(board_hash) {
+                let movegen = MoveGen::new_legal(board);
+                if movegen.into_iter().any(|legal_move| legal_move == mv) {
+                    best_move = Some(mv);
+                    best_score = final_score;
+                    
+                    if STATS {
+                        let mut pv = Vec::new();
+                        let mut temp_board = *board;
+                        for _ in 0..depth {
+                            let h = compute_zobrist_hash(&temp_board);
+                            if let Some(pv_move) = tt_guard.get_move(h) {
+                                let movegen = MoveGen::new_legal(&temp_board);
+                                if movegen.into_iter().any(|legal_move| legal_move == pv_move) {
+                                    pv.push(pv_move);
+                                    temp_board = temp_board.make_move_new(pv_move);
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        
+                        let nodes = *stats.get("nodes").unwrap_or(&0);
+                        let time_ms = (start_time.elapsed().as_secs_f64() * 1000.0) as u64;
+                        let nps = if time_ms > 0 { nodes * 1000 / time_ms as usize } else { 0 };
+                        let pv_string = pv.iter().map(|m| format!("{}", m)).collect::<Vec<_>>().join(" ");
+                        
+                        println!("info depth {} seldepth {} score cp {} nodes {} nps {} time {} pv {}", 
+                                 depth, depth, final_score, nodes, nps, time_ms, pv_string);
+                    }
+                    
+                    if final_score.abs() > 30000 {
                         break;
                     }
-                } else {
-                    break;
                 }
             }
-            
-            let depth_time_ms = (start_depth_time.elapsed().as_secs_f64() * 1000.0) as u64;
-            let nodes = *stats.get("nodes").unwrap_or(&0);
-            let nps = if depth_time_ms > 0 { nodes * 1000 / depth_time_ms as usize } else { 0 };
-            let pv_string = pv.iter().map(|m| format!("{}", m)).collect::<Vec<_>>().join(" ");
-
-            println!("info depth {} seldepth {} score cp {} nodes {} nps {} time {} pv {}", 
-                     depth, depth, best_score, nodes, nps, depth_time_ms, pv_string);
+        } else {
+            break;
         }
-    }
-    
-    if let Some(chosen_move) = best_move {
-        println!("info string final choice: {}", chosen_move);
     }
     
     best_move.or_else(|| {
         let moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
-        if moves.is_empty() {
-            None
-        } else {
-            println!("info string fallback to first legal move: {}", moves[0]);
-            Some(moves[0])
-        }
+        moves.first().copied()
     })
 }
 fn compute_zobrist_hash(board: &Board) -> u64 {
@@ -1172,7 +1131,7 @@ impl UCIEngine {
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnightv1.7.1");
+        println!("id name RustKnightv1.8");
         println!("id author Anish");
         println!("uciok");
     }
