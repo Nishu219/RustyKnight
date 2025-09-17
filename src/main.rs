@@ -9,7 +9,6 @@ use std::io::{self, BufRead};
 use std::time::Instant;
 use std::str::FromStr;
 const MAX_DEPTH: usize = 40;
-const TIME_LIMIT: f64 = 5.0;
 const DELTA_MARGIN: i32 = 200;
 const STATS: bool = true;
 const CONTEMPT: i32 = 25;
@@ -216,6 +215,7 @@ lazy_static! {
     static ref KILLER_MOVES: Mutex<Vec<Vec<ChessMove>>> = Mutex::new(Vec::new());
     static ref HISTORY_HEURISTIC: Mutex<HashMap<ChessMove, i32>> = Mutex::new(HashMap::new());
     static ref TRANSPOSITION_TABLE: Mutex<TranspositionTable> = Mutex::new(TranspositionTable::new(1024));
+    static ref REPETITION_TABLE: Mutex<HashMap<u64, usize>> = Mutex::new(HashMap::new());
 }
 struct TranspositionTable {
     table: HashMap<u64, TTEntry>,
@@ -333,6 +333,21 @@ impl MaterialHashTable {
     }
 }
 
+fn is_repetition(position_hash: u64) -> bool {
+    let rep_table = REPETITION_TABLE.lock().unwrap();
+    *rep_table.get(&position_hash).unwrap_or(&0) >= 2
+}
+
+fn update_repetition_table(position_hash: u64) {
+    let mut rep_table = REPETITION_TABLE.lock().unwrap();
+    *rep_table.entry(position_hash).or_insert(0) += 1;
+}
+
+fn clear_repetition_table() {
+    let mut rep_table = REPETITION_TABLE.lock().unwrap();
+    rep_table.clear();
+}
+
 fn compute_material_key(board: &Board) -> u64 {
     let mut key = 0u64;
     for &piece in &[Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen] {
@@ -356,7 +371,7 @@ fn compute_material_eval(board: &Board) -> i32 {
 fn phase_value(board: &Board) -> i32 {
     let mut phase = 0;
     for sq_idx in 0..64 {
-        let square = unsafe { Square::new(sq_idx) }; // Square::new is unsafe
+        let square = unsafe { Square::new(sq_idx) };
         if let Some(piece) = board.piece_on(square) {
             match piece {
                 Piece::Knight | Piece::Bishop => phase += 1,
@@ -368,9 +383,7 @@ fn phase_value(board: &Board) -> i32 {
     }
     std::cmp::min(phase, 24)
 }
-fn is_endgame(board: &Board) -> bool {
-    phase_value(board) < 8
-}
+
 fn see(board: &Board, mv: ChessMove) -> i32 {
     let to_sq = mv.get_dest();
     let from_sq = mv.get_source();
@@ -396,7 +409,7 @@ fn see(board: &Board, mv: ChessMove) -> i32 {
         for &pt in &[Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen, Piece::King] {
             let pieces_bb = *board.pieces(pt);
             let candidates_bb = cur_attackers & pieces_bb & board.color_combined(side);
-            if candidates_bb != BitBoard(0) { // Use != BitBoard(0)
+            if candidates_bb != BitBoard(0) {
                 if let Some(attacker_sq) = candidates_bb.into_iter().next() {
                      let value = VALUES[&pt];
                      if value < min_value {
@@ -504,7 +517,20 @@ fn evaluate(board: &Board) -> i32 {
             return cached;
         }
     }
-    let is_checkmate = (*board.checkers() != BitBoard(0)) && { // Use != BitBoard(0)
+    
+    if is_repetition(key) {
+        let result = if board.side_to_move() == Color::White { -CONTEMPT } else { CONTEMPT };
+        let mut cache = EVAL_CACHE.lock().unwrap();
+        cache.insert(key.clone(), result);
+        if cache.len() > EVAL_CACHE_MAX {
+            if let Some(first_key) = cache.keys().next().cloned() {
+                cache.remove(&first_key);
+            }
+        }
+        return result;
+    }
+    
+    let is_checkmate = (*board.checkers() != BitBoard(0)) && {
         let mut moves = MoveGen::new_legal(board);
         moves.next().is_none()
     };
@@ -519,7 +545,7 @@ fn evaluate(board: &Board) -> i32 {
         }
         return result;
     }
-    let is_stalemate = *board.checkers() == BitBoard(0) && { // Use == BitBoard(0)
+    let is_stalemate = *board.checkers() == BitBoard(0) && {
         let mut moves = MoveGen::new_legal(board);
         moves.next().is_none()
     };
@@ -548,12 +574,11 @@ fn evaluate(board: &Board) -> i32 {
         }
     };
     let mut score = material;
-    let endgame = is_endgame(board);
     let phase = phase_value(board);
     for sq_idx in 0..64 {
-        let square = unsafe { Square::new(sq_idx) }; // Square::new is unsafe
+        let square = unsafe { Square::new(sq_idx) };
         if let Some(piece) = board.piece_on(square) {
-            let piece_color = if (*board.color_combined(Color::White) & BitBoard::from_square(square)) != BitBoard(0) { // Use != BitBoard(0)
+            let piece_color = if (*board.color_combined(Color::White) & BitBoard::from_square(square)) != BitBoard(0) {
                 Color::White
             } else {
                 Color::Black
@@ -701,7 +726,7 @@ fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats:
     alpha
 }
 
-fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_time: Instant, ply: usize, stats: &mut HashMap<&str, usize>, root_color: Color, tt: &mut TranspositionTable, max_time: f64, timeout_occurred: &mut bool) -> i32 {
+fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: Instant, ply: usize, stats: &mut HashMap<&str, usize>, root_color: Color, tt: &mut TranspositionTable, max_time: f64, timeout_occurred: &mut bool) -> i32 {
     let is_pv = beta - alpha > 1;
     let is_root = ply == 0;
     
@@ -712,7 +737,13 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
         return if ply > 0 { evaluate(board) } else { 0 };
     }
     
+    let position_hash = compute_zobrist_hash(board);
+    
     if ply > 0 {
+        if is_repetition(position_hash) {
+            return if board.side_to_move() == root_color { -CONTEMPT } else { CONTEMPT };
+        }
+        
         if board.status() == BoardStatus::Checkmate {
             return -30000 + ply as i32;
         }
@@ -867,6 +898,9 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
         }
         
         let new_board = board.make_move_new(*mv);
+        let new_position_hash = compute_zobrist_hash(&new_board);
+        update_repetition_table(new_position_hash);
+        
         let gives_check = *new_board.checkers() != BitBoard(0);
         
         let mut extension = 0;
@@ -915,6 +949,16 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_tim
                 }
             }
         };
+        
+        {
+            let mut rep_table = REPETITION_TABLE.lock().unwrap();
+            if let Some(count) = rep_table.get_mut(&new_position_hash) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    rep_table.remove(&new_position_hash);
+                }
+            }
+        }
         
         if *timeout_occurred {
             break;
@@ -1093,9 +1137,9 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
 fn compute_zobrist_hash(board: &Board) -> u64 {
     let mut h = 0;
     for sq_idx in 0..64 {
-        let square = unsafe { Square::new(sq_idx) }; // Square::new is unsafe
+        let square = unsafe { Square::new(sq_idx) };
         if let Some(piece) = board.piece_on(square) {
-            let piece_color = if (*board.color_combined(Color::White) & BitBoard::from_square(square)) != BitBoard(0) { // Use != BitBoard(0)
+            let piece_color = if (*board.color_combined(Color::White) & BitBoard::from_square(square)) != BitBoard(0) {
                 Color::White
             } else {
                 Color::Black
@@ -1120,6 +1164,7 @@ fn compute_zobrist_hash(board: &Board) -> u64 {
 struct UCIEngine {
     board: Board,
     debug: bool,
+    position_history: Vec<u64>,
 }
 
 impl UCIEngine {
@@ -1127,11 +1172,12 @@ impl UCIEngine {
         UCIEngine {
             board: Board::default(),
             debug: false,
+            position_history: Vec::new(),
         }
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnightv1.8");
+        println!("id name RustKnightv1.9");
         println!("id author Anish");
         println!("uciok");
     }
@@ -1144,14 +1190,19 @@ impl UCIEngine {
         if tokens.len() < 2 {
             return;
         }
+        
+        self.position_history.clear();
 
         match tokens[1] {
             "startpos" => {
                 self.board = Board::default();
+                self.position_history.push(compute_zobrist_hash(&self.board));
+                
                 if tokens.len() > 2 && tokens[2] == "moves" {
                     for move_str in &tokens[3..] {
                         if let Ok(chess_move) = ChessMove::from_str(move_str) {
                             self.board = self.board.make_move_new(chess_move);
+                            self.position_history.push(compute_zobrist_hash(&self.board));
                         }
                     }
                 }
@@ -1163,6 +1214,7 @@ impl UCIEngine {
                 let fen = tokens[2..8].join(" ");
                 if let Ok(board) = Board::from_str(&fen) {
                     self.board = board;
+                    self.position_history.push(compute_zobrist_hash(&self.board));
                     
                     let mut moves_start = None;
                     for (i, &token) in tokens.iter().enumerate() {
@@ -1176,12 +1228,18 @@ impl UCIEngine {
                         for move_str in &tokens[start..] {
                             if let Ok(chess_move) = ChessMove::from_str(move_str) {
                                 self.board = self.board.make_move_new(chess_move);
+                                self.position_history.push(compute_zobrist_hash(&self.board));
                             }
                         }
                     }
                 }
             }
             _ => {}
+        }
+        
+        clear_repetition_table();
+        for &hash in &self.position_history {
+            update_repetition_table(hash);
         }
     }
 
@@ -1307,6 +1365,8 @@ impl UCIEngine {
                 "register" => {},
                 "ucinewgame" => {
                     self.board = Board::default();
+                    self.position_history.clear();
+                    self.position_history.push(compute_zobrist_hash(&self.board));
                     {
                         let mut tt = TRANSPOSITION_TABLE.lock().unwrap();
                         tt.clear();
@@ -1320,6 +1380,7 @@ impl UCIEngine {
                         let mut history = HISTORY_HEURISTIC.lock().unwrap();
                         history.clear();
                     }
+                    clear_repetition_table();
                 }
                 "position" => self.handle_position(&tokens),
                 "go" => self.handle_go(&tokens),
