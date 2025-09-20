@@ -27,6 +27,8 @@ const LMP_MOVE_COUNTS: [usize; 5] = [0, 3, 6, 12, 18];
 const SEE_QUIET_THRESHOLD: i32 = -60;
 const SEE_CAPTURE_THRESHOLD: i32 = -100;
 const MOBILITY_BONUS: [i32; 5] = [0, 4, 5, 2, 1];
+const SINGULAR_EXTENSION_DEPTH: usize = 6;
+const SINGULAR_MARGIN: i32 = 80;
 lazy_static! {
     static ref VALUES: HashMap<Piece, i32> = {
         let mut m = HashMap::new();
@@ -216,6 +218,73 @@ lazy_static! {
     static ref HISTORY_HEURISTIC: Mutex<HashMap<ChessMove, i32>> = Mutex::new(HashMap::new());
     static ref TRANSPOSITION_TABLE: Mutex<TranspositionTable> = Mutex::new(TranspositionTable::new(1024));
     static ref REPETITION_TABLE: Mutex<HashMap<u64, usize>> = Mutex::new(HashMap::new());
+    static ref PAWN_HASH_TABLE: Mutex<HashMap<u64, i32>> = Mutex::new(HashMap::new());
+    static ref FILE_MASKS: [BitBoard; 8] = [
+        BitBoard::new(0x0101010101010101),
+        BitBoard::new(0x0202020202020202),
+        BitBoard::new(0x0404040404040404),
+        BitBoard::new(0x0808080808080808),
+        BitBoard::new(0x1010101010101010),
+        BitBoard::new(0x2020202020202020),
+        BitBoard::new(0x4040404040404040),
+        BitBoard::new(0x8080808080808080),
+    ];
+    static ref ADJACENT_FILES: [BitBoard; 8] = [
+        BitBoard::new(0x0202020202020202),
+        BitBoard::new(0x0505050505050505),
+        BitBoard::new(0x0A0A0A0A0A0A0A0A),
+        BitBoard::new(0x1414141414141414),
+        BitBoard::new(0x2828282828282828),
+        BitBoard::new(0x5050505050505050),
+        BitBoard::new(0xA0A0A0A0A0A0A0A0),
+        BitBoard::new(0x4040404040404040),
+    ];
+    static ref WHITE_PASSED_MASKS: [BitBoard; 64] = {
+        let mut masks = [BitBoard::new(0); 64];
+        for sq in 0..64 {
+            let square = unsafe { Square::new(sq as u8) };
+            let file = square.get_file().to_index();
+            let rank = square.get_rank().to_index();
+            
+            if rank < 7 {
+                let mut mask = BitBoard::new(0);
+                for r in (rank + 1)..8 {
+                    mask |= BitBoard::new(1u64 << (r * 8 + file));
+                    if file > 0 {
+                        mask |= BitBoard::new(1u64 << (r * 8 + file - 1));
+                    }
+                    if file < 7 {
+                        mask |= BitBoard::new(1u64 << (r * 8 + file + 1));
+                    }
+                }
+                masks[sq as usize] = mask;
+            }
+        }
+        masks
+    };
+    static ref BLACK_PASSED_MASKS: [BitBoard; 64] = {
+        let mut masks = [BitBoard::new(0); 64];
+        for sq in 0..64 {
+            let square = unsafe { Square::new(sq as u8) };
+            let file = square.get_file().to_index();
+            let rank = square.get_rank().to_index();
+            
+            if rank > 0 {
+                let mut mask = BitBoard::new(0);
+                for r in 0..rank {
+                    mask |= BitBoard::new(1u64 << (r * 8 + file));
+                    if file > 0 {
+                        mask |= BitBoard::new(1u64 << (r * 8 + file - 1));
+                    }
+                    if file < 7 {
+                        mask |= BitBoard::new(1u64 << (r * 8 + file + 1));
+                    }
+                }
+                masks[sq as usize] = mask;
+            }
+        }
+        masks
+    };
 }
 struct TranspositionTable {
     table: HashMap<u64, TTEntry>,
@@ -332,7 +401,11 @@ impl MaterialHashTable {
         }
     }
 }
-
+fn compute_pawn_hash(board: &Board) -> u64 {
+    let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+    let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+    white_pawns.0 ^ (black_pawns.0 << 1)
+}
 fn is_repetition(position_hash: u64) -> bool {
     let rep_table = REPETITION_TABLE.lock().unwrap();
     *rep_table.get(&position_hash).unwrap_or(&0) >= 2
@@ -508,6 +581,147 @@ fn evaluate_mobility(board: &Board, color: Color) -> i32 {
     
     mobility
 }
+fn evaluate_pawns(board: &Board) -> i32 {
+    let pawn_hash = compute_pawn_hash(board);
+    
+    {
+        let cache = PAWN_HASH_TABLE.lock().unwrap();
+        if let Some(&cached_score) = cache.get(&pawn_hash) {
+            return cached_score;
+        }
+    }
+    
+    let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+    let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+    let all_pawns = white_pawns | black_pawns;
+    
+    let mut score = 0;
+    
+    let mut white_file_counts = [0u8; 8];
+    let mut black_file_counts = [0u8; 8];
+    
+    for square in white_pawns {
+        white_file_counts[square.get_file().to_index()] += 1;
+    }
+    for square in black_pawns {
+        black_file_counts[square.get_file().to_index()] += 1;
+    }
+    
+    for file_idx in 0..8 {
+        if white_file_counts[file_idx] >= 2 {
+            score -= 20 * (white_file_counts[file_idx] - 1) as i32;
+        }
+        if black_file_counts[file_idx] >= 2 {
+            score += 20 * (black_file_counts[file_idx] - 1) as i32;
+        }
+        
+        if white_file_counts[file_idx] > 0 {
+            let has_adjacent = (file_idx > 0 && white_file_counts[file_idx - 1] > 0) ||
+                              (file_idx < 7 && white_file_counts[file_idx + 1] > 0);
+            if !has_adjacent {
+                score -= 15;
+            }
+        }
+        
+        if black_file_counts[file_idx] > 0 {
+            let has_adjacent = (file_idx > 0 && black_file_counts[file_idx - 1] > 0) ||
+                              (file_idx < 7 && black_file_counts[file_idx + 1] > 0);
+            if !has_adjacent {
+                score += 15;
+            }
+        }
+    }
+    
+    for square in white_pawns {
+        let sq_idx = square.to_index();
+        let file = square.get_file().to_index();
+        let rank = square.get_rank().to_index();
+        
+        if rank >= 1 && rank <= 6 {
+            let front_square = unsafe { Square::new((sq_idx + 8) as u8) };
+            if (BitBoard::from_square(front_square) & white_pawns) != BitBoard::new(0) {
+                score += 5;
+                
+                if file > 0 {
+                    let diag_left = unsafe { Square::new((sq_idx + 7) as u8) };
+                    if (BitBoard::from_square(diag_left) & white_pawns) != BitBoard::new(0) {
+                        score += 3;
+                    }
+                }
+                if file < 7 {
+                    let diag_right = unsafe { Square::new((sq_idx + 9) as u8) };
+                    if (BitBoard::from_square(diag_right) & white_pawns) != BitBoard::new(0) {
+                        score += 3;
+                    }
+                }
+            }
+        }
+        
+        if (WHITE_PASSED_MASKS[sq_idx] & black_pawns) == BitBoard::new(0) {
+            let passed_bonus = match rank {
+                1 => 5,
+                2 => 10,
+                3 => 20,
+                4 => 35,
+                5 => 55,
+                6 => 80,
+                _ => 0,
+            };
+            score += passed_bonus;
+        }
+    }
+    
+    for square in black_pawns {
+        let sq_idx = square.to_index();
+        let file = square.get_file().to_index();
+        let rank = square.get_rank().to_index();
+        
+        if rank >= 1 && rank <= 6 {
+            let front_square = unsafe { Square::new((sq_idx - 8) as u8) };
+            if (BitBoard::from_square(front_square) & black_pawns) != BitBoard::new(0) {
+                score -= 5;
+                
+                if file > 0 {
+                    let diag_left = unsafe { Square::new((sq_idx - 9) as u8) };
+                    if (BitBoard::from_square(diag_left) & black_pawns) != BitBoard::new(0) {
+                        score -= 3;
+                    }
+                }
+                if file < 7 {
+                    let diag_right = unsafe { Square::new((sq_idx - 7) as u8) };
+                    if (BitBoard::from_square(diag_right) & black_pawns) != BitBoard::new(0) {
+                        score -= 3;
+                    }
+                }
+            }
+        }
+        
+        if (BLACK_PASSED_MASKS[sq_idx] & white_pawns) == BitBoard::new(0) {
+            let passed_bonus = match rank {
+                6 => 5,
+                5 => 10,
+                4 => 20,
+                3 => 35,
+                2 => 55,
+                1 => 80,
+                _ => 0,
+            };
+            score -= passed_bonus;
+        }
+    }
+    
+    {
+        let mut cache = PAWN_HASH_TABLE.lock().unwrap();
+        if cache.len() >= 10000 {
+            if let Some(first_key) = cache.keys().next().cloned() {
+                cache.remove(&first_key);
+            }
+        }
+        cache.insert(pawn_hash, score);
+    }
+    
+    score
+}
 const EVAL_CACHE_MAX: usize = 20000;
 fn evaluate(board: &Board) -> i32 {
     let key = compute_zobrist_hash(board);
@@ -602,6 +816,7 @@ fn evaluate(board: &Board) -> i32 {
     score += evaluate_mobility(board, Color::White);
     score -= evaluate_mobility(board, Color::Black);
     score += evaluate_rooks(board);
+    score += evaluate_pawns(board);
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
         score += 30;
     }
@@ -900,18 +1115,76 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
         let new_board = board.make_move_new(*mv);
         let new_position_hash = compute_zobrist_hash(&new_board);
         update_repetition_table(new_position_hash);
-        
         let gives_check = *new_board.checkers() != BitBoard(0);
+
+let mut extension = 0;
+if gives_check {
+    extension = 1;
+} else if let Some(piece) = board.piece_on(mv.get_source()) {
+    if piece == Piece::Pawn && (mv.get_dest().get_rank() == Rank::Eighth || mv.get_dest().get_rank() == Rank::First) {
+        extension = 1;
+    }
+}
+
+// Singular extension
+if depth >= SINGULAR_EXTENSION_DEPTH && 
+   Some(*mv) == hash_move && 
+   extension == 0 && 
+   !is_root {
+    
+    let singular_beta = best_value - SINGULAR_MARGIN;
+    let mut singular_search_failed = true;
+    
+    // Test all other moves at reduced depth
+    for &test_move in moves.iter() {
+        if test_move == *mv {
+            continue; // Skip the hash move
+        }
         
-        let mut extension = 0;
-        if gives_check {
-            extension = 1;
-        } else if let Some(piece) = board.piece_on(mv.get_source()) {
-            if piece == Piece::Pawn && (mv.get_dest().get_rank() == Rank::Eighth || mv.get_dest().get_rank() == Rank::First) {
-                extension = 1;
+        let test_board = board.make_move_new(test_move);
+        let test_position_hash = compute_zobrist_hash(&test_board);
+        update_repetition_table(test_position_hash);
+        
+        let singular_score = -negamax(
+            &test_board,
+            (depth - 1) / 2, // Reduced depth for singular search
+            -singular_beta - 1,
+            -singular_beta,
+            start_time,
+            ply + 1,
+            stats,
+            root_color,
+            tt,
+            max_time,
+            timeout_occurred
+        );
+        
+        // Undo repetition table update
+        {
+            let mut rep_table = REPETITION_TABLE.lock().unwrap();
+            if let Some(count) = rep_table.get_mut(&test_position_hash) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    rep_table.remove(&test_position_hash);
+                }
             }
         }
         
+        if *timeout_occurred {
+            break;
+        }
+        
+        if singular_score > singular_beta {
+            singular_search_failed = false;
+            break;
+        }
+    }
+    
+    // If no other move beats singular_beta, extend this move
+    if !*timeout_occurred && singular_search_failed {
+        extension = 1;
+    }
+}      
         let mut new_depth = depth - 1 + extension;
         let mut do_full_search = true;
         
@@ -1177,7 +1450,7 @@ impl UCIEngine {
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnightv1.9");
+        println!("id name RustKnightv1.9.1");
         println!("id author Anish");
         println!("uciok");
     }
