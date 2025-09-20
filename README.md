@@ -34,6 +34,14 @@ The engine assesses rook positioning and activity with the following heuristics:
 - **Mobility Evaluation:** Rewards pieces (knights, bishops, rooks, and queens) based on the number of legal moves available to them.
 ---
 
+### 7.Pawn Evaluation
+Analyzes pawn structure to detect weaknesses and strengths:
+- **Doubled Pawns:** Penalized by -20 per extra pawn on the same file.
+- **Isolated Pawns:** Penalized by -15 if there are no adjacent pawns on neighboring files.
+- **Connected Pawns:** Bonus of +3 for pawns supporting each other diagonally.
+- **Passed Pawns:** Bonuses increase with rank advancement:
+   Ranks 2–6: +5 to +80 (based on proximity to promotion)
+- **Pawn Chains:** Additional +5 bonus for pawns protected from behind by another pawn.
 ## Search Methods
 
 RustyKnight implements several search algorithms and pruning techniques:
@@ -66,7 +74,7 @@ RustyKnight implements several search algorithms and pruning techniques:
 - **Late Move Reductions (LMR):** Reduces search depth for less promising moves.
 - **Null Move Pruning:** Searches positions where the side to move passes (makes a "null" move) to detect threats.
 - **Internal Iterative Deepening (IID):** Used to find a good move when hash move is unavailable.
-
+- **Singular Extensions:** Extends the search depth of a move that is significantly better than its alternatives, identified through a verification search with a reduced margin. Helps focus the search on critical lines.
 ---
 
 ## Features
