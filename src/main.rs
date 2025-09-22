@@ -27,8 +27,9 @@ const LMP_MOVE_COUNTS: [usize; 5] = [0, 3, 6, 12, 18];
 const SEE_QUIET_THRESHOLD: i32 = -60;
 const SEE_CAPTURE_THRESHOLD: i32 = -100;
 const MOBILITY_BONUS: [i32; 5] = [0, 4, 5, 2, 1];
-const SINGULAR_EXTENSION_DEPTH: usize = 6;
-const SINGULAR_MARGIN: i32 = 80;
+const TROPISM_WEIGHTS: [(i32, i32); 4] = [(3, 2), (2, 3), (1, 1), (2, 1)];
+const ATTACK_WEIGHTS: [(i32, i32); 5] = [(4, 2), (3, 4), (2, 1), (3, 1), (1, 0)];
+const PIECE_ORDER: [Piece; 5] = [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight, Piece::Pawn];
 lazy_static! {
     static ref VALUES: HashMap<Piece, i32> = {
         let mut m = HashMap::new();
@@ -722,6 +723,132 @@ fn evaluate_pawns(board: &Board) -> i32 {
     
     score
 }
+fn compute_tropism_score(piece_bb: BitBoard, target_file: i32, target_rank: i32, piece_idx: usize) -> (i32, i32) {
+    let (mg_weight, eg_weight) = TROPISM_WEIGHTS[piece_idx];
+    let mut mg_total = 0;
+    let mut eg_total = 0;
+    
+    for square in piece_bb {
+        let file_dist = (square.get_file().to_index() as i32 - target_file).abs();
+        let rank_dist = (square.get_rank().to_index() as i32 - target_rank).abs();
+        
+        let distance = if piece_idx == 3 {
+            (file_dist + rank_dist + file_dist.max(rank_dist)) / 2
+        } else {
+            file_dist.max(rank_dist)
+        };
+        
+        let max_dist = if piece_idx == 3 { 5 } else { 7 };
+        let tropism = (if piece_idx == 3 { 6 } else { 8 }) - distance.min(max_dist);
+        
+        mg_total += tropism * mg_weight;
+        eg_total += tropism * eg_weight / if piece_idx == 2 { 2 } else { if piece_idx == 3 { 3 } else { 1 } };
+    }
+    
+    (mg_total, eg_total)
+}
+
+fn evaluate_king_tropism(board: &Board, phase: i32) -> i32 {
+    let white_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::White)).into_iter().next().unwrap();
+    let black_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::Black)).into_iter().next().unwrap();
+    
+    let white_king_file = white_king_sq.get_file().to_index() as i32;
+    let white_king_rank = white_king_sq.get_rank().to_index() as i32;
+    let black_king_file = black_king_sq.get_file().to_index() as i32;
+    let black_king_rank = black_king_sq.get_rank().to_index() as i32;
+    
+    let mut mg_score = 0;
+    let mut eg_score = 0;
+    
+    for (i, &piece_type) in PIECE_ORDER.iter().enumerate().take(4) {
+        let white_pieces = board.pieces(piece_type) & board.color_combined(Color::White);
+        let black_pieces = board.pieces(piece_type) & board.color_combined(Color::Black);
+        
+        let (white_mg, white_eg) = compute_tropism_score(white_pieces, black_king_file, black_king_rank, i);
+        let (black_mg, black_eg) = compute_tropism_score(black_pieces, white_king_file, white_king_rank, i);
+        
+        mg_score += white_mg - black_mg;
+        eg_score += white_eg - black_eg;
+    }
+    
+    ((mg_score * phase) + (eg_score * (24 - phase))) / 24
+}
+fn get_king_ring(king_sq: Square) -> BitBoard {
+    let king_file = king_sq.get_file().to_index() as i32;
+    let king_rank = king_sq.get_rank().to_index() as i32;
+    let mut ring = BitBoard::new(0);
+    
+    for file_offset in -1..=1 {
+        for rank_offset in -1..=1 {
+            if file_offset == 0 && rank_offset == 0 { continue; }
+            let new_file = king_file + file_offset;
+            let new_rank = king_rank + rank_offset;
+            if new_file >= 0 && new_file < 8 && new_rank >= 0 && new_rank < 8 {
+                let sq_idx = (new_rank * 8 + new_file) as u8;
+                ring |= BitBoard::from_square(unsafe { Square::new(sq_idx) });
+            }
+        }
+    }
+    ring
+}
+
+fn count_piece_attacks(pieces: BitBoard, target_ring: BitBoard, piece_type: Piece, board: &Board) -> i32 {
+    let mut attacks = 0;
+    
+    for square in pieces {
+        let attack_bb = match piece_type {
+            Piece::Queen => {
+                let rook_attacks = chess::get_rook_rays(square) & !board.combined();
+                let bishop_attacks = chess::get_bishop_rays(square) & !board.combined();
+                rook_attacks | bishop_attacks
+            },
+            Piece::Rook => chess::get_rook_rays(square) & !board.combined(),
+            Piece::Bishop => chess::get_bishop_rays(square) & !board.combined(),
+            Piece::Knight => chess::get_knight_moves(square),
+            Piece::Pawn => {
+                let color = if (board.color_combined(Color::White) & BitBoard::from_square(square)) != BitBoard::new(0) {
+                    Color::White
+                } else {
+                    Color::Black
+                };
+                chess::get_pawn_attacks(square, color, *board.combined())
+            },
+            _ => BitBoard::new(0),
+        };
+        
+        attacks += (attack_bb & target_ring).popcnt() as i32;
+    }
+    
+    attacks
+}
+
+fn evaluate_king_ring_attacks(board: &Board, phase: i32) -> i32 {
+    let white_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::White)).into_iter().next().unwrap();
+    let black_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::Black)).into_iter().next().unwrap();
+    
+    let white_king_ring = get_king_ring(white_king_sq);
+    let black_king_ring = get_king_ring(black_king_sq);
+    
+    let mut mg_score = 0;
+    let mut eg_score = 0;
+    
+    for (i, &piece_type) in PIECE_ORDER.iter().enumerate() {
+        let white_pieces = board.pieces(piece_type) & board.color_combined(Color::White);
+        let black_pieces = board.pieces(piece_type) & board.color_combined(Color::Black);
+        
+        let white_attacks = count_piece_attacks(white_pieces, black_king_ring, piece_type, board);
+        let black_attacks = count_piece_attacks(black_pieces, white_king_ring, piece_type, board);
+        
+        let (mg_weight, eg_weight) = ATTACK_WEIGHTS[i];
+        
+        mg_score += white_attacks * mg_weight;
+        mg_score -= black_attacks * mg_weight;
+        eg_score += white_attacks * eg_weight;
+        eg_score -= black_attacks * eg_weight;
+    }
+    
+    ((mg_score * phase) + (eg_score * (24 - phase))) / 24
+}
 const EVAL_CACHE_MAX: usize = 20000;
 fn evaluate(board: &Board) -> i32 {
     let key = compute_zobrist_hash(board);
@@ -817,6 +944,8 @@ fn evaluate(board: &Board) -> i32 {
     score -= evaluate_mobility(board, Color::Black);
     score += evaluate_rooks(board);
     score += evaluate_pawns(board);
+    score += evaluate_king_tropism(board, phase);
+    score += evaluate_king_ring_attacks(board, phase);
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
         score += 30;
     }
@@ -940,7 +1069,6 @@ fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats:
     
     alpha
 }
-
 fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: Instant, ply: usize, stats: &mut HashMap<&str, usize>, root_color: Color, tt: &mut TranspositionTable, max_time: f64, timeout_occurred: &mut bool) -> i32 {
     let is_pv = beta - alpha > 1;
     let is_root = ply == 0;
@@ -1115,76 +1243,18 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
         let new_board = board.make_move_new(*mv);
         let new_position_hash = compute_zobrist_hash(&new_board);
         update_repetition_table(new_position_hash);
+        
         let gives_check = *new_board.checkers() != BitBoard(0);
-
-let mut extension = 0;
-if gives_check {
-    extension = 1;
-} else if let Some(piece) = board.piece_on(mv.get_source()) {
-    if piece == Piece::Pawn && (mv.get_dest().get_rank() == Rank::Eighth || mv.get_dest().get_rank() == Rank::First) {
-        extension = 1;
-    }
-}
-
-// Singular extension
-if depth >= SINGULAR_EXTENSION_DEPTH && 
-   Some(*mv) == hash_move && 
-   extension == 0 && 
-   !is_root {
-    
-    let singular_beta = best_value - SINGULAR_MARGIN;
-    let mut singular_search_failed = true;
-    
-    // Test all other moves at reduced depth
-    for &test_move in moves.iter() {
-        if test_move == *mv {
-            continue; // Skip the hash move
-        }
         
-        let test_board = board.make_move_new(test_move);
-        let test_position_hash = compute_zobrist_hash(&test_board);
-        update_repetition_table(test_position_hash);
-        
-        let singular_score = -negamax(
-            &test_board,
-            (depth - 1) / 2, // Reduced depth for singular search
-            -singular_beta - 1,
-            -singular_beta,
-            start_time,
-            ply + 1,
-            stats,
-            root_color,
-            tt,
-            max_time,
-            timeout_occurred
-        );
-        
-        // Undo repetition table update
-        {
-            let mut rep_table = REPETITION_TABLE.lock().unwrap();
-            if let Some(count) = rep_table.get_mut(&test_position_hash) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    rep_table.remove(&test_position_hash);
-                }
+        let mut extension = 0;
+        if gives_check {
+            extension = 1;
+        } else if let Some(piece) = board.piece_on(mv.get_source()) {
+            if piece == Piece::Pawn && (mv.get_dest().get_rank() == Rank::Eighth || mv.get_dest().get_rank() == Rank::First) {
+                extension = 1;
             }
         }
         
-        if *timeout_occurred {
-            break;
-        }
-        
-        if singular_score > singular_beta {
-            singular_search_failed = false;
-            break;
-        }
-    }
-    
-    // If no other move beats singular_beta, extend this move
-    if !*timeout_occurred && singular_search_failed {
-        extension = 1;
-    }
-}      
         let mut new_depth = depth - 1 + extension;
         let mut do_full_search = true;
         
@@ -1450,7 +1520,7 @@ impl UCIEngine {
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnightv1.9.1");
+        println!("id name RustKnightv1.9.2");
         println!("id author Anish");
         println!("uciok");
     }
