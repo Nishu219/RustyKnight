@@ -30,7 +30,7 @@ The engine assesses rook positioning and activity with the following heuristics:
 - **Rooks on Semi-Open Files:** A rook on a file with only friendly pawns is valuable (+15 for each side).
 - **Rooks on the Seventh Rank:** A rook on the opponent's second to last rank is a powerful piece, often controlling key squares and attacking pawns (+20 for white on the 7th rank, +20 for black on the 2nd rank).
 
-### 6.Pawn Evaluation
+### 6. Pawn Evaluation
 Analyzes pawn structure to detect weaknesses and strengths:
 - **Doubled Pawns:** Penalized by -20 per extra pawn on the same file.
 - **Isolated Pawns:** Penalized by -15 if there are no adjacent pawns on neighboring files.
