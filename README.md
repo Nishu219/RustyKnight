@@ -30,11 +30,7 @@ The engine assesses rook positioning and activity with the following heuristics:
 - **Rooks on Semi-Open Files:** A rook on a file with only friendly pawns is valuable (+15 for each side).
 - **Rooks on the Seventh Rank:** A rook on the opponent's second to last rank is a powerful piece, often controlling key squares and attacking pawns (+20 for white on the 7th rank, +20 for black on the 2nd rank).
 
-### 6. Mobility Evaluation
-- **Mobility Evaluation:** Rewards pieces (knights, bishops, rooks, and queens) based on the number of legal moves available to them.
----
-
-### 7.Pawn Evaluation
+### 6.Pawn Evaluation
 Analyzes pawn structure to detect weaknesses and strengths:
 - **Doubled Pawns:** Penalized by -20 per extra pawn on the same file.
 - **Isolated Pawns:** Penalized by -15 if there are no adjacent pawns on neighboring files.
@@ -74,7 +70,6 @@ RustyKnight implements several search algorithms and pruning techniques:
 - **Late Move Reductions (LMR):** Reduces search depth for less promising moves.
 - **Null Move Pruning:** Searches positions where the side to move passes (makes a "null" move) to detect threats.
 - **Internal Iterative Deepening (IID):** Used to find a good move when hash move is unavailable.
-- **Singular Extensions:** Extends the search depth of a move that is significantly better than its alternatives, identified through a verification search with a reduced margin. Helps focus the search on critical lines.
 ---
 
 ## Features
