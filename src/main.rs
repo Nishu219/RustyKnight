@@ -26,7 +26,6 @@ const LMP_DEPTH: usize = 4;
 const LMP_MOVE_COUNTS: [usize; 5] = [0, 3, 6, 12, 18];
 const SEE_QUIET_THRESHOLD: i32 = -60;
 const SEE_CAPTURE_THRESHOLD: i32 = -100;
-const MOBILITY_BONUS: [i32; 5] = [0, 4, 5, 2, 1];
 const TROPISM_WEIGHTS: [(i32, i32); 4] = [(3, 2), (2, 3), (1, 1), (2, 1)];
 const ATTACK_WEIGHTS: [(i32, i32); 5] = [(4, 2), (3, 4), (2, 1), (3, 1), (1, 0)];
 const PIECE_ORDER: [Piece; 5] = [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight, Piece::Pawn];
@@ -556,32 +555,7 @@ fn evaluate_rooks(board: &Board) -> i32 {
     
     score
 }
-fn evaluate_mobility(board: &Board, color: Color) -> i32 {
-    let mut mobility = 0;
-    let piece_types = [Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen];
-    
-    for piece_type in piece_types {
-        let pieces = *board.pieces(piece_type) & *board.color_combined(color);
-        
-        for square in pieces {
-            let moves = MoveGen::new_legal(board)
-                .filter(|m| m.get_source() == square)
-                .count() as i32;
-            
-            let bonus = match piece_type {
-                Piece::Knight => (moves - 4).max(0) * MOBILITY_BONUS[1],
-                Piece::Bishop => (moves - 7).max(0) * MOBILITY_BONUS[2],
-                Piece::Rook => (moves - 7).max(0) * MOBILITY_BONUS[3],
-                Piece::Queen => (moves - 14).max(0) * MOBILITY_BONUS[4],
-                _ => 0,
-            };
-            
-            mobility += bonus;
-        }
-    }
-    
-    mobility
-}
+
 fn evaluate_pawns(board: &Board) -> i32 {
     let pawn_hash = compute_pawn_hash(board);
     
@@ -940,8 +914,6 @@ fn evaluate(board: &Board) -> i32 {
             }
         }
     }   
-    score += evaluate_mobility(board, Color::White);
-    score -= evaluate_mobility(board, Color::Black);
     score += evaluate_rooks(board);
     score += evaluate_pawns(board);
     score += evaluate_king_tropism(board, phase);
@@ -1520,7 +1492,7 @@ impl UCIEngine {
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnightv1.9.2");
+        println!("id name RustKnightv1.9.3");
         println!("id author Anish");
         println!("uciok");
     }
