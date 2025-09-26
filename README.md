@@ -38,6 +38,7 @@ Analyzes pawn structure to detect weaknesses and strengths:
 - **Passed Pawns:** Bonuses increase with rank advancement:
    Ranks 2–6: +5 to +80 (based on proximity to promotion)
 - **Pawn Chains:** Additional +5 bonus for pawns protected from behind by another pawn.
+- **Backward Pawns:** Appropiate penalty is given for backward pawns.
 ## Search Methods
 
 RustyKnight implements several search algorithms and pruning techniques:
@@ -58,8 +59,8 @@ RustyKnight implements several search algorithms and pruning techniques:
 - **Killer Moves:** Quiet moves causing cutoffs in previous searches at the same depth.
 - **History Heuristic:** Tracks which moves historically perform well.
 
-### 5. Static Exchange Evaluation (SEE)
-- Evaluates the net gain or loss from captures on a square, helping to order moves effectively.
+### 5. MVV-LVA
+- Used to sort captures using the most valuable victim and least valuable attacker.
 
 ### 6. Transposition Table
 - Memoizes positions already evaluated to prevent redundant computation and speed up search.
