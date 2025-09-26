@@ -1,5 +1,5 @@
 use chess::{
-    Board, ChessMove, Color, File, MoveGen, Piece, Rank, Square, BitBoard, BoardStatus,
+    Board, ChessMove, Color, MoveGen, Piece, Rank, Square, BitBoard, BoardStatus,
 };
 use rand::Rng;
 use std::collections::HashMap;
@@ -9,7 +9,6 @@ use std::io::{self, BufRead};
 use std::time::Instant;
 use std::str::FromStr;
 const MAX_DEPTH: usize = 40;
-const DELTA_MARGIN: i32 = 200;
 const STATS: bool = true;
 const CONTEMPT: i32 = 25;
 const LMR_FULL_DEPTH_MOVES: usize = 4;
@@ -24,8 +23,6 @@ const FUTILITY_DEPTH: usize = 4;
 const FUTILITY_MARGINS: [i32; 5] = [0, 200, 400, 600, 800];
 const LMP_DEPTH: usize = 4;
 const LMP_MOVE_COUNTS: [usize; 5] = [0, 3, 6, 12, 18];
-const SEE_QUIET_THRESHOLD: i32 = -60;
-const SEE_CAPTURE_THRESHOLD: i32 = -100;
 const TROPISM_WEIGHTS: [(i32, i32); 4] = [(3, 2), (2, 3), (1, 1), (2, 1)];
 const ATTACK_WEIGHTS: [(i32, i32); 5] = [(4, 2), (3, 4), (2, 1), (3, 1), (1, 0)];
 const PIECE_ORDER: [Piece; 5] = [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight, Piece::Pawn];
@@ -456,58 +453,27 @@ fn phase_value(board: &Board) -> i32 {
     }
     std::cmp::min(phase, 24)
 }
-
-fn see(board: &Board, mv: ChessMove) -> i32 {
-    let to_sq = mv.get_dest();
-    let from_sq = mv.get_source();
-    let piece = match board.piece_on(from_sq) {
-        Some(p) => p,
-        None => return 0,
+fn mvv_lva_score(board: &Board, mv: ChessMove) -> i32 {
+    let victim_value = if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
+        VALUES[&captured_piece]
+    } else if mv.get_promotion().is_some() {
+        VALUES[&Piece::Queen] // Assume queen promotion
+    } else {
+        0
     };
-    let mut captured_value = 0;
-    if let Some(captured) = board.piece_on(to_sq) {
-        captured_value = VALUES[&captured];
+    
+    let attacker_value = if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
+        VALUES[&attacker_piece]
+    } else {
+        0
+    };
+    
+    if victim_value > 0 {
+        victim_value * 10 - attacker_value
+    } else {
+        0
     }
-    if let Some(promotion) = mv.get_promotion() {
-        captured_value += VALUES[&promotion] - VALUES[&Piece::Pawn];
-    }
-    let attackers_bb = board.combined() ^ BitBoard::from_square(from_sq);
-    let mut side = !board.side_to_move();
-    let mut gains = vec![captured_value];
-    let mut depth = 1;
-    let mut cur_attackers = attackers_bb;
-    while depth <= 32 {
-        let mut least_valuable_attacker: Option<(Piece, Square)> = None;
-        let mut min_value = i32::MAX;
-        for &pt in &[Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen, Piece::King] {
-            let pieces_bb = *board.pieces(pt);
-            let candidates_bb = cur_attackers & pieces_bb & board.color_combined(side);
-            if candidates_bb != BitBoard(0) {
-                if let Some(attacker_sq) = candidates_bb.into_iter().next() {
-                     let value = VALUES[&pt];
-                     if value < min_value {
-                         min_value = value;
-                         least_valuable_attacker = Some((pt, attacker_sq));
-                     }
-                }
-            }
-        }
-        if let Some((pt, attacker_sq)) = least_valuable_attacker {
-            gains.push(VALUES[&pt] - gains[depth - 1]);
-            cur_attackers ^= BitBoard::from_square(attacker_sq);
-            side = !side;
-            depth += 1;
-        } else {
-            break;
-        }
-    }
-    for i in (0..gains.len() - 1).rev() {
-        gains[i] = -std::cmp::max(-gains[i], gains[i + 1]);
-    }
-    gains[0]
 }
-
-
 fn evaluate_rooks(board: &Board) -> i32 {
     let mut score = 0;
     
@@ -1017,12 +983,7 @@ fn order_moves(board: &Board, moves: Vec<ChessMove>, hash_move: Option<ChessMove
         let score = if Some(mv) == hash_move {
             1000000
         } else if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
-            let see_value = see(board, mv);
-            if see_value >= 0 {
-                900000 + see_value
-            } else {
-                100000 + see_value
-            }
+            900000 + mvv_lva_score(board, mv)
         } else {
             let new_board = board.make_move_new(mv);
             if *new_board.checkers() != BitBoard(0) {
@@ -1052,7 +1013,6 @@ fn order_moves(board: &Board, moves: Vec<ChessMove>, hash_move: Option<ChessMove
     scored_moves.sort_by(|a, b| b.1.cmp(&a.1));
     scored_moves.into_iter().map(|(mv, _)| mv).collect()
 }
-
 fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats: &mut HashMap<&str, usize>, root_color: Color, max_time: f64, timeout_occurred: &mut bool) -> i32 {
     *stats.entry("nodes").or_insert(0) += 1;
     *stats.entry("qnodes").or_insert(0) += 1;
@@ -1068,11 +1028,6 @@ fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats:
         return beta;
     }
     
-    let big_delta = 900;
-    if stand_pat < alpha - big_delta {
-        return alpha;
-    }
-    
     if stand_pat > alpha {
         alpha = stand_pat;
     }
@@ -1082,22 +1037,16 @@ fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats:
     
     for mv in movegen {
         if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
-            let see_value = see(board, mv);
-            if see_value >= SEE_CAPTURE_THRESHOLD || mv.get_promotion().is_some() {
-                captures.push((mv, see_value));
-            }
+            let mvv_lva = mvv_lva_score(board, mv);
+            captures.push((mv, mvv_lva));
         }
     }
     
     captures.sort_by(|a, b| b.1.cmp(&a.1));
     
-    for (mv, see_value) in captures {
+    for (mv, _) in captures {
         if *timeout_occurred {
             break;
-        }
-        
-        if stand_pat + see_value + DELTA_MARGIN < alpha {
-            continue;
         }
         
         let new_board = board.make_move_new(mv);
@@ -1281,14 +1230,6 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
         if !is_pv && depth <= LMP_DEPTH && is_quiet && i >= LMP_MOVE_COUNTS[depth.min(4)] {
             continue;
         }
-        
-        if depth >= 4 && !is_pv && is_quiet && i >= 3 {
-            let see_value = see(board, *mv);
-            if see_value < SEE_QUIET_THRESHOLD {
-                continue;
-            }
-        }
-        
         let new_board = board.make_move_new(*mv);
         let new_position_hash = compute_zobrist_hash(&new_board);
         update_repetition_table(new_position_hash);
