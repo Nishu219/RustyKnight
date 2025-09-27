@@ -521,7 +521,6 @@ fn evaluate_rooks(board: &Board) -> i32 {
     
     score
 }
-
 fn evaluate_pawns(board: &Board) -> i32 {
     let pawn_hash = compute_pawn_hash(board);
     
@@ -536,15 +535,22 @@ fn evaluate_pawns(board: &Board) -> i32 {
     let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
     
     let mut score = 0;
-    
     let mut white_file_counts = [0u8; 8];
     let mut black_file_counts = [0u8; 8];
+    let mut white_file_ranks = [8u8; 8];
+    let mut black_file_ranks = [8u8; 8];
     
     for square in white_pawns {
-        white_file_counts[square.get_file().to_index()] += 1;
+        let file = square.get_file().to_index();
+        let rank = square.get_rank().to_index();
+        white_file_counts[file] += 1;
+        white_file_ranks[file] = white_file_ranks[file].min(rank as u8);
     }
     for square in black_pawns {
-        black_file_counts[square.get_file().to_index()] += 1;
+        let file = square.get_file().to_index();
+        let rank = square.get_rank().to_index();
+        black_file_counts[file] += 1;
+        black_file_ranks[file] = black_file_ranks[file].min(rank as u8);
     }
     
     for file_idx in 0..8 {
@@ -578,62 +584,64 @@ fn evaluate_pawns(board: &Board) -> i32 {
         let rank = square.get_rank().to_index();
         
         if (WHITE_PASSED_MASKS[sq_idx] & black_pawns) == BitBoard::new(0) {
-            let passed_bonus = match rank {
-                1 => 5,
-                2 => 10,
-                3 => 20,
-                4 => 35,
-                5 => 55,
-                6 => 80,
-                _ => 0,
-            };
+            let passed_bonus = [0, 5, 10, 20, 35, 55, 80, 0][rank];
             score += passed_bonus;
         } else {
             let mut can_advance = true;
             let mut supported = false;
             
-            for support_file in [(file.wrapping_sub(1)), (file + 1)].iter().filter(|&&f| f < 8) {
-                let support_mask = BitBoard::new(0x0101010101010101u64 << support_file);
-                let support_pawns = white_pawns & support_mask;
-                
-                for support_pawn in support_pawns {
-                    if support_pawn.get_rank().to_index() < rank {
-                        supported = true;
-                        break;
-                    }
-                }
-                
-                if supported { break; }
+            if file > 0 && white_file_counts[file - 1] > 0 && white_file_ranks[file - 1] <= rank as u8 {
+                supported = true;
+            }
+            if file < 7 && white_file_counts[file + 1] > 0 && white_file_ranks[file + 1] <= rank as u8 {
+                supported = true;
             }
             
             if rank < 7 {
-                for check_rank in (rank + 1)..8 {
-                    let front_mask = BitBoard::new(1u64 << (check_rank * 8 + file));
-                    if (front_mask & white_pawns) != BitBoard::new(0) {
-                        can_advance = false;
-                        break;
-                    }
-                    
-                    let enemy_mask = if file > 0 { 
-                        BitBoard::new(1u64 << (check_rank * 8 + file - 1))
-                    } else { 
-                        BitBoard::new(0) 
-                    } | if file < 7 { 
-                        BitBoard::new(1u64 << (check_rank * 8 + file + 1))
-                    } else { 
-                        BitBoard::new(0) 
-                    };
-                    
-                    if (enemy_mask & black_pawns) != BitBoard::new(0) {
-                        can_advance = false;
-                        break;
-                    }
+                let front_mask = BitBoard::new(1u64 << ((rank + 1) * 8 + file));
+                if (front_mask & white_pawns) != BitBoard::new(0) {
+                    can_advance = false;
+                }
+                
+                let enemy_mask = if file > 0 { 
+                    BitBoard::new(1u64 << ((rank + 1) * 8 + file - 1))
+                } else { 
+                    BitBoard::new(0) 
+                } | if file < 7 { 
+                    BitBoard::new(1u64 << ((rank + 1) * 8 + file + 1))
+                } else { 
+                    BitBoard::new(0) 
+                };
+                
+                if (enemy_mask & black_pawns) != BitBoard::new(0) {
+                    can_advance = false;
                 }
             }
             
             if !can_advance && !supported {
                 score -= 10;
             }
+        }
+        
+        let is_backward = if file > 0 && file < 7 {
+            let left_support = white_file_counts[file - 1] > 0 && white_file_ranks[file - 1] < rank as u8;
+            let right_support = white_file_counts[file + 1] > 0 && white_file_ranks[file + 1] < rank as u8;
+            let left_enemy = black_file_counts[file - 1] > 0 && black_file_ranks[file - 1] >= rank as u8;
+            let right_enemy = black_file_counts[file + 1] > 0 && black_file_ranks[file + 1] >= rank as u8;
+            
+            !left_support && !right_support && (left_enemy || right_enemy)
+        } else if file == 0 {
+            let right_support = white_file_counts[1] > 0 && white_file_ranks[1] < rank as u8;
+            let right_enemy = black_file_counts[1] > 0 && black_file_ranks[1] >= rank as u8;
+            !right_support && right_enemy
+        } else {
+            let left_support = white_file_counts[6] > 0 && white_file_ranks[6] < rank as u8;
+            let left_enemy = black_file_counts[6] > 0 && black_file_ranks[6] >= rank as u8;
+            !left_support && left_enemy
+        };
+        
+        if is_backward {
+            score -= 8;
         }
         
         if file > 0 {
@@ -656,62 +664,64 @@ fn evaluate_pawns(board: &Board) -> i32 {
         let rank = square.get_rank().to_index();
         
         if (BLACK_PASSED_MASKS[sq_idx] & white_pawns) == BitBoard::new(0) {
-            let passed_bonus = match rank {
-                6 => 5,
-                5 => 10,
-                4 => 20,
-                3 => 35,
-                2 => 55,
-                1 => 80,
-                _ => 0,
-            };
+            let passed_bonus = [0, 80, 55, 35, 20, 10, 5, 0][rank];
             score -= passed_bonus;
         } else {
             let mut can_advance = true;
             let mut supported = false;
             
-            for support_file in [(file.wrapping_sub(1)), (file + 1)].iter().filter(|&&f| f < 8) {
-                let support_mask = BitBoard::new(0x0101010101010101u64 << support_file);
-                let support_pawns = black_pawns & support_mask;
-                
-                for support_pawn in support_pawns {
-                    if support_pawn.get_rank().to_index() > rank {
-                        supported = true;
-                        break;
-                    }
-                }
-                
-                if supported { break; }
+            if file > 0 && black_file_counts[file - 1] > 0 && black_file_ranks[file - 1] >= rank as u8 {
+                supported = true;
+            }
+            if file < 7 && black_file_counts[file + 1] > 0 && black_file_ranks[file + 1] >= rank as u8 {
+                supported = true;
             }
             
             if rank > 0 {
-                for check_rank in (0..rank).rev() {
-                    let front_mask = BitBoard::new(1u64 << (check_rank * 8 + file));
-                    if (front_mask & black_pawns) != BitBoard::new(0) {
-                        can_advance = false;
-                        break;
-                    }
-                    
-                    let enemy_mask = if file > 0 { 
-                        BitBoard::new(1u64 << (check_rank * 8 + file - 1))
-                    } else { 
-                        BitBoard::new(0) 
-                    } | if file < 7 { 
-                        BitBoard::new(1u64 << (check_rank * 8 + file + 1))
-                    } else { 
-                        BitBoard::new(0) 
-                    };
-                    
-                    if (enemy_mask & white_pawns) != BitBoard::new(0) {
-                        can_advance = false;
-                        break;
-                    }
+                let front_mask = BitBoard::new(1u64 << ((rank - 1) * 8 + file));
+                if (front_mask & black_pawns) != BitBoard::new(0) {
+                    can_advance = false;
+                }
+                
+                let enemy_mask = if file > 0 { 
+                    BitBoard::new(1u64 << ((rank - 1) * 8 + file - 1))
+                } else { 
+                    BitBoard::new(0) 
+                } | if file < 7 { 
+                    BitBoard::new(1u64 << ((rank - 1) * 8 + file + 1))
+                } else { 
+                    BitBoard::new(0) 
+                };
+                
+                if (enemy_mask & white_pawns) != BitBoard::new(0) {
+                    can_advance = false;
                 }
             }
             
             if !can_advance && !supported {
                 score += 10;
             }
+        }
+        
+        let is_backward = if file > 0 && file < 7 {
+            let left_support = black_file_counts[file - 1] > 0 && black_file_ranks[file - 1] > rank as u8;
+            let right_support = black_file_counts[file + 1] > 0 && black_file_ranks[file + 1] > rank as u8;
+            let left_enemy = white_file_counts[file - 1] > 0 && white_file_ranks[file - 1] <= rank as u8;
+            let right_enemy = white_file_counts[file + 1] > 0 && white_file_ranks[file + 1] <= rank as u8;
+            
+            !left_support && !right_support && (left_enemy || right_enemy)
+        } else if file == 0 {
+            let right_support = black_file_counts[1] > 0 && black_file_ranks[1] > rank as u8;
+            let right_enemy = white_file_counts[1] > 0 && white_file_ranks[1] <= rank as u8;
+            !right_support && right_enemy
+        } else {
+            let left_support = black_file_counts[6] > 0 && black_file_ranks[6] > rank as u8;
+            let left_enemy = white_file_counts[6] > 0 && white_file_ranks[6] <= rank as u8;
+            !left_support && left_enemy
+        };
+        
+        if is_backward {
+            score += 8;
         }
         
         if file > 0 {
@@ -1510,7 +1520,7 @@ impl UCIEngine {
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnightv1.9.3");
+        println!("id name RustKnightv2.0");
         println!("id author Anish");
         println!("uciok");
     }
