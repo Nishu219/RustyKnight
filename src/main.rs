@@ -22,7 +22,6 @@ const REVERSE_FUTILITY_MARGIN: i32 = 120;
 const FUTILITY_DEPTH: usize = 4;
 const FUTILITY_MARGINS: [i32; 5] = [0, 200, 400, 600, 800];
 const LMP_DEPTH: usize = 4;
-const LMP_MOVE_COUNTS: [usize; 5] = [0, 3, 6, 12, 18];
 const TROPISM_WEIGHTS: [(i32, i32); 4] = [(3, 2), (2, 3), (1, 1), (2, 1)];
 const ATTACK_WEIGHTS: [(i32, i32); 5] = [(4, 2), (3, 4), (2, 1), (3, 1), (1, 0)];
 const PIECE_ORDER: [Piece; 5] = [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight, Piece::Pawn];
@@ -1077,12 +1076,14 @@ fn quiesce(board: &Board, mut alpha: i32, beta: i32, start_time: Instant, stats:
     
     alpha
 }
-fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: Instant, ply: usize, stats: &mut HashMap<&str, usize>, root_color: Color, tt: &mut TranspositionTable, max_time: f64, timeout_occurred: &mut bool) -> i32 {
+fn negamax(board: &Board, depth: usize, mut alpha: i32, mut beta: i32, start_time: Instant, ply: usize, stats: &mut HashMap<&str, usize>, root_color: Color, tt: &mut TranspositionTable, max_time: f64, timeout_occurred: &mut bool) -> i32 {
     let is_pv = beta - alpha > 1;
     let is_root = ply == 0;
+    let original_alpha = alpha;
     
     *stats.entry("nodes").or_insert(0) += 1;
     
+    // Timeout check
     if start_time.elapsed().as_secs_f64() > max_time {
         *timeout_occurred = true;
         return if ply > 0 { evaluate(board) } else { 0 };
@@ -1090,6 +1091,7 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
     
     let position_hash = compute_zobrist_hash(board);
     
+    // Draw detection and mate distance pruning
     if ply > 0 {
         if is_repetition(position_hash) {
             return if board.side_to_move() == root_color { -CONTEMPT } else { CONTEMPT };
@@ -1102,6 +1104,10 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
         if board.status() == BoardStatus::Stalemate {
             return if board.side_to_move() == root_color { -CONTEMPT } else { CONTEMPT };
         }
+        
+        // Mate distance pruning
+        alpha = alpha.max(-30000 + ply as i32);
+        beta = beta.min(30000 - ply as i32);
         if alpha >= beta {
             return alpha;
         }
@@ -1109,47 +1115,84 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
     
     let board_hash = compute_zobrist_hash(board);
     let mut hash_move = None;
+    let mut tt_value = None;
     
-    if let Some(tt_value) = tt.get(board_hash, depth, alpha, beta) {
+    // Transposition table lookup
+    if let Some(stored_value) = tt.get(board_hash, depth, alpha, beta) {
         *stats.entry("tt_hits").or_insert(0) += 1;
-        if !is_pv || (tt_value <= alpha || tt_value >= beta) {
-            return tt_value;
+        if !is_pv || !is_root {
+            return stored_value;
+        }
+        tt_value = Some(stored_value);
+    }
+    
+    if let Some(entry) = tt.table.get(&board_hash) {
+        hash_move = entry.move_;
+        if tt_value.is_none() {
+            tt_value = Some(entry.value);
         }
     }
     
-    hash_move = tt.get_move(board_hash);
-    
     let in_check = *board.checkers() != BitBoard(0);
-    let static_eval = if in_check { -30000 + ply as i32 } else { evaluate(board) };
+    let static_eval = if in_check { 
+        -30000 + ply as i32 
+    } else { 
+        evaluate(board) 
+    };
     
+    // Quiescence search at leaf nodes
     if depth == 0 {
         return quiesce(board, alpha, beta, start_time, stats, root_color, max_time, timeout_occurred);
     }
     
-    let improving = !in_check && ply >= 2;
+    // Calculate improvement
+    let improving = !in_check && ply >= 2 && {
+        if let Some(tt_val) = tt_value {
+            static_eval > tt_val
+        } else {
+            true // Assume improving if no TT info
+        }
+    };
     
+    // Non-PV pruning techniques
     if !is_pv && !in_check {
-        if depth <= RAZOR_DEPTH && static_eval + RAZOR_MARGIN < alpha {
-            let razor_alpha = alpha - RAZOR_MARGIN;
-            let razor_score = quiesce(board, razor_alpha, razor_alpha + 1, start_time, stats, root_color, max_time, timeout_occurred);
-            if *timeout_occurred {
-                return evaluate(board);
-            }
-            if razor_score <= razor_alpha {
-                return razor_score;
+        // Enhanced Razoring
+        if depth <= RAZOR_DEPTH {
+            let razor_margin = RAZOR_MARGIN + 50 * (depth as i32 - 1);
+            if static_eval + razor_margin < alpha {
+                let razor_alpha = alpha - razor_margin;
+                let razor_score = quiesce(board, razor_alpha, razor_alpha + 1, start_time, stats, root_color, max_time, timeout_occurred);
+                if *timeout_occurred {
+                    return evaluate(board);
+                }
+                if razor_score <= razor_alpha {
+                    return razor_score;
+                }
             }
         }
         
-        if depth <= REVERSE_FUTILITY_DEPTH && static_eval - REVERSE_FUTILITY_MARGIN * depth as i32 >= beta {
-            return static_eval;
+        // Enhanced Reverse Futility Pruning (Static Null Move)
+        if depth <= REVERSE_FUTILITY_DEPTH {
+            let rfp_margin = REVERSE_FUTILITY_MARGIN * depth as i32 + 
+                           if improving { 50 } else { 0 };
+            if static_eval - rfp_margin >= beta {
+                return static_eval;
+            }
         }
         
+        // Enhanced Null Move Pruning
         if depth >= NULL_MOVE_DEPTH && static_eval >= beta {
             let has_non_pawn_pieces = (board.combined() & board.color_combined(board.side_to_move())).0 !=
                 ((board.pieces(Piece::King) | board.pieces(Piece::Pawn)) & board.color_combined(board.side_to_move())).0;
                 
             if has_non_pawn_pieces {
-                let r = 3 + depth / 4 + ((static_eval - beta) / 200).min(3) as usize;
+                // Dynamic reduction based on depth, eval, and improving
+                let mut r = 3 + depth / 4;
+                r += ((static_eval - beta) / 200).min(3) as usize;
+                if !improving { r += 1; }
+                if depth > 12 { r += 1; }
+                
+                r = r.min(depth - 1);
                 
                 if let Some(null_board) = board.null_move() {
                     let null_score = -negamax(
@@ -1171,46 +1214,78 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
                     }
                     
                     if null_score >= beta {
-                        if depth < 12 {
-                            return null_score;
-                        }
-                        
-                        let verification_depth = depth.saturating_sub(r + 1);
-                        let verification_score = negamax(
-                            board,
-                            verification_depth,
-                            beta - 1,
-                            beta,
-                            start_time,
-                            ply,
-                            stats,
-                            root_color,
-                            tt,
-                            max_time,
-                            timeout_occurred
-                        );
-                        
-                        if *timeout_occurred {
-                            return evaluate(board);
-                        }
-                        
-                        if verification_score >= beta {
+                        // Null move verification for high depths
+                        if depth >= 12 {
+                            let verification_depth = depth.saturating_sub(r + 1);
+                            let verification_score = negamax(
+                                board,
+                                verification_depth,
+                                beta - 1,
+                                beta,
+                                start_time,
+                                ply,
+                                stats,
+                                root_color,
+                                tt,
+                                max_time,
+                                timeout_occurred
+                            );
+                            
+                            if *timeout_occurred {
+                                return evaluate(board);
+                            }
+                            
+                            if verification_score >= beta {
+                                return null_score;
+                            }
+                        } else {
                             return null_score;
                         }
                     }
                 }
             }
         }
+        
+        // ProbCut - probabilistic cut based on reduced search
+        if depth >= 5 && !hash_move.is_some() {
+            let probcut_beta = beta + 200;
+            let probcut_depth = depth / 4 * 3;
+            
+            if probcut_depth >= 1 {
+                let probcut_score = negamax(
+                    board,
+                    probcut_depth,
+                    probcut_beta - 1,
+                    probcut_beta,
+                    start_time,
+                    ply,
+                    stats,
+                    root_color,
+                    tt,
+                    max_time,
+                    timeout_occurred
+                );
+                
+                if *timeout_occurred {
+                    return evaluate(board);
+                }
+                
+                if probcut_score >= probcut_beta {
+                    return probcut_score;
+                }
+            }
+        }
     }
     
+    // Internal Iterative Deepening
     if is_pv && depth >= IID_DEPTH && hash_move.is_none() {
-        negamax(board, depth - 2, alpha, beta, start_time, ply, stats, root_color, tt, max_time, timeout_occurred);
+        let iid_depth = depth - 2 - if is_pv { 0 } else { 1 };
+        negamax(board, iid_depth, alpha, beta, start_time, ply, stats, root_color, tt, max_time, timeout_occurred);
         if !*timeout_occurred {
             hash_move = tt.get_move(board_hash);
         }
     }
     
-    let alpha_orig = alpha;
     let mut moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
     
     if moves.is_empty() {
@@ -1222,67 +1297,163 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
     let mut best_value = -31000;
     let mut best_move = None;
     let mut moves_searched = 0;
+    let mut quiet_moves_searched = 0;
+    
+    // Multi-Cut variables
+    let mut cut_count = 0;
+    let cut_threshold = 3 + (depth / 4);
+    let multi_cut_depth = 3;
     
     for (i, mv) in moves.iter().enumerate() {
         if *timeout_occurred {
             break;
         }
         
-        let is_quiet = board.piece_on(mv.get_dest()).is_none() && mv.get_promotion().is_none();
+        let is_capture = board.piece_on(mv.get_dest()).is_some();
+        let is_promotion = mv.get_promotion().is_some();
+        let is_quiet = !is_capture && !is_promotion;
         
+        // Enhanced Late Move Pruning with better thresholds
+        if !is_pv && !in_check && is_quiet && depth <= LMP_DEPTH {
+            let mut lmp_threshold = match depth {
+                1 => if improving { 4 } else { 3 },
+                2 => if improving { 7 } else { 6 },
+                3 => if improving { 13 } else { 12 },
+                4 => if improving { 20 } else { 18 },
+                _ => 25,
+            };
+            
+            // Adjust threshold based on evaluation
+            if static_eval + 200 < alpha {
+                lmp_threshold /= 2;
+            } else if static_eval > alpha + 200 {
+                lmp_threshold = (lmp_threshold * 3) / 2;
+            }
+            
+            if quiet_moves_searched >= lmp_threshold {
+                continue;
+            }
+        }
+        
+        // Enhanced Futility Pruning
         if !is_pv && !in_check && is_quiet && depth <= FUTILITY_DEPTH && i > 0 {
-            let futility_value = static_eval + FUTILITY_MARGINS[depth.min(4)] + 200;
+            let mut futility_margin = FUTILITY_MARGINS[depth.min(4)];
+            if !improving { futility_margin += 50; }
+            
+            let futility_value = static_eval + futility_margin;
             if futility_value <= alpha {
                 continue;
             }
         }
         
-        if !is_pv && depth <= LMP_DEPTH && is_quiet && i >= LMP_MOVE_COUNTS[depth.min(4)] {
-            continue;
-        }
+
+        
         let new_board = board.make_move_new(*mv);
         let new_position_hash = compute_zobrist_hash(&new_board);
         update_repetition_table(new_position_hash);
         
         let gives_check = *new_board.checkers() != BitBoard(0);
         
+        // Calculate extensions
         let mut extension = 0;
         if gives_check {
             extension = 1;
         } else if let Some(piece) = board.piece_on(mv.get_source()) {
-            if piece == Piece::Pawn && (mv.get_dest().get_rank() == Rank::Eighth || mv.get_dest().get_rank() == Rank::First) {
-                extension = 1;
+            // Pawn to 7th/2nd rank extension
+            if piece == Piece::Pawn {
+                let dest_rank = mv.get_dest().get_rank();
+                if dest_rank == Rank::Seventh || dest_rank == Rank::Second {
+                    extension = 1;
+                }
             }
         }
         
         let mut new_depth = depth - 1 + extension;
         let mut do_full_search = true;
         
+        // Late Move Reductions with enhanced conditions
         if depth >= 3 && i >= LMR_FULL_DEPTH_MOVES && is_quiet && !gives_check {
-            let mut r = 1;
+            let mut r: usize = 1;
+            
+            // Base reduction
             if i >= 6 { r += 1; }
             if i >= 12 { r += 1; }
+            if i >= 24 { r += 1; }
+            
+            // Adjust based on various factors
             if !improving { r += 1; }
+            if !is_pv { r += 1; }
+            if depth > 8 { r += 1; }
             
-            r = r.min(LMR_REDUCTION_LIMIT).min(new_depth);
+            // Reduce less for killer moves and good history
+            let history = HISTORY_HEURISTIC.lock().unwrap();
+            let history_score = *history.get(mv).unwrap_or(&0);
+            if history_score > 1000 { r = r.saturating_sub(1); }
             
+            r = r.min(LMR_REDUCTION_LIMIT).min(new_depth.saturating_sub(1));
             new_depth = new_depth.saturating_sub(r);
             do_full_search = false;
         }
         
+        // Multi-Cut implementation
+        if !is_pv && depth >= multi_cut_depth && i >= cut_threshold && !is_capture && cut_count > 0 {
+            let multi_cut_score = -negamax(
+                &new_board,
+                depth / 2,
+                -beta,
+                -beta + 1,
+                start_time,
+                ply + 1,
+                stats,
+                root_color,
+                tt,
+                max_time,
+                timeout_occurred
+            );
+            
+            if *timeout_occurred {
+                let mut rep_table = REPETITION_TABLE.lock().unwrap();
+                if let Some(count) = rep_table.get_mut(&new_position_hash) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        rep_table.remove(&new_position_hash);
+                    }
+                }
+                break;
+            }
+            
+            if multi_cut_score >= beta {
+                cut_count += 1;
+                if cut_count >= cut_threshold {
+                    let mut rep_table = REPETITION_TABLE.lock().unwrap();
+                    if let Some(count) = rep_table.get_mut(&new_position_hash) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            rep_table.remove(&new_position_hash);
+                        }
+                    }
+                    return beta;
+                }
+            }
+        }
+        
+        // Principal Variation Search
         let score = if i == 0 {
             -negamax(&new_board, new_depth, -beta, -alpha, start_time, ply + 1, stats, root_color, tt, max_time, timeout_occurred)
         } else {
+            // Null window search
             let mut search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt, max_time, timeout_occurred);
             
             if *timeout_occurred {
                 evaluate(board)
             } else {
+                // Re-search with full depth if LMR was applied and score improved
                 if !do_full_search && search_score > alpha {
                     new_depth = depth - 1 + extension;
                     search_score = -negamax(&new_board, new_depth, -alpha - 1, -alpha, start_time, ply + 1, stats, root_color, tt, max_time, timeout_occurred);
                 }
                 
+                // PV re-search
                 if *timeout_occurred {
                     evaluate(board)
                 } else if is_pv && search_score > alpha && search_score < beta {
@@ -1293,6 +1464,7 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
             }
         };
         
+        // Cleanup repetition table
         {
             let mut rep_table = REPETITION_TABLE.lock().unwrap();
             if let Some(count) = rep_table.get_mut(&new_position_hash) {
@@ -1308,6 +1480,9 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
         }
         
         moves_searched += 1;
+        if is_quiet {
+            quiet_moves_searched += 1;
+        }
         
         if score > best_value {
             best_value = score;
@@ -1317,7 +1492,9 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
         if score > alpha {
             alpha = score;
             
+            // Update heuristics for quiet moves
             if is_quiet {
+                // Update killer moves
                 {
                     let mut killers = KILLER_MOVES.lock().unwrap();
                     if ply < 64 && killers.len() > ply {
@@ -1337,20 +1514,44 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
                     }
                 }
                 
+                // Update history heuristic with depth-based bonus
                 {
                     let mut history = HISTORY_HEURISTIC.lock().unwrap();
-                    *history.entry(*mv).or_insert(0) += (depth * depth) as i32;
+                    let bonus = (depth * depth) as i32;
+                    *history.entry(*mv).or_insert(0) += bonus;
+                    
+                    // Cap history values to prevent overflow
+                    if let Some(value) = history.get_mut(mv) {
+                        if *value > 10000 {
+                            *value = 10000;
+                        }
+                    }
+                }
+                
+                // Reduce history for previous quiet moves that failed
+                for prev_mv in &moves[0..i] {
+                    if board.piece_on(prev_mv.get_dest()).is_none() && prev_mv.get_promotion().is_none() {
+                        let mut history = HISTORY_HEURISTIC.lock().unwrap();
+                        if let Some(value) = history.get_mut(prev_mv) {
+                            *value -= (depth * depth / 4) as i32;
+                            if *value < -1000 {
+                                *value = -1000;
+                            }
+                        }
+                    }
                 }
             }
         }
         
+        // Beta cutoff
         if alpha >= beta {
             break;
         }
     }
     
-    if !*timeout_occurred {
-        let flag = if best_value <= alpha_orig {
+    // Store result in transposition table
+    if !*timeout_occurred && moves_searched > 0 {
+        let flag = if best_value <= original_alpha {
             TTFlag::Upper
         } else if best_value >= beta {
             TTFlag::Lower
@@ -1363,7 +1564,6 @@ fn negamax(board: &Board, depth: usize, mut alpha: i32, beta: i32, start_time: I
     
     best_value
 }
-
 fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
     let start_time = Instant::now();
     let mut best_move = None;
