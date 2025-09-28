@@ -212,7 +212,7 @@ lazy_static! {
     static ref MATERIAL_HASH_TABLE: Mutex<MaterialHashTable> = Mutex::new(MaterialHashTable::new(16));
     static ref KILLER_MOVES: Mutex<Vec<Vec<ChessMove>>> = Mutex::new(Vec::new());
     static ref HISTORY_HEURISTIC: Mutex<HashMap<ChessMove, i32>> = Mutex::new(HashMap::new());
-    static ref TRANSPOSITION_TABLE: Mutex<TranspositionTable> = Mutex::new(TranspositionTable::new(1024));
+    static ref TRANSPOSITION_TABLE: Mutex<TranspositionTable> = Mutex::new(TranspositionTable::new(256));
     static ref REPETITION_TABLE: Mutex<HashMap<u64, usize>> = Mutex::new(HashMap::new());
     static ref PAWN_HASH_TABLE: Mutex<HashMap<u64, i32>> = Mutex::new(HashMap::new());
     static ref FILE_MASKS: [BitBoard; 8] = [
@@ -1708,6 +1708,7 @@ struct UCIEngine {
     board: Board,
     debug: bool,
     position_history: Vec<u64>,
+    hash_size: usize,
 }
 
 impl UCIEngine {
@@ -1716,19 +1717,38 @@ impl UCIEngine {
             board: Board::default(),
             debug: false,
             position_history: Vec::new(),
+            hash_size: 256,
         }
     }
 
     fn handle_uci(&self) {
         println!("id name RustKnightv2.0");
         println!("id author Anish");
+        println!("option name Hash type spin default 256 min 1 max 4096");
         println!("uciok");
     }
 
     fn handle_isready(&self) {
         println!("readyok");
     }
-
+    fn handle_setoption(&mut self, tokens: &[&str]){
+        if tokens.len() >= 5 && tokens[1] == "name" && tokens[3] == "value" {
+            let option_name = tokens[2].to_lowercase();
+            match option_name.as_str() {
+                "hash" => {
+                    if let Ok(size) = tokens[4].parse::<usize>() {
+                        let clamped_size = size.max(1).min(4096);
+                        self.hash_size = clamped_size;
+                        {
+                            let mut tt = TRANSPOSITION_TABLE.lock().unwrap();
+                            *tt = TranspositionTable::new(clamped_size);
+                        }
+                    }
+                }
+                _ => {} 
+            }
+        }
+    }
     fn handle_position(&mut self, tokens: &[&str]) {
         if tokens.len() < 2 {
             return;
@@ -1904,7 +1924,7 @@ impl UCIEngine {
                 "uci" => self.handle_uci(),
                 "debug" => self.handle_debug(&tokens),
                 "isready" => self.handle_isready(),
-                "setoption" => {},
+                "setoption" => self.handle_setoption(&tokens),
                 "register" => {},
                 "ucinewgame" => {
                     self.board = Board::default();
@@ -1912,6 +1932,7 @@ impl UCIEngine {
                     self.position_history.push(compute_zobrist_hash(&self.board));
                     {
                         let mut tt = TRANSPOSITION_TABLE.lock().unwrap();
+                        *tt = TranspositionTable::new(self.hash_size);
                         tt.clear();
                     }
                     {
