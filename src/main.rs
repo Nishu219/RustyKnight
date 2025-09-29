@@ -24,6 +24,14 @@ const FUTILITY_MARGINS: [i32; 5] = [0, 200, 400, 600, 800];
 const LMP_DEPTH: usize = 4;
 const TROPISM_WEIGHTS: [(i32, i32); 4] = [(3, 2), (2, 3), (1, 1), (2, 1)];
 const ATTACK_WEIGHTS: [(i32, i32); 5] = [(4, 2), (3, 4), (2, 1), (3, 1), (1, 0)];
+const KNIGHT_MOBILITY_MG: [i32; 9] = [-25, -15, -10, -5, 0, 5, 10, 15, 20];
+const KNIGHT_MOBILITY_EG: [i32; 9] = [-25, -15, -10, -5, 0, 5, 10, 15, 20];
+const BISHOP_MOBILITY_MG: [i32; 14] = [-20, -15, -10, -5, 0, 5, 8, 12, 15, 18, 20, 22, 24, 25];
+const BISHOP_MOBILITY_EG: [i32; 14] = [-20, -15, -10, -5, 0, 5, 8, 12, 15, 18, 20, 22, 24, 25];
+const ROOK_MOBILITY_MG: [i32; 15] = [-15, -10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10, 12, 14, 15];
+const ROOK_MOBILITY_EG: [i32; 15] = [-15, -10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10, 12, 14, 15];
+const QUEEN_MOBILITY_MG: [i32; 28] = [-10, -8, -6, -4, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+const QUEEN_MOBILITY_EG: [i32; 28] = [-10, -8, -6, -4, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
 const PIECE_ORDER: [Piece; 5] = [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight, Piece::Pawn];
 lazy_static! {
     static ref VALUES: HashMap<Piece, i32> = {
@@ -875,6 +883,95 @@ fn evaluate_king_ring_attacks(board: &Board, phase: i32) -> i32 {
     
     ((mg_score * phase) + (eg_score * (24 - phase))) / 24
 }
+fn evaluate_mobility(board: &Board, phase: i32) -> i32 {
+    let mut mg_score = 0;
+    let mut eg_score = 0;
+    
+    let white_pieces = board.color_combined(Color::White);
+    let black_pieces = board.color_combined(Color::Black);
+    let occupied = board.combined();
+    
+    // White piece mobility
+    let white_knights = board.pieces(Piece::Knight) & white_pieces;
+    for knight_sq in white_knights {
+        let moves = chess::get_knight_moves(knight_sq);
+        let mobility = (moves & !white_pieces).popcnt() as usize;
+        let clamped_mobility = mobility.min(8);
+        mg_score += KNIGHT_MOBILITY_MG[clamped_mobility];
+        eg_score += KNIGHT_MOBILITY_EG[clamped_mobility];
+    }
+    
+    let white_bishops = board.pieces(Piece::Bishop) & white_pieces;
+    for bishop_sq in white_bishops {
+        let moves = chess::get_bishop_rays(bishop_sq) & !occupied;
+        let mobility = (moves & !white_pieces).popcnt() as usize;
+        let clamped_mobility = mobility.min(13);
+        mg_score += BISHOP_MOBILITY_MG[clamped_mobility];
+        eg_score += BISHOP_MOBILITY_EG[clamped_mobility];
+    }
+    
+    let white_rooks = board.pieces(Piece::Rook) & white_pieces;
+    for rook_sq in white_rooks {
+        let moves = chess::get_rook_rays(rook_sq) & !occupied;
+        let mobility = (moves & !white_pieces).popcnt() as usize;
+        let clamped_mobility = mobility.min(14);
+        mg_score += ROOK_MOBILITY_MG[clamped_mobility];
+        eg_score += ROOK_MOBILITY_EG[clamped_mobility];
+    }
+    
+    let white_queens = board.pieces(Piece::Queen) & white_pieces;
+    for queen_sq in white_queens {
+        let rook_moves = chess::get_rook_rays(queen_sq) & !occupied;
+        let bishop_moves = chess::get_bishop_rays(queen_sq) & !occupied;
+        let moves = rook_moves | bishop_moves;
+        let mobility = (moves & !white_pieces).popcnt() as usize;
+        let clamped_mobility = mobility.min(27);
+        mg_score += QUEEN_MOBILITY_MG[clamped_mobility];
+        eg_score += QUEEN_MOBILITY_EG[clamped_mobility];
+    }
+    
+    // Black piece mobility
+    let black_knights = board.pieces(Piece::Knight) & black_pieces;
+    for knight_sq in black_knights {
+        let moves = chess::get_knight_moves(knight_sq);
+        let mobility = (moves & !black_pieces).popcnt() as usize;
+        let clamped_mobility = mobility.min(8);
+        mg_score -= KNIGHT_MOBILITY_MG[clamped_mobility];
+        eg_score -= KNIGHT_MOBILITY_EG[clamped_mobility];
+    }
+    
+    let black_bishops = board.pieces(Piece::Bishop) & black_pieces;
+    for bishop_sq in black_bishops {
+        let moves = chess::get_bishop_rays(bishop_sq) & !occupied;
+        let mobility = (moves & !black_pieces).popcnt() as usize;
+        let clamped_mobility = mobility.min(13);
+        mg_score -= BISHOP_MOBILITY_MG[clamped_mobility];
+        eg_score -= BISHOP_MOBILITY_EG[clamped_mobility];
+    }
+    
+    let black_rooks = board.pieces(Piece::Rook) & black_pieces;
+    for rook_sq in black_rooks {
+        let moves = chess::get_rook_rays(rook_sq) & !occupied;
+        let mobility = (moves & !black_pieces).popcnt() as usize;
+        let clamped_mobility = mobility.min(14);
+        mg_score -= ROOK_MOBILITY_MG[clamped_mobility];
+        eg_score -= ROOK_MOBILITY_EG[clamped_mobility];
+    }
+    
+    let black_queens = board.pieces(Piece::Queen) & black_pieces;
+    for queen_sq in black_queens {
+        let rook_moves = chess::get_rook_rays(queen_sq) & !occupied;
+        let bishop_moves = chess::get_bishop_rays(queen_sq) & !occupied;
+        let moves = rook_moves | bishop_moves;
+        let mobility = (moves & !black_pieces).popcnt() as usize;
+        let clamped_mobility = mobility.min(27);
+        mg_score -= QUEEN_MOBILITY_MG[clamped_mobility];
+        eg_score -= QUEEN_MOBILITY_EG[clamped_mobility];
+    }
+    
+    // Taper the score based on game phase
+    ((mg_score * phase) + (eg_score * (24 - phase))) / 24
+}
 const EVAL_CACHE_MAX: usize = 20000;
 fn evaluate(board: &Board) -> i32 {
     let key = compute_zobrist_hash(board);
@@ -970,6 +1067,7 @@ fn evaluate(board: &Board) -> i32 {
     score += evaluate_pawns(board);
     score += evaluate_king_tropism(board, phase);
     score += evaluate_king_ring_attacks(board, phase);
+    score += evaluate_mobility(board, phase);
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
         score += 30;
     }
