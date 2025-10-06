@@ -7,6 +7,8 @@ use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Instant;
 const MAX_DEPTH: usize = 40;
+const INITIAL_WINDOW: i32 = 50;
+const MAX_WINDOW: i32 = 400;
 const STATS: bool = true;
 const CONTEMPT: i32 = 25;
 const LMR_FULL_DEPTH_MOVES: usize = 4;
@@ -483,6 +485,331 @@ fn phase_value(board: &Board) -> i32 {
         }
     }
     std::cmp::min(phase, 24)
+}
+/// Static Exchange Evaluation - Evaluates the material outcome of a capture sequence
+/// Returns the net material gain/loss from the perspective of the side making the capture
+/// Positive values indicate the capture is winning, negative values indicate losing captures
+fn see(board: &Board, target_square: Square, attacker_square: Square) -> i32 {
+    // Get the piece values
+    let victim = match board.piece_on(target_square) {
+        Some(p) => VALUES[&p],
+        None => return 0, // No capture, SEE is 0
+    };
+
+    let attacker = match board.piece_on(attacker_square) {
+        Some(p) => VALUES[&p],
+        None => return 0,
+    };
+
+    // Quick return for obviously good/bad captures
+    if victim >= attacker {
+        return victim; // Winning or equal capture
+    }
+
+    // Initialize swap list - first gain is the captured piece
+    let mut swap_list = vec![victim];
+
+    // Determine attacking side
+    let stm_mask = board.color_combined(board.side_to_move());
+    let attacking_side = if (BitBoard::from_square(attacker_square) & stm_mask) != BitBoard::new(0)
+    {
+        board.side_to_move()
+    } else {
+        !board.side_to_move()
+    };
+
+    let mut current_side = attacking_side;
+    let mut occupied = *board.combined();
+    let mut attackers = compute_all_attackers(board, target_square, occupied);
+
+    // Remove the initial attacker
+    occupied ^= BitBoard::from_square(attacker_square);
+    attackers ^= BitBoard::from_square(attacker_square);
+
+    // Add X-ray attacks through the initial attacker
+    attackers |= compute_xray_attackers(board, target_square, attacker_square, occupied);
+
+    let mut captured_value = attacker;
+
+    // Process exchange sequence
+    loop {
+        current_side = !current_side;
+
+        // Filter attackers for current side
+        let side_attackers = attackers & board.color_combined(current_side);
+
+        if side_attackers == BitBoard::new(0) {
+            break; // No more attackers for this side
+        }
+
+        // Find least valuable attacker
+        let (next_attacker_sq, next_attacker_value) =
+            find_least_valuable_attacker(board, side_attackers);
+
+        if next_attacker_sq.is_none() {
+            break;
+        }
+
+        let attacker_sq = next_attacker_sq.unwrap();
+        swap_list.push(captured_value);
+        captured_value = next_attacker_value;
+
+        // Update occupied squares
+        occupied ^= BitBoard::from_square(attacker_sq);
+        attackers ^= BitBoard::from_square(attacker_sq);
+
+        // Add X-ray attacks
+        attackers |= compute_xray_attackers(board, target_square, attacker_sq, occupied);
+
+        // Early exit if the side to move is losing after capture
+        // This implements the "standing pat" pruning
+        if swap_list.len() >= 2 {
+            let last_idx = swap_list.len() - 1;
+            if -swap_list[last_idx] + swap_list[last_idx - 1] < 0 {
+                break;
+            }
+        }
+    }
+
+    // Negamax the swap list from the end
+    while swap_list.len() > 1 {
+        let last_idx = swap_list.len() - 1;
+        swap_list[last_idx - 1] = -swap_list[last_idx].max(-swap_list[last_idx - 1]);
+        swap_list.pop();
+    }
+
+    swap_list[0]
+}
+
+/// Compute all pieces attacking a square, considering current board occupancy
+fn compute_all_attackers(board: &Board, square: Square, occupied: BitBoard) -> BitBoard {
+    let mut attackers = BitBoard::new(0);
+
+    // Pawn attackers (from both sides)
+    let white_pawn_attacks = chess::get_pawn_attacks(square, Color::Black, occupied);
+    attackers |=
+        white_pawn_attacks & board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+
+    let black_pawn_attacks = chess::get_pawn_attacks(square, Color::White, occupied);
+    attackers |=
+        black_pawn_attacks & board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+
+    // Knight attackers
+    let knight_attacks = chess::get_knight_moves(square);
+    attackers |= knight_attacks & board.pieces(Piece::Knight);
+
+    // Bishop/Queen diagonal attackers
+    let bishop_attacks_blocked = get_bishop_attacks_with_blockers(square, occupied);
+    attackers |=
+        bishop_attacks_blocked & (board.pieces(Piece::Bishop) | board.pieces(Piece::Queen));
+
+    // Rook/Queen straight attackers
+    let rook_attacks_blocked = get_rook_attacks_with_blockers(square, occupied);
+    attackers |= rook_attacks_blocked & (board.pieces(Piece::Rook) | board.pieces(Piece::Queen));
+
+    // King attackers
+    let king_attacks = get_king_attacks(square);
+    attackers |= king_attacks & board.pieces(Piece::King);
+
+    attackers
+}
+
+/// Compute X-ray attackers revealed by removing a piece
+fn compute_xray_attackers(
+    board: &Board,
+    target_square: Square,
+    removed_square: Square,
+    occupied: BitBoard,
+) -> BitBoard {
+    let mut xray = BitBoard::new(0);
+
+    // Check if removed piece could have blocked diagonal attacks
+    let diagonal_line =
+        chess::get_bishop_rays(target_square) & chess::get_bishop_rays(removed_square);
+    if diagonal_line != BitBoard::new(0) {
+        let bishop_attacks = get_bishop_attacks_with_blockers(target_square, occupied);
+        xray |= bishop_attacks & (board.pieces(Piece::Bishop) | board.pieces(Piece::Queen));
+    }
+
+    // Check if removed piece could have blocked straight attacks
+    let straight_line = chess::get_rook_rays(target_square) & chess::get_rook_rays(removed_square);
+    if straight_line != BitBoard::new(0) {
+        let rook_attacks = get_rook_attacks_with_blockers(target_square, occupied);
+        xray |= rook_attacks & (board.pieces(Piece::Rook) | board.pieces(Piece::Queen));
+    }
+
+    xray
+}
+
+/// Find the least valuable attacker from a set of attackers
+fn find_least_valuable_attacker(
+    board: &Board,
+    attackers: BitBoard,
+) -> (Option<Square>, i32) {
+    // Priority order: Pawn < Knight < Bishop < Rook < Queen < King
+    let piece_order = [
+        (Piece::Pawn, VALUES[&Piece::Pawn]),
+        (Piece::Knight, VALUES[&Piece::Knight]),
+        (Piece::Bishop, VALUES[&Piece::Bishop]),
+        (Piece::Rook, VALUES[&Piece::Rook]),
+        (Piece::Queen, VALUES[&Piece::Queen]),
+        (Piece::King, VALUES[&Piece::King]),
+    ];
+
+    for (piece_type, value) in piece_order.iter() {
+        let pieces_of_type = attackers & board.pieces(*piece_type);
+        if pieces_of_type != BitBoard::new(0) {
+            // Return first attacker of this type
+            for sq in pieces_of_type {
+                return (Some(sq), *value);
+            }
+        }
+    }
+
+    (None, 0)
+}
+
+/// Get bishop attacks considering blockers (magic bitboard approximation)
+fn get_bishop_attacks_with_blockers(square: Square, occupied: BitBoard) -> BitBoard {
+    let mut attacks = BitBoard::new(0);
+    let file = square.get_file().to_index() as i32;
+    let rank = square.get_rank().to_index() as i32;
+
+    // NE direction
+    for i in 1..8 {
+        let new_file = file + i;
+        let new_rank = rank + i;
+        if new_file >= 8 || new_rank >= 8 {
+            break;
+        }
+        let sq = unsafe { Square::new((new_rank * 8 + new_file) as u8) };
+        attacks |= BitBoard::from_square(sq);
+        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
+            break;
+        }
+    }
+
+    // NW direction
+    for i in 1..8 {
+        let new_file = file - i;
+        let new_rank = rank + i;
+        if new_file < 0 || new_rank >= 8 {
+            break;
+        }
+        let sq = unsafe { Square::new((new_rank * 8 + new_file) as u8) };
+        attacks |= BitBoard::from_square(sq);
+        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
+            break;
+        }
+    }
+
+    // SE direction
+    for i in 1..8 {
+        let new_file = file + i;
+        let new_rank = rank - i;
+        if new_file >= 8 || new_rank < 0 {
+            break;
+        }
+        let sq = unsafe { Square::new((new_rank * 8 + new_file) as u8) };
+        attacks |= BitBoard::from_square(sq);
+        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
+            break;
+        }
+    }
+
+    // SW direction
+    for i in 1..8 {
+        let new_file = file - i;
+        let new_rank = rank - i;
+        if new_file < 0 || new_rank < 0 {
+            break;
+        }
+        let sq = unsafe { Square::new((new_rank * 8 + new_file) as u8) };
+        attacks |= BitBoard::from_square(sq);
+        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
+            break;
+        }
+    }
+
+    attacks
+}
+
+/// Get rook attacks considering blockers
+fn get_rook_attacks_with_blockers(square: Square, occupied: BitBoard) -> BitBoard {
+    let mut attacks = BitBoard::new(0);
+
+    let file = square.get_file().to_index() as i32;
+    let rank = square.get_rank().to_index() as i32;
+
+    // North
+    for i in (rank + 1)..8 {
+        let sq = unsafe { Square::new((i * 8 + file) as u8) };
+        attacks |= BitBoard::from_square(sq);
+        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
+            break;
+        }
+    }
+
+    // South
+    for i in (0..rank).rev() {
+        let sq = unsafe { Square::new((i * 8 + file) as u8) };
+        attacks |= BitBoard::from_square(sq);
+        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
+            break;
+        }
+    }
+
+    // East
+    for i in (file + 1)..8 {
+        let sq = unsafe { Square::new((rank * 8 + i) as u8) };
+        attacks |= BitBoard::from_square(sq);
+        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
+            break;
+        }
+    }
+
+    // West
+    for i in (0..file).rev() {
+        let sq = unsafe { Square::new((rank * 8 + i) as u8) };
+        attacks |= BitBoard::from_square(sq);
+        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
+            break;
+        }
+    }
+
+    attacks
+}
+
+/// Get king attack squares
+fn get_king_attacks(square: Square) -> BitBoard {
+    let file = square.get_file().to_index() as i32;
+    let rank = square.get_rank().to_index() as i32;
+    let mut attacks = BitBoard::new(0);
+
+    for df in -1..=1 {
+        for dr in -1..=1 {
+            if df == 0 && dr == 0 {
+                continue;
+            }
+            let new_file = file + df;
+            let new_rank = rank + dr;
+            if new_file >= 0 && new_file < 8 && new_rank >= 0 && new_rank < 8 {
+                let sq = unsafe { Square::new((new_rank * 8 + new_file) as u8) };
+                attacks |= BitBoard::from_square(sq);
+            }
+        }
+    }
+
+    attacks
+}
+
+/// SEE-based move evaluation for better move ordering
+fn see_move(board: &Board, mv: ChessMove) -> i32 {
+    if board.piece_on(mv.get_dest()).is_none() && mv.get_promotion().is_none() {
+        return 0; // Not a capture, SEE doesn't apply
+    }
+
+    see(board, mv.get_dest(), mv.get_source())
 }
 fn mvv_lva_score(board: &Board, mv: ChessMove) -> i32 {
     let victim_value = if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
@@ -1215,22 +1542,31 @@ fn order_moves(
         .into_iter()
         .map(|mv| {
             let score = if Some(mv) == hash_move {
-                1000000
+                10000000
             } else if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
-                900000 + mvv_lva_score(board, mv)
+                // Use SEE for accurate capture evaluation
+                let see_score = see_move(board, mv);
+
+                if see_score >= 0 {
+                    // Winning or equal captures
+                    9000000 + see_score
+                } else {
+                    // Losing captures - order after quiet moves but before very bad moves
+                    100000 + see_score
+                }
             } else {
                 let new_board = board.make_move_new(mv);
                 if *new_board.checkers() != BitBoard(0) {
-                    800000
+                    8000000
                 } else {
                     let history = HISTORY_HEURISTIC.lock().unwrap();
                     if depth < 64 {
                         let killers = KILLER_MOVES.lock().unwrap();
                         if killers.len() > depth {
                             if killers[depth].len() > 0 && killers[depth][0] == mv {
-                                700000
+                                7000000
                             } else if killers[depth].len() > 1 && killers[depth][1] == mv {
-                                600000
+                                6000000
                             } else {
                                 *history.get(&mv).unwrap_or(&0)
                             }
@@ -1291,6 +1627,10 @@ fn quiesce(
     for (mv, _) in captures {
         if *timeout_occurred {
             break;
+        }
+        let see_value = see_move(board, mv);
+        if see_value < -50 {
+            continue;
         }
 
         let new_board = board.make_move_new(mv);
@@ -1779,6 +2119,7 @@ fn negamax(
 
         // Principal Variation Search
         let score = if i == 0 {
+            // Always search first move with full window
             -negamax(
                 &new_board,
                 new_depth,
@@ -1793,7 +2134,7 @@ fn negamax(
                 timeout_occurred,
             )
         } else {
-            // Null window search
+            // Scout search with null window
             let mut search_score = -negamax(
                 &new_board,
                 new_depth,
@@ -1811,7 +2152,7 @@ fn negamax(
             if *timeout_occurred {
                 evaluate(board)
             } else {
-                // Re-search with full depth if LMR was applied and score improved
+                // Check if reduced search needs full-depth re-search
                 if !do_full_search && search_score > alpha {
                     new_depth = depth - 1 + extension;
                     search_score = -negamax(
@@ -1829,23 +2170,28 @@ fn negamax(
                     );
                 }
 
-                // PV re-search
+                // PV re-search with full window if score beats alpha
                 if *timeout_occurred {
                     evaluate(board)
-                } else if is_pv && search_score > alpha && search_score < beta {
-                    -negamax(
-                        &new_board,
-                        new_depth,
-                        -beta,
-                        -alpha,
-                        start_time,
-                        ply + 1,
-                        stats,
-                        root_color,
-                        tt,
-                        max_time,
-                        timeout_occurred,
-                    )
+                } else if search_score > alpha {
+                    // Only do full re-search if we're in PV node or score is in window
+                    if is_pv || (search_score < beta) {
+                        -negamax(
+                            &new_board,
+                            new_depth,
+                            -beta,
+                            -alpha,
+                            start_time,
+                            ply + 1,
+                            stats,
+                            root_color,
+                            tt,
+                            max_time,
+                            timeout_occurred,
+                        )
+                    } else {
+                        search_score
+                    }
                 } else {
                     search_score
                 }
@@ -1960,6 +2306,7 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
     let mut best_score = 0;
     let root_color = board.side_to_move();
 
+    // Check for immediate checkmate
     let movegen = MoveGen::new_legal(board);
     for mv in movegen {
         let new_board = board.make_move_new(mv);
@@ -1969,7 +2316,6 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
     }
 
     let mut tt_guard = TRANSPOSITION_TABLE.lock().unwrap();
-
     for depth in 1..=MAX_DEPTH {
         if start_time.elapsed().as_secs_f64() > max_time * 0.8 {
             break;
@@ -1978,33 +2324,30 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
         let mut stats: HashMap<&str, usize> = HashMap::new();
         let mut timeout_occurred = false;
 
-        let (alpha, beta) = if depth <= 4 || best_move.is_none() {
+        // Determine initial aspiration window bounds
+        let (initial_alpha, initial_beta) = if depth <= 4 || best_move.is_none() {
+            // Full window for early depths or when no best move exists
             (-31000, 31000)
         } else {
-            (best_score - 50, best_score + 50)
+            // Narrow aspiration window centered on previous iteration's score
+            (best_score - INITIAL_WINDOW, best_score + INITIAL_WINDOW)
         };
 
-        let score = negamax(
-            board,
-            depth,
-            alpha,
-            beta,
-            start_time,
-            0,
-            &mut stats,
-            root_color,
-            &mut *tt_guard,
-            max_time,
-            &mut timeout_occurred,
-        );
+        let mut alpha = initial_alpha;
+        let mut beta = initial_beta;
+        let mut window_size = INITIAL_WINDOW;
+        let mut search_iterations = 0;
+        const MAX_ASPIRATION_ITERATIONS: usize = 6;
 
-        let final_score = if timeout_occurred || score <= alpha || score >= beta {
-            timeout_occurred = false;
-            negamax(
+        // Aspiration window re-search loop
+        loop {
+            search_iterations += 1;
+
+            let score = negamax(
                 board,
                 depth,
-                -31000,
-                31000,
+                alpha,
+                beta,
                 start_time,
                 0,
                 &mut stats,
@@ -2012,62 +2355,143 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                 &mut *tt_guard,
                 max_time,
                 &mut timeout_occurred,
-            )
-        } else {
-            score
-        };
+            );
 
-        if !timeout_occurred {
-            let board_hash = compute_zobrist_hash(board);
-            if let Some(mv) = tt_guard.get_move(board_hash) {
-                let movegen = MoveGen::new_legal(board);
-                if movegen.into_iter().any(|legal_move| legal_move == mv) {
-                    best_move = Some(mv);
-                    best_score = final_score;
+            if timeout_occurred {
+                break;
+            }
 
-                    if STATS {
-                        let mut pv = Vec::new();
-                        let mut temp_board = *board;
-                        for _ in 0..depth {
-                            let h = compute_zobrist_hash(&temp_board);
-                            if let Some(pv_move) = tt_guard.get_move(h) {
-                                let movegen = MoveGen::new_legal(&temp_board);
-                                if movegen.into_iter().any(|legal_move| legal_move == pv_move) {
-                                    pv.push(pv_move);
-                                    temp_board = temp_board.make_move_new(pv_move);
+            // Check if we failed low or high
+            if score <= alpha {
+                // FAIL LOW: True score is <= alpha
+                // Standard PVS: Open the window downward, keep beta
+                if STATS {
+                    println!(
+                        "info string Aspiration fail-low at depth {} (score {} <= alpha {})",
+                        depth, score, alpha
+                    );
+                }
+
+                // Widen window exponentially
+                window_size *= 2;
+
+                if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
+                    // Give up on aspiration, do full search
+                    alpha = -31000;
+                    beta = initial_beta.max(score + INITIAL_WINDOW);
+                } else {
+                    // Re-search with lowered alpha, keeping beta stable
+                    alpha = (score - window_size).max(-31000);
+                    // Beta remains at initial_beta or can be narrowed slightly
+                    beta = initial_beta;
+                }
+            } else if score >= beta {
+                // FAIL HIGH: True score is >= beta
+                // Standard PVS: Open the window upward, keep alpha
+                if STATS {
+                    println!(
+                        "info string Aspiration fail-high at depth {} (score {} >= beta {})",
+                        depth, score, beta
+                    );
+                }
+
+                // Widen window exponentially
+                window_size *= 2;
+
+                if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
+                    // Give up on aspiration, do full search
+                    alpha = initial_alpha.min(score - INITIAL_WINDOW);
+                    beta = 31000;
+                } else {
+                    // Re-search with raised beta, keeping alpha stable
+                    beta = (score + window_size).min(31000);
+                    // Alpha remains at initial_alpha or can be narrowed slightly
+                    alpha = initial_alpha;
+                }
+            } else {
+                // SUCCESS: Score is within [alpha, beta]
+                best_score = score;
+
+                let board_hash = compute_zobrist_hash(board);
+                if let Some(mv) = tt_guard.get_move(board_hash) {
+                    let movegen = MoveGen::new_legal(board);
+                    if movegen.into_iter().any(|legal_move| legal_move == mv) {
+                        best_move = Some(mv);
+
+                        if STATS {
+                            // Extract and display principal variation
+                            let mut pv = Vec::new();
+                            let mut temp_board = *board;
+                            let mut pv_depth = 0;
+
+                            for _ in 0..depth.min(20) {
+                                let h = compute_zobrist_hash(&temp_board);
+                                if let Some(pv_move) = tt_guard.get_move(h) {
+                                    let movegen = MoveGen::new_legal(&temp_board);
+                                    if movegen.into_iter().any(|legal_move| legal_move == pv_move) {
+                                        pv.push(pv_move);
+                                        temp_board = temp_board.make_move_new(pv_move);
+                                        pv_depth += 1;
+                                    } else {
+                                        break;
+                                    }
                                 } else {
                                     break;
                                 }
-                            } else {
-                                break;
                             }
+
+                            let nodes = *stats.get("nodes").unwrap_or(&0);
+                            let time_ms = (start_time.elapsed().as_secs_f64() * 1000.0) as u64;
+                            let nps = if time_ms > 0 {
+                                nodes * 1000 / time_ms as usize
+                            } else {
+                                0
+                            };
+                            let pv_string = pv
+                                .iter()
+                                .map(|m| format!("{}", m))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+
+                            // Calculate hash usage percentage
+                            let hashfull =
+                                (tt_guard.table.len() * 1000 / tt_guard.size.max(1)).min(1000);
+
+                            println!(
+                                "info depth {} seldepth {} score cp {} nodes {} nps {} time {} hashfull {} pv {}",
+                                depth, 
+                                pv_depth.max(depth), 
+                                best_score, 
+                                nodes, 
+                                nps, 
+                                time_ms,
+                                hashfull,
+                                pv_string
+                            );
                         }
 
-                        let nodes = *stats.get("nodes").unwrap_or(&0);
-                        let time_ms = (start_time.elapsed().as_secs_f64() * 1000.0) as u64;
-                        let nps = if time_ms > 0 {
-                            nodes * 1000 / time_ms as usize
-                        } else {
-                            0
-                        };
-                        let pv_string = pv
-                            .iter()
-                            .map(|m| format!("{}", m))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-
-                        println!(
-                            "info depth {} seldepth {} score cp {} nodes {} nps {} time {} pv {}",
-                            depth, depth, final_score, nodes, nps, time_ms, pv_string
-                        );
-                    }
-
-                    if final_score.abs() > 30000 {
-                        break;
+                        // Early exit if mate found
+                        if best_score.abs() > 29000 {
+                            break;
+                        }
                     }
                 }
+                break; // Exit aspiration window loop on success
             }
-        } else {
+
+            // Safety: prevent infinite loops
+            if timeout_occurred || search_iterations >= MAX_ASPIRATION_ITERATIONS * 2 {
+                if STATS && search_iterations >= MAX_ASPIRATION_ITERATIONS * 2 {
+                    println!(
+                        "info string Aspiration window abandoned after {} iterations",
+                        search_iterations
+                    );
+                }
+                break;
+            }
+        }
+
+        if timeout_occurred {
             break;
         }
     }
@@ -2133,7 +2557,7 @@ impl UCIEngine {
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnightv2.0");
+        println!("id name RustKnightdev");
         println!("id author Anish");
         println!("option name Hash type spin default 256 min 1 max 4096");
         println!("uciok");
