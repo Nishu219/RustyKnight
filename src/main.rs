@@ -486,306 +486,324 @@ fn phase_value(board: &Board) -> i32 {
     }
     std::cmp::min(phase, 24)
 }
-/// Static Exchange Evaluation - Evaluates the material outcome of a capture sequence
-/// Returns the net material gain/loss from the perspective of the side making the capture
-/// Positive values indicate the capture is winning, negative values indicate losing captures
-fn see(board: &Board, target_square: Square, attacker_square: Square) -> i32 {
-    // Get the piece values
-    let victim = match board.piece_on(target_square) {
-        Some(p) => VALUES[&p],
-        None => return 0, // No capture, SEE is 0
+/// Static Exchange Evaluation with Threshold
+/// Returns TRUE if the capture sequence meets or exceeds the threshold
+/// Returns FALSE if the capture sequence is below the threshold
+/// 
+/// This allows efficient pruning decisions:
+/// - see_capture(board, mv, 0) -> Is capture winning or equal?
+/// - see_capture(board, mv, -100) -> Is capture not too bad (loss < 1 pawn)?
+/// - see_capture(board, mv, 200) -> Does capture win at least 2 pawns?
+fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
+    let to_square = mv.get_dest();
+    let from_square = mv.get_source();
+    
+    // Get initial capture value
+    let captured_piece = match board.piece_on(to_square) {
+        Some(p) => p,
+        None => {
+            // Handle en passant
+            if mv.get_promotion().is_some() {
+                return VALUES[&Piece::Queen] - VALUES[&Piece::Pawn] >= threshold;
+            }
+            return false; // Not a capture
+        }
     };
-
-    let attacker = match board.piece_on(attacker_square) {
-        Some(p) => VALUES[&p],
-        None => return 0,
+    
+    let moving_piece = match board.piece_on(from_square) {
+        Some(p) => p,
+        None => return false,
     };
-
-    // Quick return for obviously good/bad captures
-    if victim >= attacker {
-        return victim; // Winning or equal capture
+    
+    let mut see_value = VALUES[&captured_piece];
+    let mut trophy_value = VALUES[&moving_piece];
+    
+    // Quick exit: obviously winning capture (e.g., PxQ)
+    if see_value - trophy_value >= threshold {
+        return true;
     }
-
-    // Initialize swap list - first gain is the captured piece
-    let mut swap_list = vec![victim];
-
-    // Determine attacking side
-    let stm_mask = board.color_combined(board.side_to_move());
-    let attacking_side = if (BitBoard::from_square(attacker_square) & stm_mask) != BitBoard::new(0)
-    {
+    
+    // Quick exit: captured piece value alone doesn't meet threshold
+    if see_value < threshold {
+        return false;
+    }
+    
+    // Determine sides
+    let to_move_mask = board.color_combined(board.side_to_move());
+    let to_move = if (BitBoard::from_square(from_square) & to_move_mask) != BitBoard::new(0) {
         board.side_to_move()
     } else {
         !board.side_to_move()
     };
-
-    let mut current_side = attacking_side;
-    let mut occupied = *board.combined();
-    let mut attackers = compute_all_attackers(board, target_square, occupied);
-
-    // Remove the initial attacker
-    occupied ^= BitBoard::from_square(attacker_square);
-    attackers ^= BitBoard::from_square(attacker_square);
-
-    // Add X-ray attacks through the initial attacker
-    attackers |= compute_xray_attackers(board, target_square, attacker_square, occupied);
-
-    let mut captured_value = attacker;
-
-    // Process exchange sequence
+    let opponent = !to_move;
+    
+    // Generate all attackers for both sides
+    let mut attacks_to_move = BitBoard::new(0);
+    let mut attacks_opponent = BitBoard::new(0);
+    
+    // Pawns
+    attacks_to_move |= get_pawn_attackers(to_square, to_move, board);
+    attacks_opponent |= get_pawn_attackers(to_square, opponent, board);
+    
+    // Early cutoff: can opponent's pawn capture and cause immediate fail?
+    if attacks_opponent != BitBoard::new(0) 
+        && see_value - trophy_value + VALUES[&Piece::Pawn] < threshold {
+        return false;
+    }
+    
+    // Knights
+    let knight_attacks = chess::get_knight_moves(to_square);
+    attacks_to_move |= knight_attacks & board.pieces(Piece::Knight) & board.color_combined(to_move);
+    attacks_opponent |= knight_attacks & board.pieces(Piece::Knight) & board.color_combined(opponent);
+    
+    // Kings
+    let king_attacks = get_king_attacks(to_square);
+    attacks_to_move |= king_attacks & board.pieces(Piece::King) & board.color_combined(to_move);
+    attacks_opponent |= king_attacks & board.pieces(Piece::King) & board.color_combined(opponent);
+    
+    // Bishops and Queens (diagonal)
+    let bishop_rays = chess::get_bishop_rays(to_square);
+    attacks_to_move |= bishop_rays & (board.pieces(Piece::Bishop) | board.pieces(Piece::Queen)) 
+        & board.color_combined(to_move);
+    attacks_opponent |= bishop_rays & (board.pieces(Piece::Bishop) | board.pieces(Piece::Queen)) 
+        & board.color_combined(opponent);
+    
+    // Rooks and Queens (straight)
+    let rook_rays = chess::get_rook_rays(to_square);
+    attacks_to_move |= rook_rays & (board.pieces(Piece::Rook) | board.pieces(Piece::Queen)) 
+        & board.color_combined(to_move);
+    attacks_opponent |= rook_rays & (board.pieces(Piece::Rook) | board.pieces(Piece::Queen)) 
+        & board.color_combined(opponent);
+    
+    // Track occupied squares (remove initial attacker)
+    let mut all_pieces = *board.combined();
+    let from_bb = BitBoard::from_square(from_square);
+    attacks_to_move ^= from_bb;
+    all_pieces ^= from_bb;
+    
+    // Main exchange loop
     loop {
-        current_side = !current_side;
-
-        // Filter attackers for current side
-        let side_attackers = attackers & board.color_combined(current_side);
-
-        if side_attackers == BitBoard::new(0) {
-            break; // No more attackers for this side
+        // ===== OPPONENT'S TURN TO CAPTURE =====
+        
+        // Check if opponent has any attackers
+        if attacks_opponent == BitBoard::new(0) {
+            trophy_value = 0;
+            // Jump to opponent cut test
+        } else if let Some((attacker_sq, attacker_piece)) = 
+            find_least_valuable_attacker_threshold(
+                board, 
+                opponent, 
+                attacks_opponent, 
+                all_pieces, 
+                to_square
+            ) {
+            // Opponent captures
+            see_value -= trophy_value;
+            trophy_value = VALUES[&attacker_piece];
+            
+            // Remove attacker from board
+            let attacker_bb = BitBoard::from_square(attacker_sq);
+            attacks_opponent ^= attacker_bb;
+            all_pieces ^= attacker_bb;
+        } else {
+            trophy_value = 0;
         }
-
-        // Find least valuable attacker
-        let (next_attacker_sq, next_attacker_value) =
-            find_least_valuable_attacker(board, side_attackers);
-
-        if next_attacker_sq.is_none() {
-            break;
+        
+        // Opponent cut test: Can we prune here?
+        
+        // Upper bound test: side-to-move can stand pat and still win
+        if see_value >= threshold {
+            return true;
         }
-
-        let attacker_sq = next_attacker_sq.unwrap();
-        swap_list.push(captured_value);
-        captured_value = next_attacker_value;
-
-        // Update occupied squares
-        occupied ^= BitBoard::from_square(attacker_sq);
-        attackers ^= BitBoard::from_square(attacker_sq);
-
-        // Add X-ray attacks
-        attackers |= compute_xray_attackers(board, target_square, attacker_sq, occupied);
-
-        // Early exit if the side to move is losing after capture
-        // This implements the "standing pat" pruning
-        if swap_list.len() >= 2 {
-            let last_idx = swap_list.len() - 1;
-            if -swap_list[last_idx] + swap_list[last_idx - 1] < 0 {
-                break;
-            }
+        
+        // Lower bound test: even if side-to-move captures, still loses
+        if see_value + trophy_value < threshold {
+            return false;
         }
+        
+        // ===== SIDE-TO-MOVE'S TURN TO RECAPTURE =====
+        
+        // Check if side-to-move has any attackers
+        if attacks_to_move == BitBoard::new(0) {
+            trophy_value = 0;
+            // Jump to to_move cut test
+        } else if let Some((attacker_sq, attacker_piece)) = 
+            find_least_valuable_attacker_threshold(
+                board, 
+                to_move, 
+                attacks_to_move, 
+                all_pieces, 
+                to_square
+            ) {
+            // Side-to-move recaptures
+            see_value += trophy_value;
+            trophy_value = VALUES[&attacker_piece];
+            
+            // Remove attacker from board
+            let attacker_bb = BitBoard::from_square(attacker_sq);
+            attacks_to_move ^= attacker_bb;
+            all_pieces ^= attacker_bb;
+        } else {
+            trophy_value = 0;
+        }
+        
+        // To-move cut test
+        
+        // Upper bound test: even if opponent captures, side-to-move still wins
+        if see_value - trophy_value >= threshold {
+            return true;
+        }
+        
+        // Lower bound test: opponent can stand pat and win
+        if see_value < threshold {
+            return false;
+        }
+        
+        // Continue exchange loop
     }
-
-    // Negamax the swap list from the end
-    while swap_list.len() > 1 {
-        let last_idx = swap_list.len() - 1;
-        swap_list[last_idx - 1] = -swap_list[last_idx].max(-swap_list[last_idx - 1]);
-        swap_list.pop();
-    }
-
-    swap_list[0]
 }
 
-/// Compute all pieces attacking a square, considering current board occupancy
-fn compute_all_attackers(board: &Board, square: Square, occupied: BitBoard) -> BitBoard {
+/// Get pawn attackers of a square for a specific color
+fn get_pawn_attackers(square: Square, color: Color, board: &Board) -> BitBoard {
+    // Pawns attack diagonally opposite to their move direction
+    let file = square.get_file().to_index() as i32;
+    let rank = square.get_rank().to_index() as i32;
     let mut attackers = BitBoard::new(0);
-
-    // Pawn attackers (from both sides)
-    let white_pawn_attacks = chess::get_pawn_attacks(square, Color::Black, occupied);
-    attackers |=
-        white_pawn_attacks & board.pieces(Piece::Pawn) & board.color_combined(Color::White);
-
-    let black_pawn_attacks = chess::get_pawn_attacks(square, Color::White, occupied);
-    attackers |=
-        black_pawn_attacks & board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
-
-    // Knight attackers
-    let knight_attacks = chess::get_knight_moves(square);
-    attackers |= knight_attacks & board.pieces(Piece::Knight);
-
-    // Bishop/Queen diagonal attackers
-    let bishop_attacks_blocked = get_bishop_attacks_with_blockers(square, occupied);
-    attackers |=
-        bishop_attacks_blocked & (board.pieces(Piece::Bishop) | board.pieces(Piece::Queen));
-
-    // Rook/Queen straight attackers
-    let rook_attacks_blocked = get_rook_attacks_with_blockers(square, occupied);
-    attackers |= rook_attacks_blocked & (board.pieces(Piece::Rook) | board.pieces(Piece::Queen));
-
-    // King attackers
-    let king_attacks = get_king_attacks(square);
-    attackers |= king_attacks & board.pieces(Piece::King);
-
-    attackers
-}
-
-/// Compute X-ray attackers revealed by removing a piece
-fn compute_xray_attackers(
-    board: &Board,
-    target_square: Square,
-    removed_square: Square,
-    occupied: BitBoard,
-) -> BitBoard {
-    let mut xray = BitBoard::new(0);
-
-    // Check if removed piece could have blocked diagonal attacks
-    let diagonal_line =
-        chess::get_bishop_rays(target_square) & chess::get_bishop_rays(removed_square);
-    if diagonal_line != BitBoard::new(0) {
-        let bishop_attacks = get_bishop_attacks_with_blockers(target_square, occupied);
-        xray |= bishop_attacks & (board.pieces(Piece::Bishop) | board.pieces(Piece::Queen));
-    }
-
-    // Check if removed piece could have blocked straight attacks
-    let straight_line = chess::get_rook_rays(target_square) & chess::get_rook_rays(removed_square);
-    if straight_line != BitBoard::new(0) {
-        let rook_attacks = get_rook_attacks_with_blockers(target_square, occupied);
-        xray |= rook_attacks & (board.pieces(Piece::Rook) | board.pieces(Piece::Queen));
-    }
-
-    xray
-}
-
-/// Find the least valuable attacker from a set of attackers
-fn find_least_valuable_attacker(
-    board: &Board,
-    attackers: BitBoard,
-) -> (Option<Square>, i32) {
-    // Priority order: Pawn < Knight < Bishop < Rook < Queen < King
-    let piece_order = [
-        (Piece::Pawn, VALUES[&Piece::Pawn]),
-        (Piece::Knight, VALUES[&Piece::Knight]),
-        (Piece::Bishop, VALUES[&Piece::Bishop]),
-        (Piece::Rook, VALUES[&Piece::Rook]),
-        (Piece::Queen, VALUES[&Piece::Queen]),
-        (Piece::King, VALUES[&Piece::King]),
-    ];
-
-    for (piece_type, value) in piece_order.iter() {
-        let pieces_of_type = attackers & board.pieces(*piece_type);
-        if pieces_of_type != BitBoard::new(0) {
-            // Return first attacker of this type
-            for sq in pieces_of_type {
-                return (Some(sq), *value);
+    
+    match color {
+        Color::White => {
+            // White pawns attack from below (lower ranks)
+            if rank > 0 {
+                if file > 0 {
+                    let sq = unsafe { Square::new(((rank - 1) * 8 + file - 1) as u8) };
+                    attackers |= BitBoard::from_square(sq);
+                }
+                if file < 7 {
+                    let sq = unsafe { Square::new(((rank - 1) * 8 + file + 1) as u8) };
+                    attackers |= BitBoard::from_square(sq);
+                }
+            }
+        }
+        Color::Black => {
+            // Black pawns attack from above (higher ranks)
+            if rank < 7 {
+                if file > 0 {
+                    let sq = unsafe { Square::new(((rank + 1) * 8 + file - 1) as u8) };
+                    attackers |= BitBoard::from_square(sq);
+                }
+                if file < 7 {
+                    let sq = unsafe { Square::new(((rank + 1) * 8 + file + 1) as u8) };
+                    attackers |= BitBoard::from_square(sq);
+                }
             }
         }
     }
-
-    (None, 0)
+    
+    attackers & board.pieces(Piece::Pawn) & board.color_combined(color)
 }
 
-/// Get bishop attacks considering blockers (magic bitboard approximation)
-fn get_bishop_attacks_with_blockers(square: Square, occupied: BitBoard) -> BitBoard {
-    let mut attacks = BitBoard::new(0);
-    let file = square.get_file().to_index() as i32;
-    let rank = square.get_rank().to_index() as i32;
-
-    // NE direction
-    for i in 1..8 {
-        let new_file = file + i;
-        let new_rank = rank + i;
-        if new_file >= 8 || new_rank >= 8 {
-            break;
-        }
-        let sq = unsafe { Square::new((new_rank * 8 + new_file) as u8) };
-        attacks |= BitBoard::from_square(sq);
-        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
-            break;
-        }
-    }
-
-    // NW direction
-    for i in 1..8 {
-        let new_file = file - i;
-        let new_rank = rank + i;
-        if new_file < 0 || new_rank >= 8 {
-            break;
-        }
-        let sq = unsafe { Square::new((new_rank * 8 + new_file) as u8) };
-        attacks |= BitBoard::from_square(sq);
-        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
-            break;
+/// Find least valuable attacker considering blockers
+/// Returns (Square, Piece) of the attacker, or None if no unblocked attacker exists
+fn find_least_valuable_attacker_threshold(
+    board: &Board,
+    color: Color,
+    attackers: BitBoard,
+    all_pieces: BitBoard,
+    target_square: Square,
+) -> Option<(Square, Piece)> {
+    // Check pieces in order of value: Pawn, Knight, Bishop, Rook, Queen, King
+    
+    // Pawns (no blocking check needed)
+    let pawns = attackers & board.pieces(Piece::Pawn) & board.color_combined(color);
+    if pawns != BitBoard::new(0) {
+        for sq in pawns {
+            return Some((sq, Piece::Pawn));
         }
     }
-
-    // SE direction
-    for i in 1..8 {
-        let new_file = file + i;
-        let new_rank = rank - i;
-        if new_file >= 8 || new_rank < 0 {
-            break;
-        }
-        let sq = unsafe { Square::new((new_rank * 8 + new_file) as u8) };
-        attacks |= BitBoard::from_square(sq);
-        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
-            break;
+    
+    // Knights (no blocking check needed)
+    let knights = attackers & board.pieces(Piece::Knight) & board.color_combined(color);
+    if knights != BitBoard::new(0) {
+        for sq in knights {
+            return Some((sq, Piece::Knight));
         }
     }
-
-    // SW direction
-    for i in 1..8 {
-        let new_file = file - i;
-        let new_rank = rank - i;
-        if new_file < 0 || new_rank < 0 {
-            break;
-        }
-        let sq = unsafe { Square::new((new_rank * 8 + new_file) as u8) };
-        attacks |= BitBoard::from_square(sq);
-        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
-            break;
+    
+    // Bishops (must check for blockers)
+    let bishops = attackers & board.pieces(Piece::Bishop) & board.color_combined(color);
+    if bishops != BitBoard::new(0) {
+        for sq in bishops {
+            if !is_path_blocked(sq, target_square, all_pieces) {
+                return Some((sq, Piece::Bishop));
+            }
         }
     }
-
-    attacks
+    
+    // Rooks (must check for blockers)
+    let rooks = attackers & board.pieces(Piece::Rook) & board.color_combined(color);
+    if rooks != BitBoard::new(0) {
+        for sq in rooks {
+            if !is_path_blocked(sq, target_square, all_pieces) {
+                return Some((sq, Piece::Rook));
+            }
+        }
+    }
+    
+    // Queens (must check for blockers)
+    let queens = attackers & board.pieces(Piece::Queen) & board.color_combined(color);
+    if queens != BitBoard::new(0) {
+        for sq in queens {
+            if !is_path_blocked(sq, target_square, all_pieces) {
+                return Some((sq, Piece::Queen));
+            }
+        }
+    }
+    
+    // King (no blocking check needed)
+    let kings = attackers & board.pieces(Piece::King) & board.color_combined(color);
+    if kings != BitBoard::new(0) {
+        for sq in kings {
+            return Some((sq, Piece::King));
+        }
+    }
+    
+    None
 }
 
-/// Get rook attacks considering blockers
-fn get_rook_attacks_with_blockers(square: Square, occupied: BitBoard) -> BitBoard {
-    let mut attacks = BitBoard::new(0);
-
-    let file = square.get_file().to_index() as i32;
-    let rank = square.get_rank().to_index() as i32;
-
-    // North
-    for i in (rank + 1)..8 {
-        let sq = unsafe { Square::new((i * 8 + file) as u8) };
-        attacks |= BitBoard::from_square(sq);
+/// Check if path between two squares is blocked
+fn is_path_blocked(from: Square, to: Square, occupied: BitBoard) -> bool {
+    let from_file = from.get_file().to_index() as i32;
+    let from_rank = from.get_rank().to_index() as i32;
+    let to_file = to.get_file().to_index() as i32;
+    let to_rank = to.get_rank().to_index() as i32;
+    
+    let file_diff = to_file - from_file;
+    let rank_diff = to_rank - from_rank;
+    
+    // Determine direction
+    let file_step = if file_diff > 0 { 1 } else if file_diff < 0 { -1 } else { 0 };
+    let rank_step = if rank_diff > 0 { 1 } else if rank_diff < 0 { -1 } else { 0 };
+    
+    // Check squares between from and to
+    let mut current_file = from_file + file_step;
+    let mut current_rank = from_rank + rank_step;
+    
+    while current_file != to_file || current_rank != to_rank {
+        let sq = unsafe { Square::new((current_rank * 8 + current_file) as u8) };
         if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
-            break;
+            return true; // Blocked
         }
+        current_file += file_step;
+        current_rank += rank_step;
     }
-
-    // South
-    for i in (0..rank).rev() {
-        let sq = unsafe { Square::new((i * 8 + file) as u8) };
-        attacks |= BitBoard::from_square(sq);
-        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
-            break;
-        }
-    }
-
-    // East
-    for i in (file + 1)..8 {
-        let sq = unsafe { Square::new((rank * 8 + i) as u8) };
-        attacks |= BitBoard::from_square(sq);
-        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
-            break;
-        }
-    }
-
-    // West
-    for i in (0..file).rev() {
-        let sq = unsafe { Square::new((rank * 8 + i) as u8) };
-        attacks |= BitBoard::from_square(sq);
-        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
-            break;
-        }
-    }
-
-    attacks
+    
+    false // Not blocked
 }
-
-/// Get king attack squares
 fn get_king_attacks(square: Square) -> BitBoard {
     let file = square.get_file().to_index() as i32;
     let rank = square.get_rank().to_index() as i32;
     let mut attacks = BitBoard::new(0);
-
+    
     for df in -1..=1 {
         for dr in -1..=1 {
             if df == 0 && dr == 0 {
@@ -799,17 +817,8 @@ fn get_king_attacks(square: Square) -> BitBoard {
             }
         }
     }
-
+    
     attacks
-}
-
-/// SEE-based move evaluation for better move ordering
-fn see_move(board: &Board, mv: ChessMove) -> i32 {
-    if board.piece_on(mv.get_dest()).is_none() && mv.get_promotion().is_none() {
-        return 0; // Not a capture, SEE doesn't apply
-    }
-
-    see(board, mv.get_dest(), mv.get_source())
 }
 fn mvv_lva_score(board: &Board, mv: ChessMove) -> i32 {
     let victim_value = if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
@@ -1544,15 +1553,14 @@ fn order_moves(
             let score = if Some(mv) == hash_move {
                 10000000
             } else if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
-                // Use SEE for accurate capture evaluation
-                let see_score = see_move(board, mv);
-
-                if see_score >= 0 {
-                    // Winning or equal captures
-                    9000000 + see_score
+                if see_capture(board, mv, 300)
+                {
+                    9500000
+                }
+                else if see_capture(board, mv, 0) {
+                    7500000
                 } else {
-                    // Losing captures - order after quiet moves but before very bad moves
-                    100000 + see_score
+                    500000
                 }
             } else {
                 let new_board = board.make_move_new(mv);
@@ -1628,8 +1636,7 @@ fn quiesce(
         if *timeout_occurred {
             break;
         }
-        let see_value = see_move(board, mv);
-        if see_value < -50 {
+        if !see_capture(board, mv, 0) {
             continue;
         }
 
