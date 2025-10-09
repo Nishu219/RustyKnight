@@ -25,19 +25,13 @@ const LMP_DEPTH: usize = 4;
 const TROPISM_WEIGHTS: [(i32, i32); 4] = [(3, 2), (2, 3), (1, 1), (2, 1)];
 const ATTACK_WEIGHTS: [(i32, i32); 5] = [(4, 2), (3, 4), (2, 1), (3, 1), (1, 0)];
 const KNIGHT_MOBILITY_MG: [i32; 9] = [-25, -15, -10, -5, 0, 5, 10, 15, 20];
-const KNIGHT_MOBILITY_EG: [i32; 9] = [-25, -15, -10, -5, 0, 5, 10, 15, 20];
+const KNIGHT_MOBILITY_EG: [i32; 9] = [-30, -20, -15, -10, -5, 0, 5, 10, 15];
 const BISHOP_MOBILITY_MG: [i32; 14] = [-20, -15, -10, -5, 0, 5, 8, 12, 15, 18, 20, 22, 24, 25];
-const BISHOP_MOBILITY_EG: [i32; 14] = [-20, -15, -10, -5, 0, 5, 8, 12, 15, 18, 20, 22, 24, 25];
+const BISHOP_MOBILITY_EG: [i32; 14] = [-15, -10, -5, 0, 5, 10, 13, 16, 19, 22, 25, 27, 29, 31];
 const ROOK_MOBILITY_MG: [i32; 15] = [-15, -10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10, 12, 14, 15];
-const ROOK_MOBILITY_EG: [i32; 15] = [-15, -10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10, 12, 14, 15];
-const QUEEN_MOBILITY_MG: [i32; 28] = [
-    -10, -8, -6, -4, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-    20, 21,
-];
-const QUEEN_MOBILITY_EG: [i32; 28] = [
-    -10, -8, -6, -4, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-    20, 21,
-];
+const ROOK_MOBILITY_EG: [i32; 15] = [-10, -5, -3, 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22];
+const QUEEN_MOBILITY_MG: [i32; 28] = [-10, -8, -6, -4, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+const QUEEN_MOBILITY_EG: [i32; 28] = [-5, -3, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
 const PIECE_ORDER: [Piece; 5] = [
     Piece::Queen,
     Piece::Rook,
@@ -1521,10 +1515,10 @@ fn evaluate(board: &Board) -> i32 {
     score += evaluate_king_ring_attacks(board, phase);
     score += evaluate_mobility(board, phase);
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
-        score += 30;
+        score += ((25 * phase) + (40 * (24 - phase))) / 24;
     }
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::Black)).popcnt() >= 2 {
-        score -= 30;
+        score -= ((25 * phase) + (40 * (24 - phase))) / 24;
     }
 
     let final_score = if board.side_to_move() == Color::White {
