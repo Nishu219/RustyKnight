@@ -315,7 +315,7 @@ impl TranspositionTable {
             table: HashMap::new(),
             hits: 0,
             age: 0,
-            size: (size_mb * 1024 * 1024) / 32,
+            size: (size_mb * 1024 * 1024) / 24,
         }
     }
     fn clear(&mut self) {
@@ -379,7 +379,7 @@ struct MaterialHashTable {
 }
 impl MaterialHashTable {
     fn new(size_mb: usize) -> Self {
-        let size = (size_mb * 1024 * 1024) / 24;
+        let size = (size_mb * 1024 * 1024) / 48;
         Self {
             table: vec![[(0, 0, 0); 2]; size],
             age: 0,
