@@ -214,7 +214,6 @@ lazy_static! {
         });
         m
     };
-    static ref EVAL_CACHE: Mutex<HashMap<u64, i32>> = Mutex::new(HashMap::new());
     static ref MATERIAL_HASH_TABLE: Mutex<MaterialHashTable> =
         Mutex::new(MaterialHashTable::new(16));
     static ref KILLER_MOVES: Mutex<Vec<Vec<ChessMove>>> = Mutex::new(Vec::new());
@@ -1383,32 +1382,7 @@ fn evaluate_mobility(board: &Board, phase: i32) -> i32 {
     // Taper the score based on game phase
     ((mg_score * phase) + (eg_score * (24 - phase))) / 24
 }
-const EVAL_CACHE_MAX: usize = 20000;
 fn evaluate(board: &Board) -> i32 {
-    let key = compute_zobrist_hash(board);
-    {
-        let cache = EVAL_CACHE.lock().unwrap();
-        if let Some(&cached) = cache.get(&key) {
-            return cached;
-        }
-    }
-
-    if is_repetition(key) {
-        let result = if board.side_to_move() == Color::White {
-            -CONTEMPT
-        } else {
-            CONTEMPT
-        };
-        let mut cache = EVAL_CACHE.lock().unwrap();
-        cache.insert(key.clone(), result);
-        if cache.len() > EVAL_CACHE_MAX {
-            if let Some(first_key) = cache.keys().next().cloned() {
-                cache.remove(&first_key);
-            }
-        }
-        return result;
-    }
-
     let is_checkmate = (*board.checkers() != BitBoard(0)) && {
         let mut moves = MoveGen::new_legal(board);
         moves.next().is_none()
@@ -1419,13 +1393,6 @@ fn evaluate(board: &Board) -> i32 {
         } else {
             30000
         };
-        let mut cache = EVAL_CACHE.lock().unwrap();
-        cache.insert(key.clone(), result);
-        if cache.len() > EVAL_CACHE_MAX {
-            if let Some(first_key) = cache.keys().next().cloned() {
-                cache.remove(&first_key);
-            }
-        }
         return result;
     }
     let is_stalemate = *board.checkers() == BitBoard(0) && {
@@ -1438,13 +1405,6 @@ fn evaluate(board: &Board) -> i32 {
         } else {
             -CONTEMPT
         };
-        let mut cache = EVAL_CACHE.lock().unwrap();
-        cache.insert(key.clone(), result);
-        if cache.len() > EVAL_CACHE_MAX {
-            if let Some(first_key) = cache.keys().next().cloned() {
-                cache.remove(&first_key);
-            }
-        }
         return result;
     }
     let material_hash_table = MATERIAL_HASH_TABLE.lock().unwrap();
@@ -1526,13 +1486,6 @@ fn evaluate(board: &Board) -> i32 {
     } else {
         -score
     };
-    let mut cache = EVAL_CACHE.lock().unwrap();
-    cache.insert(key, final_score);
-    if cache.len() > EVAL_CACHE_MAX {
-        if let Some(first_key) = cache.keys().next().cloned() {
-            cache.remove(&first_key);
-        }
-    }
     final_score
 }
 fn order_moves(
@@ -2558,7 +2511,7 @@ impl UCIEngine {
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnightdev");
+        println!("id name RustKnightv2.1");
         println!("id author Anish");
         println!("option name Hash type spin default 256 min 1 max 4096");
         println!("uciok");
