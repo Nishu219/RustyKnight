@@ -6,7 +6,7 @@ use std::io::{self, BufRead};
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Instant;
-const MAX_DEPTH: usize = 40;
+const MAX_DEPTH: usize = 99;
 const INITIAL_WINDOW: i32 = 50;
 const MAX_WINDOW: i32 = 400;
 const STATS: bool = true;
@@ -292,22 +292,22 @@ lazy_static! {
 struct TranspositionTable {
     table: Vec<TTBucket>,
     hits: usize,
-    age: u8,  // Changed to u8 for efficiency
+    age: u8,
     size: usize,
 }
 
 #[derive(Clone)]
 struct TTBucket {
-    entries: [TTEntry; 2],  // 2-bucket system
+    entries: [TTEntry; 4],  // 4-bucket for better collision handling 
 }
 
 #[derive(Clone, Copy)]
 struct TTEntry {
-    key: u64,      
-    depth: u8,     
-    value: i16,   
+    key: u32,      // Store only upper 32 bits (lower bits used for indexing)
+    depth: u8,
+    value: i16,
     flag: TTFlag,
-    move_: u32,    
+    move_: u32,
     age: u8,
 }
 
@@ -335,13 +335,14 @@ impl Default for TTEntry {
 impl Default for TTBucket {
     fn default() -> Self {
         Self {
-            entries: [TTEntry::default(); 2],
+            entries: [TTEntry::default(); 4],
         }
     }
 }
 
 impl TranspositionTable {
     fn new(size_mb: usize) -> Self {
+    
         let num_buckets = (size_mb * 1024 * 1024) / std::mem::size_of::<TTBucket>();
         
         Self {
@@ -361,18 +362,23 @@ impl TranspositionTable {
     #[inline(always)]
     fn get(&mut self, key: u64, depth: usize, alpha: i32, beta: i32) -> Option<i32> {
         let index = (key as usize) % self.size;
+        let key32 = (key >> 32) as u32;  // Upper 32 bits for verification
         let bucket = &self.table[index];
         
+        // Check all 4 entries in the bucket
         for entry in &bucket.entries {
-            if entry.key == key && entry.depth >= depth as u8 {
-                self.hits += 1;
-                let val = entry.value as i32;
-                
-                match entry.flag {
-                    TTFlag::Exact => return Some(val),
-                    TTFlag::Lower if val >= beta => return Some(val),
-                    TTFlag::Upper if val <= alpha => return Some(val),
-                    _ => {}
+            if entry.key == key32 && entry.flag != TTFlag::None {
+                // Key matches - verify depth
+                if entry.depth >= depth as u8 {
+                    self.hits += 1;
+                    let val = entry.value as i32;
+                    
+                    match entry.flag {
+                        TTFlag::Exact => return Some(val),
+                        TTFlag::Lower if val >= beta => return Some(val),
+                        TTFlag::Upper if val <= alpha => return Some(val),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -389,92 +395,99 @@ impl TranspositionTable {
         move_: Option<ChessMove>,
     ) {
         let index = (key as usize) % self.size;
+        let key32 = (key >> 32) as u32;
         let bucket = &mut self.table[index];
         
         let depth_u8 = depth.min(255) as u8;
         let value_i16 = value.clamp(-32000, 32000) as i16;
         let move_packed = move_.map(|m| pack_move(m)).unwrap_or(0);
-        let entry0 = &bucket.entries[0];
-        let entry1 = &bucket.entries[1];
         
-        if entry0.key == key {
+        // Find best slot to replace 
+        let mut replace_idx = 0;
+        let mut replace_score = i32::MAX;
+        
+        for (i, entry) in bucket.entries.iter().enumerate() {
+            // If we find the same position, always update it
+            if entry.key == key32 {
+                bucket.entries[i] = TTEntry {
+                    key: key32,
+                    depth: depth_u8,
+                    value: value_i16,
+                    flag,
+                    move_: if move_packed != 0 { move_packed } else { entry.move_ }, // Preserve move if new one is empty
+                    age: self.age,
+                };
+                return;
+            }
+            let score = if entry.flag == TTFlag::None {
+                // Empty slot - use immediately
+                -1000000
+            } else {
+                    
+                let age_diff = self.age.wrapping_sub(entry.age) as i32;
+                let depth_diff = depth_u8 as i32 - entry.depth as i32;
+                let age_weight = age_diff * 4;  
+                let depth_weight = depth_diff * 2;  
+                
+                let type_bonus = match entry.flag {
+                    TTFlag::Exact => 2, 
+                    TTFlag::Lower | TTFlag::Upper => 0,  
+                    TTFlag::None => -100,  
+                };
+
+                -age_weight - depth_weight + type_bonus
+            };
             
-            bucket.entries[0] = TTEntry {
-                key,
-                depth: depth_u8.max(entry0.depth),  
-                value: value_i16,
-                flag,
-                move_: move_packed,
-                age: self.age,
-            };
-            return;
+            if score < replace_score {
+                replace_score = score;
+                replace_idx = i;
+            }
         }
-        
-        if entry1.key == key {
-        
-            bucket.entries[1] = TTEntry {
-                key,
-                depth: depth_u8.max(entry1.depth),  
-                value: value_i16,
-                flag,
-                move_: move_packed,
-                age: self.age,
-            };
-            return;
-        }
-        
-        let replace_slot0 = depth_u8 > entry0.depth || entry0.age != self.age;
-        
-        if replace_slot0 {
-            // Replace slot 0
-            bucket.entries[0] = TTEntry {
-                key,
-                depth: depth_u8,
-                value: value_i16,
-                flag,
-                move_: move_packed,
-                age: self.age,
-            };
-        } else {
-            // Always replace slot 1
-            bucket.entries[1] = TTEntry {
-                key,
-                depth: depth_u8,
-                value: value_i16,
-                flag,
-                move_: move_packed,
-                age: self.age,
-            };
-        }
+        bucket.entries[replace_idx] = TTEntry {
+            key: key32,
+            depth: depth_u8,
+            value: value_i16,
+            flag,
+            move_: move_packed,
+            age: self.age,
+        };
     }
 
     #[inline(always)]
     fn get_move(&self, key: u64) -> Option<ChessMove> {
         let index = (key as usize) % self.size;
+        let key32 = (key >> 32) as u32;
         let bucket = &self.table[index];
+        let mut best_move = None;
+        let mut best_depth = 0;
         
-        // Check both entries
         for entry in &bucket.entries {
-            if entry.key == key && entry.move_ != 0 {
-                return Some(unpack_move(entry.move_));
+            if entry.key == key32 && entry.move_ != 0 {
+                if entry.depth > best_depth {
+                    best_depth = entry.depth;
+                    best_move = Some(unpack_move(entry.move_));
+                }
             }
         }
-        None
+        best_move
     }
     
     fn hashfull(&self) -> usize {
+        // Sample first 1000 buckets to estimate fill rate
         let sample_size = 1000.min(self.size);
         let mut filled = 0;
         
         for i in 0..sample_size {
             let bucket = &self.table[i];
+            // Count entries from current search (age matches)
             for entry in &bucket.entries {
                 if entry.age == self.age && entry.key != 0 {
                     filled += 1;
+                    break; // Count each bucket only once
                 }
             }
         }
-        (filled * 1000) / (sample_size * 2)
+        (filled * 1000) / sample_size
     }
 }
 
@@ -616,6 +629,14 @@ fn phase_value(board: &Board) -> i32 {
     }
     std::cmp::min(phase, 24)
 }
+/// Static Exchange Evaluation with Threshold
+/// Returns TRUE if the capture sequence meets or exceeds the threshold
+/// Returns FALSE if the capture sequence is below the threshold
+/// 
+/// This allows efficient pruning decisions:
+/// - see_capture(board, mv, 0) -> Is capture winning or equal?
+/// - see_capture(board, mv, -100) -> Is capture not too bad (loss < 1 pawn)?
+/// - see_capture(board, mv, 200) -> Does capture win at least 2 pawns?
 fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
     let to_square = mv.get_dest();
     let from_square = mv.get_source();
@@ -705,6 +726,8 @@ fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
     
     // Main exchange loop
     loop {
+        // ===== OPPONENT'S TURN TO CAPTURE =====
+        
         // Check if opponent has any attackers
         if attacks_opponent == BitBoard::new(0) {
             trophy_value = 0;
@@ -741,7 +764,8 @@ fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
             return false;
         }
         
-
+        // ===== SIDE-TO-MOVE'S TURN TO RECAPTURE =====
+        
         // Check if side-to-move has any attackers
         if attacks_to_move == BitBoard::new(0) {
             trophy_value = 0;
@@ -777,6 +801,8 @@ fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
         if see_value < threshold {
             return false;
         }
+        
+        // Continue exchange loop
     }
 }
 
@@ -819,6 +845,8 @@ fn get_pawn_attackers(square: Square, color: Color, board: &Board) -> BitBoard {
     attackers & board.pieces(Piece::Pawn) & board.color_combined(color)
 }
 
+/// Find least valuable attacker considering blockers
+/// Returns (Square, Piece) of the attacker, or None if no unblocked attacker exists
 fn find_least_valuable_attacker_threshold(
     board: &Board,
     color: Color,
@@ -826,7 +854,9 @@ fn find_least_valuable_attacker_threshold(
     all_pieces: BitBoard,
     target_square: Square,
 ) -> Option<(Square, Piece)> {
+    // Check pieces in order of value: Pawn, Knight, Bishop, Rook, Queen, King
     
+    // Pawns (no blocking check needed)
     let pawns = attackers & board.pieces(Piece::Pawn) & board.color_combined(color);
     if pawns != BitBoard::new(0) {
         for sq in pawns {
@@ -834,6 +864,7 @@ fn find_least_valuable_attacker_threshold(
         }
     }
     
+    // Knights (no blocking check needed)
     let knights = attackers & board.pieces(Piece::Knight) & board.color_combined(color);
     if knights != BitBoard::new(0) {
         for sq in knights {
@@ -841,6 +872,7 @@ fn find_least_valuable_attacker_threshold(
         }
     }
     
+    // Bishops (must check for blockers)
     let bishops = attackers & board.pieces(Piece::Bishop) & board.color_combined(color);
     if bishops != BitBoard::new(0) {
         for sq in bishops {
@@ -850,6 +882,7 @@ fn find_least_valuable_attacker_threshold(
         }
     }
     
+    // Rooks (must check for blockers)
     let rooks = attackers & board.pieces(Piece::Rook) & board.color_combined(color);
     if rooks != BitBoard::new(0) {
         for sq in rooks {
@@ -858,7 +891,8 @@ fn find_least_valuable_attacker_threshold(
             }
         }
     }
-
+    
+    // Queens (must check for blockers)
     let queens = attackers & board.pieces(Piece::Queen) & board.color_combined(color);
     if queens != BitBoard::new(0) {
         for sq in queens {
@@ -868,6 +902,7 @@ fn find_least_valuable_attacker_threshold(
         }
     }
     
+    // King (no blocking check needed)
     let kings = attackers & board.pieces(Piece::King) & board.color_combined(color);
     if kings != BitBoard::new(0) {
         for sq in kings {
@@ -878,6 +913,7 @@ fn find_least_valuable_attacker_threshold(
     None
 }
 
+/// Check if path between two squares is blocked
 fn is_path_blocked(from: Square, to: Square, occupied: BitBoard) -> bool {
     let from_file = from.get_file().to_index() as i32;
     let from_rank = from.get_rank().to_index() as i32;
@@ -1801,7 +1837,6 @@ fn negamax(
     if hash_move.is_none() {
         hash_move = tt.get_move(board_hash);
     }
-
     let in_check = *board.checkers() != BitBoard(0);
     let static_eval = if in_check {
         -30000 + ply as i32
@@ -2520,6 +2555,7 @@ fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
 
                             // Calculate hash usage percentage
                             let hashfull = tt_guard.hashfull();
+
                             println!(
                                 "info depth {} seldepth {} score cp {} nodes {} nps {} time {} hashfull {} pv {}",
                                 depth, 
