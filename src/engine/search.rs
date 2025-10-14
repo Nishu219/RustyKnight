@@ -166,7 +166,7 @@ fn negamax(
     let mut hash_move = None;
     let mut tt_value = None;
 
-    // Transposition table lookup
+    // TT probe
     if let Some(stored_value) = tt.get(board_hash, depth, alpha, beta) {
         *stats.entry("tt_hits").or_insert(0) += 1;
         if !is_pv || !is_root {
@@ -178,6 +178,7 @@ fn negamax(
     if hash_move.is_none() {
         hash_move = tt.get_move(board_hash);
     }
+    
     let in_check = *board.checkers() != BitBoard(0);
     let static_eval = if in_check {
         -30000 + ply as i32
@@ -185,7 +186,7 @@ fn negamax(
         evaluate(board)
     };
 
-    // Quiescence search at leaf nodes
+    // Quiescence at leaf
     if depth == 0 {
         return quiesce(
             board,
@@ -199,18 +200,17 @@ fn negamax(
         );
     }
 
-    // Calculate improvement
+    // Calculate improving flag
     let improving = !in_check && ply >= 2 && {
         if let Some(tt_val) = tt_value {
             static_eval > tt_val
         } else {
-            true // Assume improving if no TT info
+            true
         }
     };
 
-    // Non-PV pruning techniques
     if !is_pv && !in_check {
-        // Enhanced Razoring
+        // Razoring
         if depth <= RAZOR_DEPTH {
             let razor_margin = RAZOR_MARGIN + 50 * (depth as i32 - 1);
             if static_eval + razor_margin < alpha {
@@ -234,7 +234,7 @@ fn negamax(
             }
         }
 
-        // Enhanced Reverse Futility Pruning (Static Null Move)
+        // Reverse futility pruning
         if depth <= REVERSE_FUTILITY_DEPTH {
             let rfp_margin =
                 REVERSE_FUTILITY_MARGIN * depth as i32 + if improving { 50 } else { 0 };
@@ -243,7 +243,7 @@ fn negamax(
             }
         }
 
-        // Enhanced Null Move Pruning
+        // Null move pruning
         if depth >= NULL_MOVE_DEPTH && static_eval >= beta {
             let has_non_pawn_pieces = (board.combined() & board.color_combined(board.side_to_move())).0
                     != ((board.pieces(chess::Piece::King) | board.pieces(chess::Piece::Pawn))
@@ -251,7 +251,6 @@ fn negamax(
                     .0;
 
             if has_non_pawn_pieces {
-                // Dynamic reduction based on depth, eval, and improving
                 let mut r = 3 + depth / 4;
                 r += ((static_eval - beta) / 200).min(3) as usize;
                 if !improving {
@@ -260,7 +259,6 @@ fn negamax(
                 if depth > 12 {
                     r += 1;
                 }
-
                 r = r.min(depth - 1);
 
                 if let Some(null_board) = board.null_move() {
@@ -283,7 +281,7 @@ fn negamax(
                     }
 
                     if null_score >= beta {
-                        // Null move verification for high depths
+                        // Null move verification
                         if depth >= 12 {
                             let verification_depth = depth.saturating_sub(r + 1);
                             let verification_score = negamax(
@@ -315,7 +313,7 @@ fn negamax(
             }
         }
 
-        // ProbCut - probabilistic cut based on reduced search
+        // ProbCut
         if depth >= 5 && !hash_move.is_some() {
             let probcut_beta = beta + 200;
             let probcut_depth = depth / 4 * 3;
@@ -346,7 +344,7 @@ fn negamax(
         }
     }
 
-    // Internal Iterative Deepening
+    // IID
     if is_pv && depth >= IID_DEPTH && hash_move.is_none() {
         let iid_depth = depth - 2 - if is_pv { 0 } else { 1 };
         negamax(
@@ -367,6 +365,93 @@ fn negamax(
         }
     }
 
+    // Singular extensions
+    let mut singular_extension = 0;
+    if !is_root 
+        && depth >= SINGULAR_DEPTH 
+        && hash_move.is_some() 
+        && !in_check
+        && tt_value.is_some()
+    {
+        let tt_entry_depth = tt.get_depth(board_hash);
+        
+        if let Some(entry_depth) = tt_entry_depth {
+            if entry_depth >= depth - 3 {
+                let hash_mv = hash_move.unwrap();
+                let tt_val = tt_value.unwrap();
+                
+                let singular_beta = tt_val - depth as i32 * SINGULAR_MARGIN_MULTIPLIER;
+                let singular_depth = (depth - 1) / 2;
+                
+                let mut singular_value = -32000;
+                let mut non_singular_found = false;
+                
+                let mut temp_moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
+                temp_moves = order_moves(board, temp_moves, None, ply);
+                
+                for mv in temp_moves.iter() {
+                    if *mv == hash_mv {
+                        continue;
+                    }
+                    
+                    if *timeout_occurred {
+                        break;
+                    }
+                    
+                    let new_board = board.make_move_new(*mv);
+                    let new_position_hash = compute_zobrist_hash(&new_board);
+                    update_repetition_table(new_position_hash);
+                    
+                    let score = -negamax(
+                        &new_board,
+                        singular_depth,
+                        -singular_beta - 1,
+                        -singular_beta,
+                        start_time,
+                        ply + 1,
+                        stats,
+                        root_color,
+                        tt,
+                        max_time,
+                        timeout_occurred,
+                    );
+                    
+                    {
+                        let mut rep_table = REPETITION_TABLE.lock().unwrap();
+                        if let Some(count) = rep_table.get_mut(&new_position_hash) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                rep_table.remove(&new_position_hash);
+                            }
+                        }
+                    }
+                    
+                    if *timeout_occurred {
+                        break;
+                    }
+                    
+                    singular_value = singular_value.max(score);
+                    
+                    if score >= singular_beta {
+                        non_singular_found = true;
+                        break;
+                    }
+                }
+                
+                if !*timeout_occurred && !non_singular_found {
+                    singular_extension = 1;
+                    
+                    // Double extension
+                    if depth >= DOUBLE_EXTENSION_DEPTH 
+                        && singular_value < singular_beta - DOUBLE_EXTENSION_MARGIN
+                    {
+                        singular_extension = 2;
+                    }
+                }
+            }
+        }
+    }
+
     let mut moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
 
     if moves.is_empty() {
@@ -380,7 +465,7 @@ fn negamax(
     let mut moves_searched = 0;
     let mut quiet_moves_searched = 0;
 
-    // Multi-Cut variables
+    // Multi-Cut
     let mut cut_count = 0;
     let cut_threshold = 3 + (depth / 4);
     let multi_cut_depth = 3;
@@ -393,42 +478,18 @@ fn negamax(
         let is_capture = board.piece_on(mv.get_dest()).is_some();
         let is_promotion = mv.get_promotion().is_some();
         let is_quiet = !is_capture && !is_promotion;
+        let is_hash_move = hash_move.is_some() && *mv == hash_move.unwrap();
 
-        // Enhanced Late Move Pruning with better thresholds
+        // Late move pruning
         if !is_pv && !in_check && is_quiet && depth <= LMP_DEPTH {
             let mut lmp_threshold = match depth {
-                1 => {
-                    if improving {
-                        4
-                    } else {
-                        3
-                    }
-                }
-                2 => {
-                    if improving {
-                        7
-                    } else {
-                        6
-                    }
-                }
-                3 => {
-                    if improving {
-                        13
-                    } else {
-                        12
-                    }
-                }
-                4 => {
-                    if improving {
-                        20
-                    } else {
-                        18
-                    }
-                }
+                1 => if improving { 4 } else { 3 },
+                2 => if improving { 7 } else { 6 },
+                3 => if improving { 13 } else { 12 },
+                4 => if improving { 20 } else { 18 },
                 _ => 25,
             };
 
-            // Adjust threshold based on evaluation
             if static_eval + 200 < alpha {
                 lmp_threshold /= 2;
             } else if static_eval > alpha + 200 {
@@ -440,7 +501,7 @@ fn negamax(
             }
         }
 
-        // Enhanced Futility Pruning
+        // Futility pruning
         if !is_pv && !in_check && is_quiet && depth <= FUTILITY_DEPTH && i > 0 {
             let mut futility_margin = FUTILITY_MARGINS[depth.min(4)];
             if !improving {
@@ -459,12 +520,14 @@ fn negamax(
 
         let gives_check = *new_board.checkers() != BitBoard(0);
 
-        // Calculate extensions
+        // Extensions
         let mut extension = 0;
-        if gives_check {
+        
+        if is_hash_move && singular_extension > 0 {
+            extension = singular_extension;
+        } else if gives_check {
             extension = 1;
         } else if let Some(piece) = board.piece_on(mv.get_source()) {
-            // Pawn to 7th/2nd rank extension
             if piece == chess::Piece::Pawn {
                 let dest_rank = mv.get_dest().get_rank();
                 if dest_rank == chess::Rank::Seventh || dest_rank == chess::Rank::Second {
@@ -472,37 +535,24 @@ fn negamax(
                 }
             }
         }
-
+        
+        extension = extension.min(2);
+        
         let mut new_depth = depth - 1 + extension;
         let mut do_full_search = true;
 
-        // Late Move Reductions with enhanced conditions
+        // LMR
         if depth >= 3 && i >= LMR_FULL_DEPTH_MOVES && is_quiet && !gives_check {
             let mut r: usize = 1;
 
-            // Base reduction
-            if i >= 6 {
-                r += 1;
-            }
-            if i >= 12 {
-                r += 1;
-            }
-            if i >= 24 {
-                r += 1;
-            }
+            if i >= 6 { r += 1; }
+            if i >= 12 { r += 1; }
+            if i >= 24 { r += 1; }
 
-            // Adjust based on various factors
-            if !improving {
-                r += 1;
-            }
-            if !is_pv {
-                r += 1;
-            }
-            if depth > 8 {
-                r += 1;
-            }
+            if !improving { r += 1; }
+            if !is_pv { r += 1; }
+            if depth > 8 { r += 1; }
 
-            // Reduce less for killer moves and good history
             let history = HISTORY_HEURISTIC.lock().unwrap();
             let history_score = *history.get(mv).unwrap_or(&0);
             if history_score > 1000 {
@@ -514,7 +564,7 @@ fn negamax(
             do_full_search = false;
         }
 
-        // Multi-Cut implementation
+        // Multi-Cut
         if !is_pv && depth >= multi_cut_depth && i >= cut_threshold && !is_capture && cut_count > 0
         {
             let multi_cut_score = -negamax(
@@ -557,9 +607,8 @@ fn negamax(
             }
         }
 
-        // Principal Variation Search
+        // PVS
         let score = if i == 0 {
-            // Always search first move with full window
             -negamax(
                 &new_board,
                 new_depth,
@@ -574,7 +623,6 @@ fn negamax(
                 timeout_occurred,
             )
         } else {
-            // Scout search with null window
             let mut search_score = -negamax(
                 &new_board,
                 new_depth,
@@ -592,7 +640,7 @@ fn negamax(
             if *timeout_occurred {
                 evaluate(board)
             } else {
-                // Check if reduced search needs full-depth re-search
+                // Re-search at full depth if reduced
                 if !do_full_search && search_score > alpha {
                     new_depth = depth - 1 + extension;
                     search_score = -negamax(
@@ -610,11 +658,10 @@ fn negamax(
                     );
                 }
 
-                // PV re-search with full window if score beats alpha
+                // PV re-search
                 if *timeout_occurred {
                     evaluate(board)
                 } else if search_score > alpha {
-                    // Only do full re-search if we're in PV node or score is in window
                     if is_pv || (search_score < beta) {
                         -negamax(
                             &new_board,
@@ -638,7 +685,6 @@ fn negamax(
             }
         };
 
-        // Cleanup repetition table
         {
             let mut rep_table = REPETITION_TABLE.lock().unwrap();
             if let Some(count) = rep_table.get_mut(&new_position_hash) {
@@ -666,9 +712,8 @@ fn negamax(
         if score > alpha {
             alpha = score;
 
-            // Update heuristics for quiet moves
             if is_quiet {
-                // Update killer moves
+                // Killer moves
                 {
                     let mut killers = KILLER_MOVES.lock().unwrap();
                     if ply < 64 && killers.len() > ply {
@@ -688,13 +733,12 @@ fn negamax(
                     }
                 }
 
-                // Update history heuristic with depth-based bonus
+                // History heuristic
                 {
                     let mut history = HISTORY_HEURISTIC.lock().unwrap();
                     let bonus = (depth * depth) as i32;
                     *history.entry(*mv).or_insert(0) += bonus;
 
-                    // Cap history values to prevent overflow
                     if let Some(value) = history.get_mut(mv) {
                         if *value > 10000 {
                             *value = 10000;
@@ -702,7 +746,7 @@ fn negamax(
                     }
                 }
 
-                // Reduce history for previous quiet moves that failed
+                // Reduce history for failed moves
                 for prev_mv in &moves[0..i] {
                     if board.piece_on(prev_mv.get_dest()).is_none()
                         && prev_mv.get_promotion().is_none()
@@ -719,13 +763,12 @@ fn negamax(
             }
         }
 
-        // Beta cutoff
         if alpha >= beta {
             break;
         }
     }
 
-    // Store result in transposition table
+    // TT store
     if !*timeout_occurred && moves_searched > 0 {
         let flag = if best_value <= original_alpha {
             TTFlag::Upper
