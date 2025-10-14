@@ -33,3 +33,7 @@ pub const PIECE_ORDER: [Piece; 5] = [
     Piece::Knight,
     Piece::Pawn,
 ];
+pub const SINGULAR_DEPTH: usize = 8;
+pub const SINGULAR_MARGIN_MULTIPLIER: i32 = 2;
+pub const DOUBLE_EXTENSION_MARGIN: i32 = 16;
+pub const DOUBLE_EXTENSION_DEPTH: usize = 6;
