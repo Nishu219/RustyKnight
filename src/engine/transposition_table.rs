@@ -231,4 +231,29 @@ impl TranspositionTable {
         }
         (filled * 1000) / sample_size
     }
+
+    #[inline(always)]
+    pub fn get_depth(&self, key: u64) -> Option<usize> {
+        let index = (key as usize) % self.size;
+        let key32 = (key >> 32) as u32;
+        let bucket = &self.table[index];
+        
+        let mut best_depth = 0;
+        let mut found = false;
+        
+        for entry in &bucket.entries {
+            if entry.key == key32 && entry.flag != TTFlag::None {
+                if entry.depth as usize > best_depth {
+                    best_depth = entry.depth as usize;
+                    found = true;
+                }
+            }
+        }
+        
+        if found {
+            Some(best_depth)
+        } else {
+            None
+        }
+    }
 }
