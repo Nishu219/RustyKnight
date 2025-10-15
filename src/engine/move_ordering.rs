@@ -405,9 +405,9 @@ pub fn order_moves(
                 10000000
             } else if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
                 if see_capture(board, mv, 300) {
-                    9500000
+                    9500000 + mvv_lva_score(board, mv)
                 } else if see_capture(board, mv, 0) {
-                    7500000
+                    7500000 + mvv_lva_score(board, mv)
                 } else {
                     500000
                 }
