@@ -526,12 +526,12 @@ fn negamax(
         if is_hash_move && singular_extension > 0 {
             extension = singular_extension;
         } else if gives_check {
-            extension = 1;
+            extension += 1;
         } else if let Some(piece) = board.piece_on(mv.get_source()) {
             if piece == chess::Piece::Pawn {
                 let dest_rank = mv.get_dest().get_rank();
                 if dest_rank == chess::Rank::Seventh || dest_rank == chess::Rank::Second {
-                    extension = 1;
+                    extension += 1;
                 }
             }
         }
