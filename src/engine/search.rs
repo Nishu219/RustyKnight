@@ -525,7 +525,7 @@ fn negamax(
         
         if is_hash_move && singular_extension > 0 {
             extension = singular_extension;
-        } else if gives_check {
+        } else if gives_check && see_capture(board, *mv, 0) {
             extension += 1;
         } else if let Some(piece) = board.piece_on(mv.get_source()) {
             if piece == chess::Piece::Pawn {
@@ -788,16 +788,6 @@ pub fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
     let mut best_move = None;
     let mut best_score = 0;
     let root_color = board.side_to_move();
-
-    // Check for immediate checkmate
-    let movegen = MoveGen::new_legal(board);
-    for mv in movegen {
-        let new_board = board.make_move_new(mv);
-        if new_board.status() == BoardStatus::Checkmate {
-            return Some(mv);
-        }
-    }
-
     let mut tt_guard = TRANSPOSITION_TABLE.lock().unwrap();
     for depth in 1..=MAX_DEPTH {
         if start_time.elapsed().as_secs_f64() > max_time * 0.8 {
