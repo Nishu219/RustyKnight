@@ -11,6 +11,7 @@ pub const NULL_MOVE_DEPTH: usize = 3;
 pub const IID_DEPTH: usize = 4;
 pub const RAZOR_DEPTH: usize = 4;
 pub const RAZOR_MARGIN: i32 = 400;
+pub const DELTA_MARGIN: i32 = 200;
 pub const REVERSE_FUTILITY_DEPTH: usize = 6;
 pub const REVERSE_FUTILITY_MARGIN: i32 = 120;
 pub const FUTILITY_DEPTH: usize = 4;
