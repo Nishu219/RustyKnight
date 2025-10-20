@@ -1,9 +1,9 @@
 use crate::engine::constants::*;
 use crate::engine::evaluation::evaluate;
-use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC};
+use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, VALUES};
 use crate::engine::transposition_table::{TranspositionTable, TTFlag};
 use crate::engine::zobrist::compute_zobrist_hash;
-use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen};
+use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
 use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -58,6 +58,15 @@ fn quiesce(
         alpha = stand_pat;
     }
 
+    // Delta pruning: calculate the maximum possible gain
+    // We use queen value (900) as the base delta, plus a margin for promotions 
+    let big_delta = VALUES[&Piece::Queen] + DELTA_MARGIN;
+    
+    // If even capturing the opponent's queen cannot raise alpha, prune all moves
+    if stand_pat + big_delta < alpha {
+        return alpha;
+    }
+
     let mut captures = Vec::new();
     let movegen = MoveGen::new_legal(board);
 
@@ -74,6 +83,24 @@ fn quiesce(
         if *timeout_occurred {
             break;
         }
+        
+        // Delta pruning for individual moves
+        // Calculate the value of the captured piece
+        let captured_value = if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
+            VALUES[&captured_piece]
+        } else if mv.get_promotion().is_some() {
+            // Promotion - assume queen for simplicity
+            VALUES[&Piece::Queen] - VALUES[&Piece::Pawn]
+        } else {
+            0
+        };
+        
+        // If the material gain plus the stand_pat score and margin cannot raise alpha, skip this move
+        if stand_pat + captured_value + DELTA_MARGIN < alpha {
+            continue;
+        }
+        
+        // SEE pruning - skip obviously bad captures
         if !see_capture(board, mv, 0) {
             continue;
         }
@@ -105,6 +132,7 @@ fn quiesce(
 
     alpha
 }
+
 fn negamax(
     board: &Board,
     depth: usize,
