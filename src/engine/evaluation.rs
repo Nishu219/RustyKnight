@@ -289,21 +289,6 @@ fn compute_material_eval(board: &Board) -> i32 {
     }
     material
 }
-fn phase_value(board: &Board) -> i32 {
-    let mut phase = 0;
-    for sq_idx in 0..64 {
-        let square = unsafe { Square::new(sq_idx) };
-        if let Some(piece) = board.piece_on(square) {
-            match piece {
-                Piece::Knight | Piece::Bishop => phase += 1,
-                Piece::Rook => phase += 2,
-                Piece::Queen => phase += 4,
-                _ => {}
-            }
-        }
-    }
-    std::cmp::min(phase, 24)
-}
 
 fn evaluate_rooks(board: &Board) -> i32 {
     let mut score = 0;
@@ -892,7 +877,12 @@ pub fn evaluate(board: &Board) -> i32 {
         }
     };
     let mut score = material;
-    let phase = phase_value(board);
+    let mut phase = 0;
+    phase += (board.pieces(Piece::Knight).popcnt() + board.pieces(Piece::Bishop).popcnt()) as i32;
+    phase += (board.pieces(Piece::Rook).popcnt() * 2) as i32;
+    phase += (board.pieces(Piece::Queen).popcnt() * 4) as i32;
+    phase = phase.min(24);
+    
     for sq_idx in 0..64 {
         let square = unsafe { Square::new(sq_idx) };
         if let Some(piece) = board.piece_on(square) {
@@ -940,6 +930,7 @@ pub fn evaluate(board: &Board) -> i32 {
             }
         }
     }
+    
     score += evaluate_rooks(board);
     score += evaluate_pawns(board);
     score += evaluate_king_tropism(board, phase);
