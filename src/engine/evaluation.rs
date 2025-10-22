@@ -838,6 +838,52 @@ fn evaluate_mobility(board: &Board, phase: i32) -> i32 {
     // Taper the score based on game phase
     ((mg_score * phase) + (eg_score * (24 - phase))) / 24
 }
+fn evaluate_space(board: &Board, phase: i32) -> i32 {
+    let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+    let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+    let white_space_mask = BitBoard::new(0x00FFFF0000000000);
+    let black_space_mask = BitBoard::new(0x0000000000FFFF00);
+    let white_controlled = {
+        let mut control = BitBoard::new(0);
+        for pawn_sq in white_pawns {
+            let file = pawn_sq.get_file().to_index();
+            let rank = pawn_sq.get_rank().to_index();
+            if rank < 7 {
+                if file > 0 {
+                    let sq = unsafe { Square::new(((rank + 1) * 8 + file - 1) as u8) };
+                    control |= BitBoard::from_square(sq);
+                }
+                if file < 7 {
+                    let sq = unsafe { Square::new(((rank + 1) * 8 + file + 1) as u8) };
+                    control |= BitBoard::from_square(sq);
+                }
+            }
+        }
+        control
+    };
+    let black_controlled = {
+        let mut control = BitBoard::new(0);
+        for pawn_sq in black_pawns {
+            let file = pawn_sq.get_file().to_index();
+            let rank = pawn_sq.get_rank().to_index();
+            if rank > 0 {
+                if file > 0 {
+                    let sq = unsafe { Square::new(((rank - 1) * 8 + file - 1) as u8) };
+                    control |= BitBoard::from_square(sq);
+                }
+                if file < 7 {
+                    let sq = unsafe { Square::new(((rank - 1) * 8 + file + 1) as u8) };
+                    control |= BitBoard::from_square(sq);
+                }
+            }
+        }
+        control
+    };
+    let white_space = (white_controlled & white_space_mask & !black_controlled).popcnt() as i32;
+    let black_space = (black_controlled & black_space_mask & !white_controlled).popcnt() as i32;
+    let space_diff = white_space - black_space;
+    (space_diff * phase * 4) / 24
+}
 pub fn evaluate(board: &Board) -> i32 {
     let is_checkmate = (*board.checkers() != BitBoard(0)) && {
         let mut moves = MoveGen::new_legal(board);
@@ -936,6 +982,7 @@ pub fn evaluate(board: &Board) -> i32 {
     score += evaluate_king_tropism(board, phase);
     score += evaluate_king_ring_attacks(board, phase);
     score += evaluate_mobility(board, phase);
+    score += evaluate_space(board, phase);
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
         score += ((25 * phase) + (40 * (24 - phase))) / 24;
     }
