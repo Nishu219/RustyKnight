@@ -839,6 +839,9 @@ fn evaluate_mobility(board: &Board, phase: i32) -> i32 {
     ((mg_score * phase) + (eg_score * (24 - phase))) / 24
 }
 fn evaluate_space(board: &Board, phase: i32) -> i32 {
+    if phase < 8 {
+        return 0;
+    }
     let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
     let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
     let white_space_mask = BitBoard::new(0x00FFFF0000000000);
@@ -885,29 +888,15 @@ fn evaluate_space(board: &Board, phase: i32) -> i32 {
     (space_diff * phase * 4) / 24
 }
 pub fn evaluate(board: &Board) -> i32 {
-    let is_checkmate = (*board.checkers() != BitBoard(0)) && {
-        let mut moves = MoveGen::new_legal(board);
-        moves.next().is_none()
-    };
-    if is_checkmate {
-        let result = if board.side_to_move() == Color::White {
-            -30000
+    let in_check = *board.checkers() != BitBoard(0);
+    let has_legal_moves = MoveGen::new_legal(board).next().is_some();
+
+    if !has_legal_moves {
+        return if in_check {
+            if board.side_to_move() == Color::White { -30000 } else { 30000 }
         } else {
-            30000
+            if board.side_to_move() == Color::White { CONTEMPT } else { -CONTEMPT }
         };
-        return result;
-    }
-    let is_stalemate = *board.checkers() == BitBoard(0) && {
-        let mut moves = MoveGen::new_legal(board);
-        moves.next().is_none()
-    };
-    if is_stalemate {
-        let result = if board.side_to_move() == Color::White {
-            CONTEMPT
-        } else {
-            -CONTEMPT
-        };
-        return result;
     }
     let material_hash_table = MATERIAL_HASH_TABLE.lock().unwrap();
     let material_key = compute_material_key(board);
