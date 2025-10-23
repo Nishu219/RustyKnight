@@ -133,6 +133,7 @@ fn quiesce(
     alpha
 }
 
+
 fn negamax(
     board: &Board,
     depth: usize,
@@ -190,7 +191,7 @@ fn negamax(
         }
     }
 
-    let board_hash = compute_zobrist_hash(board);
+    let board_hash = position_hash;
     let mut hash_move = None;
     let mut tt_value = None;
 
