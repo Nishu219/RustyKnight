@@ -750,93 +750,80 @@ fn evaluate_king_ring_attacks(board: &Board, phase: i32) -> i32 {
     ((mg_score * phase) + (eg_score * (24 - phase))) / 24
 }
 fn evaluate_mobility(board: &Board, phase: i32) -> i32 {
-    let mut mg_score = 0;
-    let mut eg_score = 0;
-
+    let mut score_mg = 0;
+    let mut score_eg = 0;
     let white_pieces = board.color_combined(Color::White);
     let black_pieces = board.color_combined(Color::Black);
     let occupied = board.combined();
-
-    // White piece mobility
+    
+    // Compute mobility for all pieces in optimized order
+    
+    // Knights 
     let white_knights = board.pieces(Piece::Knight) & white_pieces;
-    for knight_sq in white_knights {
-        let moves = chess::get_knight_moves(knight_sq);
-        let mobility = (moves & !white_pieces).popcnt() as usize;
-        let clamped_mobility = mobility.min(8);
-        mg_score += KNIGHT_MOBILITY_MG[clamped_mobility];
-        eg_score += KNIGHT_MOBILITY_EG[clamped_mobility];
-    }
-
-    let white_bishops = board.pieces(Piece::Bishop) & white_pieces;
-    for bishop_sq in white_bishops {
-        let moves = chess::get_bishop_rays(bishop_sq) & !occupied;
-        let mobility = (moves & !white_pieces).popcnt() as usize;
-        let clamped_mobility = mobility.min(13);
-        mg_score += BISHOP_MOBILITY_MG[clamped_mobility];
-        eg_score += BISHOP_MOBILITY_EG[clamped_mobility];
-    }
-
-    let white_rooks = board.pieces(Piece::Rook) & white_pieces;
-    for rook_sq in white_rooks {
-        let moves = chess::get_rook_rays(rook_sq) & !occupied;
-        let mobility = (moves & !white_pieces).popcnt() as usize;
-        let clamped_mobility = mobility.min(14);
-        mg_score += ROOK_MOBILITY_MG[clamped_mobility];
-        eg_score += ROOK_MOBILITY_EG[clamped_mobility];
-    }
-
-    let white_queens = board.pieces(Piece::Queen) & white_pieces;
-    for queen_sq in white_queens {
-        let rook_moves = chess::get_rook_rays(queen_sq) & !occupied;
-        let bishop_moves = chess::get_bishop_rays(queen_sq) & !occupied;
-        let moves = rook_moves | bishop_moves;
-        let mobility = (moves & !white_pieces).popcnt() as usize;
-        let clamped_mobility = mobility.min(27);
-        mg_score += QUEEN_MOBILITY_MG[clamped_mobility];
-        eg_score += QUEEN_MOBILITY_EG[clamped_mobility];
-    }
-
-    // Black piece mobility
     let black_knights = board.pieces(Piece::Knight) & black_pieces;
-    for knight_sq in black_knights {
-        let moves = chess::get_knight_moves(knight_sq);
-        let mobility = (moves & !black_pieces).popcnt() as usize;
-        let clamped_mobility = mobility.min(8);
-        mg_score -= KNIGHT_MOBILITY_MG[clamped_mobility];
-        eg_score -= KNIGHT_MOBILITY_EG[clamped_mobility];
-    }
-
+    
+    let wn_mob = (white_knights.into_iter()
+        .map(|sq| (chess::get_knight_moves(sq) & !white_pieces).popcnt())
+        .sum::<u32>() as usize).min(8);
+    let bn_mob = (black_knights.into_iter()
+        .map(|sq| (chess::get_knight_moves(sq) & !black_pieces).popcnt())
+        .sum::<u32>() as usize).min(8);
+    
+    // Use lookup tables for aggregated mobility
+    score_mg += KNIGHT_MOBILITY_MG[wn_mob] - KNIGHT_MOBILITY_MG[bn_mob];
+    score_eg += KNIGHT_MOBILITY_EG[wn_mob] - KNIGHT_MOBILITY_EG[bn_mob];
+    
+    // Bishops
+    let white_bishops = board.pieces(Piece::Bishop) & white_pieces;
     let black_bishops = board.pieces(Piece::Bishop) & black_pieces;
-    for bishop_sq in black_bishops {
-        let moves = chess::get_bishop_rays(bishop_sq) & !occupied;
-        let mobility = (moves & !black_pieces).popcnt() as usize;
-        let clamped_mobility = mobility.min(13);
-        mg_score -= BISHOP_MOBILITY_MG[clamped_mobility];
-        eg_score -= BISHOP_MOBILITY_EG[clamped_mobility];
+    
+    for sq in white_bishops {
+        let mobility = (chess::get_bishop_rays(sq) & !occupied & !white_pieces).popcnt().min(13) as usize;
+        score_mg += BISHOP_MOBILITY_MG[mobility];
+        score_eg += BISHOP_MOBILITY_EG[mobility];
     }
-
+    
+    for sq in black_bishops {
+        let mobility = (chess::get_bishop_rays(sq) & !occupied & !black_pieces).popcnt().min(13) as usize;
+        score_mg -= BISHOP_MOBILITY_MG[mobility];
+        score_eg -= BISHOP_MOBILITY_EG[mobility];
+    }
+    
+    // Rooks
+    let white_rooks = board.pieces(Piece::Rook) & white_pieces;
     let black_rooks = board.pieces(Piece::Rook) & black_pieces;
-    for rook_sq in black_rooks {
-        let moves = chess::get_rook_rays(rook_sq) & !occupied;
-        let mobility = (moves & !black_pieces).popcnt() as usize;
-        let clamped_mobility = mobility.min(14);
-        mg_score -= ROOK_MOBILITY_MG[clamped_mobility];
-        eg_score -= ROOK_MOBILITY_EG[clamped_mobility];
+    
+    for sq in white_rooks {
+        let mobility = (chess::get_rook_rays(sq) & !occupied & !white_pieces).popcnt().min(14) as usize;
+        score_mg += ROOK_MOBILITY_MG[mobility];
+        score_eg += ROOK_MOBILITY_EG[mobility];
     }
-
+    
+    for sq in black_rooks {
+        let mobility = (chess::get_rook_rays(sq) & !occupied & !black_pieces).popcnt().min(14) as usize;
+        score_mg -= ROOK_MOBILITY_MG[mobility];
+        score_eg -= ROOK_MOBILITY_EG[mobility];
+    }
+    
+    // Queens (combine rook + bishop moves)
+    let white_queens = board.pieces(Piece::Queen) & white_pieces;
     let black_queens = board.pieces(Piece::Queen) & black_pieces;
-    for queen_sq in black_queens {
-        let rook_moves = chess::get_rook_rays(queen_sq) & !occupied;
-        let bishop_moves = chess::get_bishop_rays(queen_sq) & !occupied;
-        let moves = rook_moves | bishop_moves;
-        let mobility = (moves & !black_pieces).popcnt() as usize;
-        let clamped_mobility = mobility.min(27);
-        mg_score -= QUEEN_MOBILITY_MG[clamped_mobility];
-        eg_score -= QUEEN_MOBILITY_EG[clamped_mobility];
+    
+    for sq in white_queens {
+        let mobility = ((chess::get_rook_rays(sq) | chess::get_bishop_rays(sq)) & !occupied & !white_pieces)
+            .popcnt().min(27) as usize;
+        score_mg += QUEEN_MOBILITY_MG[mobility];
+        score_eg += QUEEN_MOBILITY_EG[mobility];
     }
-
-    // Taper the score based on game phase
-    ((mg_score * phase) + (eg_score * (24 - phase))) / 24
+    
+    for sq in black_queens {
+        let mobility = ((chess::get_rook_rays(sq) | chess::get_bishop_rays(sq)) & !occupied & !black_pieces)
+            .popcnt().min(27) as usize;
+        score_mg -= QUEEN_MOBILITY_MG[mobility];
+        score_eg -= QUEEN_MOBILITY_EG[mobility];
+    }
+    
+    ((score_mg * phase) + (score_eg * (24 - phase))) / 24
 }
 fn evaluate_space(board: &Board, phase: i32) -> i32 {
     if phase < 8 {
