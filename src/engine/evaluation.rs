@@ -2,7 +2,6 @@ use crate::engine::constants::*;
 use crate::engine::move_ordering::VALUES;
 use chess::{BitBoard, Board, Color, MoveGen, Piece, Rank, Square};
 use lazy_static::lazy_static;
-use std::collections::HashMap;
 use std::sync::Mutex;
 
 // Piece-Square Tables
@@ -187,7 +186,8 @@ pub fn piece_to_index(piece: Piece) -> usize {
 lazy_static! {
     pub static ref MATERIAL_HASH_TABLE: Mutex<MaterialHashTable> =
         Mutex::new(MaterialHashTable::new(16));
-    pub static ref PAWN_HASH_TABLE: Mutex<HashMap<u64, i32>> = Mutex::new(HashMap::new());
+    pub static ref PAWN_HASH_TABLE: Mutex<PawnHashTable> =
+        Mutex::new(PawnHashTable::new(16));
     pub static ref FILE_MASKS: [BitBoard; 8] = [
         BitBoard::new(0x0101010101010101),
         BitBoard::new(0x0202020202020202),
@@ -261,6 +261,7 @@ pub struct MaterialHashTable {
     age: usize,
     size: usize,
 }
+
 impl MaterialHashTable {
     pub fn new(size_mb: usize) -> Self {
         let size = (size_mb * 1024 * 1024) / 48;
@@ -298,6 +299,59 @@ impl MaterialHashTable {
         } else {
             bucket[1] = (key, value, self.age);
         }
+    }
+}
+
+pub struct PawnHashTable {
+    table: Vec<[(u64, i32, usize); 2]>,
+    age: usize,
+    size: usize,
+}
+
+impl PawnHashTable {
+    pub fn new(size_mb: usize) -> Self {
+        let size = (size_mb * 1024 * 1024) / 48;
+        Self {
+            table: vec![[(0, 0, 0); 2]; size],
+            age: 0,
+            size,
+        }
+    }
+    
+    pub fn lookup(&self, key: u64) -> Option<i32> {
+        let idx = (key as usize) % self.size;
+        let bucket = &self.table[idx];
+        if bucket[0].0 == key {
+            return Some(bucket[0].1);
+        }
+        if bucket[1].0 == key {
+            return Some(bucket[1].1);
+        }
+        None
+    }
+    
+    pub fn store(&mut self, key: u64, value: i32) {
+        self.age += 1;
+        let idx = (key as usize) % self.size;
+        let bucket = &mut self.table[idx];
+        if bucket[0].0 == key {
+            bucket[0] = (key, value, self.age);
+            return;
+        }
+        if bucket[1].0 == key {
+            bucket[1] = (key, value, self.age);
+            return;
+        }
+        if bucket[0].2 < bucket[1].2 {
+            bucket[0] = (key, value, self.age);
+        } else {
+            bucket[1] = (key, value, self.age);
+        }
+    }
+    
+    pub fn clear(&mut self) {
+        self.table.fill([(0, 0, 0); 2]);
+        self.age = 0;
     }
 }
 
@@ -382,7 +436,7 @@ fn evaluate_pawns(board: &Board) -> i32 {
 
     {
         let cache = PAWN_HASH_TABLE.lock().unwrap();
-        if let Some(&cached_score) = cache.get(&pawn_hash) {
+        if let Some(cached_score) = cache.lookup(pawn_hash) {
             return cached_score;
         }
     }
@@ -616,12 +670,7 @@ fn evaluate_pawns(board: &Board) -> i32 {
 
     {
         let mut cache = PAWN_HASH_TABLE.lock().unwrap();
-        if cache.len() >= 10000 {
-            if let Some(first_key) = cache.keys().next().cloned() {
-                cache.remove(&first_key);
-            }
-        }
-        cache.insert(pawn_hash, score);
+        cache.store(pawn_hash, score);
     }
 
     score
