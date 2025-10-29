@@ -2,7 +2,7 @@ use crate::engine::constants::*;
 use crate::engine::search::{iterative_deepening, clear_repetition_table, update_repetition_table, TRANSPOSITION_TABLE};
 use crate::engine::zobrist::compute_zobrist_hash;
 use crate::engine::transposition_table::TranspositionTable;
-use crate::engine::move_ordering::{KILLER_MOVES, HISTORY_HEURISTIC};
+use crate::engine::move_ordering::{KILLER_MOVES, HISTORY_HEURISTIC, clear_counter_moves};
 use crate::engine::evaluation::{MATERIAL_HASH_TABLE, PAWN_HASH_TABLE};
 use chess::{Board, ChessMove, Color};
 use std::io::{self, BufRead};
@@ -264,13 +264,12 @@ impl UCIEngine {
                         let mut material_table = MATERIAL_HASH_TABLE.lock().unwrap();
                         *material_table = crate::engine::evaluation::MaterialHashTable::new(16);
                     }
-    
-
                     {
                         let mut pawn_table = PAWN_HASH_TABLE.lock().unwrap();
                         pawn_table.clear();
                     }
                     clear_repetition_table();
+                    clear_counter_moves();
                 }
                 "position" => self.handle_position(&tokens),
                 "go" => self.handle_go(&tokens),
