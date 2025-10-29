@@ -1,4 +1,3 @@
-
 use chess::{BitBoard, Board, ChessMove, Color, Piece, Square};
 use lazy_static::lazy_static;
 use std::collections::HashMap;
@@ -17,6 +16,7 @@ lazy_static! {
     };
     pub static ref KILLER_MOVES: Mutex<Vec<Vec<ChessMove>>> = Mutex::new(Vec::new());
     pub static ref HISTORY_HEURISTIC: Mutex<HashMap<ChessMove, i32>> = Mutex::new(HashMap::new());
+    pub static ref COUNTER_MOVES: Mutex<[[Option<ChessMove>; 64]; 64]> = Mutex::new([[None; 64]; 64]);
 }
 
 /// Static Exchange Evaluation with Threshold
@@ -397,7 +397,10 @@ pub fn order_moves(
     moves: Vec<ChessMove>,
     hash_move: Option<ChessMove>,
     depth: usize,
+    previous_move: Option<ChessMove>, 
 ) -> Vec<ChessMove> {
+    let counter_move = previous_move.and_then(|prev_mv| get_counter_move(prev_mv));
+    
     let mut scored_moves: Vec<(ChessMove, i32)> = moves
         .into_iter()
         .map(|mv| {
@@ -417,7 +420,11 @@ pub fn order_moves(
                     8000000
                 } else {
                     let history = HISTORY_HEURISTIC.lock().unwrap();
-                    if depth < 64 {
+                    
+                    // Counter-move heuristic (between killers and history)
+                    if Some(mv) == counter_move {
+                        6500000  // Score between first killer and second killer
+                    } else if depth < 64 {
                         let killers = KILLER_MOVES.lock().unwrap();
                         if killers.len() > depth {
                             if killers[depth].len() > 0 && killers[depth][0] == mv {
@@ -440,4 +447,30 @@ pub fn order_moves(
         .collect();
     scored_moves.sort_by(|a, b| b.1.cmp(&a.1));
     scored_moves.into_iter().map(|(mv, _)| mv).collect()
+}
+
+/// Update counter-move heuristic when a move causes a beta cutoff
+pub fn update_counter_move(previous_move: Option<ChessMove>, refutation: ChessMove) {
+    if let Some(prev_mv) = previous_move {
+        let from_sq = prev_mv.get_source().to_index();
+        let to_sq = prev_mv.get_dest().to_index();
+        
+        let mut counter_moves = COUNTER_MOVES.lock().unwrap();
+        counter_moves[from_sq][to_sq] = Some(refutation);
+    }
+}
+
+/// Get counter-move for a given move
+pub fn get_counter_move(mv: ChessMove) -> Option<ChessMove> {
+    let from_sq = mv.get_source().to_index();
+    let to_sq = mv.get_dest().to_index();
+    
+    let counter_moves = COUNTER_MOVES.lock().unwrap();
+    counter_moves[from_sq][to_sq]
+}
+
+/// Clear counter-moves table
+pub fn clear_counter_moves() {
+    let mut counter_moves = COUNTER_MOVES.lock().unwrap();
+    *counter_moves = [[None; 64]; 64];
 }
