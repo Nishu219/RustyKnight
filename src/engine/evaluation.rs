@@ -920,8 +920,8 @@ fn evaluate_space(board: &Board, phase: i32) -> i32 {
     }
     let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
     let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
-    let white_space_mask = BitBoard::new(0x00FFFF0000000000);
-    let black_space_mask = BitBoard::new(0x0000000000FFFF00);
+    let white_space_mask = BitBoard::new(0x0000FFFFFFFF0000);
+    let black_space_mask = BitBoard::new(0x0000FFFFFFFF0000);
     let white_controlled = {
         let mut control = BitBoard::new(0);
         for pawn_sq in white_pawns {
