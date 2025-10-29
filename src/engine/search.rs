@@ -1,6 +1,6 @@
 use crate::engine::constants::*;
 use crate::engine::evaluation::evaluate;
-use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, VALUES};
+use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, VALUES, update_counter_move};
 use crate::engine::transposition_table::{TranspositionTable, TTFlag};
 use crate::engine::zobrist::compute_zobrist_hash;
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
@@ -146,6 +146,7 @@ fn negamax(
     tt: &mut TranspositionTable,
     max_time: f64,
     timeout_occurred: &mut bool,
+    previous_move: Option<ChessMove>,  
 ) -> i32 {
     let is_pv = beta - alpha > 1;
     let is_root = ply == 0;
@@ -303,6 +304,7 @@ fn negamax(
                         tt,
                         max_time,
                         timeout_occurred,
+                        None,
                     );
 
                     if *timeout_occurred {
@@ -325,6 +327,7 @@ fn negamax(
                                 tt,
                                 max_time,
                                 timeout_occurred,
+                                None,
                             );
 
                             if *timeout_occurred {
@@ -360,6 +363,7 @@ fn negamax(
                     tt,
                     max_time,
                     timeout_occurred,
+                    previous_move,
                 );
 
                 if *timeout_occurred {
@@ -388,6 +392,7 @@ fn negamax(
             tt,
             max_time,
             timeout_occurred,
+            previous_move,
         );
         if !*timeout_occurred {
             hash_move = tt.get_move(board_hash);
@@ -416,7 +421,7 @@ fn negamax(
                 let mut non_singular_found = false;
                 
                 let mut temp_moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
-                temp_moves = order_moves(board, temp_moves, None, ply);
+                temp_moves = order_moves(board, temp_moves, None, ply, None);
                 
                 for mv in temp_moves.iter() {
                     if *mv == hash_mv {
@@ -443,6 +448,7 @@ fn negamax(
                         tt,
                         max_time,
                         timeout_occurred,
+                        None,
                     );
                     
                     {
@@ -487,7 +493,7 @@ fn negamax(
         return if in_check { -30000 + ply as i32 } else { 0 };
     }
 
-    moves = order_moves(board, moves, hash_move, ply);
+    moves = order_moves(board, moves, hash_move, ply, previous_move);
 
     let mut best_value = -31000;
     let mut best_move = None;
@@ -608,6 +614,7 @@ fn negamax(
                 tt,
                 max_time,
                 timeout_occurred,
+                Some(*mv),
             );
 
             if *timeout_occurred {
@@ -650,6 +657,7 @@ fn negamax(
                 tt,
                 max_time,
                 timeout_occurred,
+                Some(*mv),
             )
         } else {
             let mut search_score = -negamax(
@@ -664,6 +672,7 @@ fn negamax(
                 tt,
                 max_time,
                 timeout_occurred,
+                Some(*mv),
             );
 
             if *timeout_occurred {
@@ -684,6 +693,7 @@ fn negamax(
                         tt,
                         max_time,
                         timeout_occurred,
+                        Some(*mv),
                     );
                 }
 
@@ -704,6 +714,7 @@ fn negamax(
                             tt,
                             max_time,
                             timeout_occurred,
+                            Some(*mv),
                         )
                     } else {
                         search_score
@@ -793,6 +804,10 @@ fn negamax(
         }
 
         if alpha >= beta {
+   
+            if is_quiet {
+                update_counter_move(previous_move, *mv);
+            }
             break;
         }
     }
@@ -857,6 +872,7 @@ pub fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                 &mut *tt_guard,
                 max_time,
                 &mut timeout_occurred,
+                None,
             );
 
             if timeout_occurred {
