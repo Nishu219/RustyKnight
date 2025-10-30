@@ -918,50 +918,66 @@ fn evaluate_space(board: &Board, phase: i32) -> i32 {
     if phase < 8 {
         return 0;
     }
+    
     let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
     let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
-    let white_space_mask = BitBoard::new(0x0000FFFFFFFF0000);
-    let black_space_mask = BitBoard::new(0x0000FFFFFFFF0000);
+    let space_mask = BitBoard::new(0x00003C3C3C3C0000);
+    
+    // Calculate pawn control using bitboard shifts
     let white_controlled = {
-        let mut control = BitBoard::new(0);
+        let not_a_file = BitBoard::new(0xFEFEFEFEFEFEFEFE);
+        let not_h_file = BitBoard::new(0x7F7F7F7F7F7F7F7F);
+        let left_attacks = BitBoard::new((white_pawns & not_a_file).0 << 7);
+        let right_attacks = BitBoard::new((white_pawns & not_h_file).0 << 9);
+        left_attacks | right_attacks
+    };
+    
+    let black_controlled = {
+        let not_a_file = BitBoard::new(0xFEFEFEFEFEFEFEFE);
+        let not_h_file = BitBoard::new(0x7F7F7F7F7F7F7F7F);
+        let left_attacks = BitBoard::new((black_pawns & not_a_file).0 >> 9);
+        let right_attacks = BitBoard::new((black_pawns & not_h_file).0 >> 7);
+        left_attacks | right_attacks
+    };
+    
+    // Calculate squares behind pawns using rank masks
+    let white_behind = {
+        let mut behind = BitBoard::new(0);
         for pawn_sq in white_pawns {
             let file = pawn_sq.get_file().to_index();
             let rank = pawn_sq.get_rank().to_index();
-            if rank < 7 {
-                if file > 0 {
-                    let sq = unsafe { Square::new(((rank + 1) * 8 + file - 1) as u8) };
-                    control |= BitBoard::from_square(sq);
-                }
-                if file < 7 {
-                    let sq = unsafe { Square::new(((rank + 1) * 8 + file + 1) as u8) };
-                    control |= BitBoard::from_square(sq);
-                }
-            }
+            // Mask for all squares below this rank on the same file
+            let file_mask = 0x0101010101010101u64 << file;
+            let rank_mask = (1u64 << (rank * 8)) - 1;
+            behind |= BitBoard::new(file_mask & rank_mask);
         }
-        control
+        behind
     };
-    let black_controlled = {
-        let mut control = BitBoard::new(0);
+    
+    let black_behind = {
+        let mut behind = BitBoard::new(0);
         for pawn_sq in black_pawns {
             let file = pawn_sq.get_file().to_index();
             let rank = pawn_sq.get_rank().to_index();
-            if rank > 0 {
-                if file > 0 {
-                    let sq = unsafe { Square::new(((rank - 1) * 8 + file - 1) as u8) };
-                    control |= BitBoard::from_square(sq);
-                }
-                if file < 7 {
-                    let sq = unsafe { Square::new(((rank - 1) * 8 + file + 1) as u8) };
-                    control |= BitBoard::from_square(sq);
-                }
-            }
+            // Mask for all squares above this rank on the same file
+            let file_mask = 0x0101010101010101u64 << file;
+            let rank_mask = !((1u64 << ((rank + 1) * 8)) - 1);
+            behind |= BitBoard::new(file_mask & rank_mask);
         }
-        control
+        behind
     };
-    let white_space = (white_controlled & white_space_mask & !black_controlled).popcnt() as i32;
-    let black_space = (black_controlled & black_space_mask & !white_controlled).popcnt() as i32;
-    let space_diff = white_space - black_space;
-    (space_diff * phase * 4) / 24
+    
+    // Calculate space with bonus for controlled squares behind pawns
+    let white_space_mask = space_mask & !black_controlled;
+    let black_space_mask = space_mask & !white_controlled;
+    
+    let white_space = (white_controlled & white_space_mask).popcnt() as i32
+        + (white_behind & white_controlled & white_space_mask).popcnt() as i32;
+    
+    let black_space = (black_controlled & black_space_mask).popcnt() as i32
+        + (black_behind & black_controlled & black_space_mask).popcnt() as i32;
+    
+    ((white_space - black_space) * phase * 4) / 24
 }
 pub fn evaluate(board: &Board) -> i32 {
     let in_check = *board.checkers() != BitBoard(0);
