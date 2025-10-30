@@ -779,12 +779,13 @@ fn count_piece_attacks(
     for square in pieces {
         let attack_bb = match piece_type {
             Piece::Queen => {
-                let rook_attacks = chess::get_rook_rays(square) & !board.combined();
-                let bishop_attacks = chess::get_bishop_rays(square) & !board.combined();
+                let occupied = *board.combined();
+                let rook_attacks = chess::get_rook_moves(square, occupied);
+                let bishop_attacks = chess::get_bishop_moves(square, occupied);
                 rook_attacks | bishop_attacks
             }
-            Piece::Rook => chess::get_rook_rays(square) & !board.combined(),
-            Piece::Bishop => chess::get_bishop_rays(square) & !board.combined(),
+            Piece::Rook => chess::get_rook_moves(square, *board.combined()),
+            Piece::Bishop => chess::get_bishop_moves(square, *board.combined()),
             Piece::Knight => chess::get_knight_moves(square),
             Piece::Pawn => {
                 let color = if (board.color_combined(Color::White) & BitBoard::from_square(square))
@@ -867,13 +868,13 @@ fn evaluate_mobility(board: &Board, phase: i32) -> i32 {
     let black_bishops = board.pieces(Piece::Bishop) & black_pieces;
     
     for sq in white_bishops {
-        let mobility = (chess::get_bishop_rays(sq) & !occupied & !white_pieces).popcnt().min(13) as usize;
+        let mobility = (chess::get_bishop_moves(sq, *occupied) & !white_pieces).popcnt().min(13) as usize;
         score_mg += BISHOP_MOBILITY_MG[mobility];
         score_eg += BISHOP_MOBILITY_EG[mobility];
     }
     
     for sq in black_bishops {
-        let mobility = (chess::get_bishop_rays(sq) & !occupied & !black_pieces).popcnt().min(13) as usize;
+        let mobility = (chess::get_bishop_moves(sq, *occupied) & !black_pieces).popcnt().min(13) as usize;
         score_mg -= BISHOP_MOBILITY_MG[mobility];
         score_eg -= BISHOP_MOBILITY_EG[mobility];
     }
@@ -883,13 +884,13 @@ fn evaluate_mobility(board: &Board, phase: i32) -> i32 {
     let black_rooks = board.pieces(Piece::Rook) & black_pieces;
     
     for sq in white_rooks {
-        let mobility = (chess::get_rook_rays(sq) & !occupied & !white_pieces).popcnt().min(14) as usize;
+        let mobility = (chess::get_rook_moves(sq, *occupied) & !white_pieces).popcnt().min(14) as usize;
         score_mg += ROOK_MOBILITY_MG[mobility];
         score_eg += ROOK_MOBILITY_EG[mobility];
     }
     
     for sq in black_rooks {
-        let mobility = (chess::get_rook_rays(sq) & !occupied & !black_pieces).popcnt().min(14) as usize;
+        let mobility = (chess::get_rook_moves(sq, *occupied) & !black_pieces).popcnt().min(14) as usize;
         score_mg -= ROOK_MOBILITY_MG[mobility];
         score_eg -= ROOK_MOBILITY_EG[mobility];
     }
@@ -899,14 +900,14 @@ fn evaluate_mobility(board: &Board, phase: i32) -> i32 {
     let black_queens = board.pieces(Piece::Queen) & black_pieces;
     
     for sq in white_queens {
-        let mobility = ((chess::get_rook_rays(sq) | chess::get_bishop_rays(sq)) & !occupied & !white_pieces)
+        let mobility = ((chess::get_rook_moves(sq, *occupied) | chess::get_bishop_moves(sq, *occupied)) & !white_pieces)
             .popcnt().min(27) as usize;
         score_mg += QUEEN_MOBILITY_MG[mobility];
         score_eg += QUEEN_MOBILITY_EG[mobility];
     }
     
     for sq in black_queens {
-        let mobility = ((chess::get_rook_rays(sq) | chess::get_bishop_rays(sq)) & !occupied & !black_pieces)
+        let mobility = ((chess::get_rook_moves(sq, *occupied) | chess::get_bishop_moves(sq, *occupied)) & !black_pieces)
             .popcnt().min(27) as usize;
         score_mg -= QUEEN_MOBILITY_MG[mobility];
         score_eg -= QUEEN_MOBILITY_EG[mobility];
