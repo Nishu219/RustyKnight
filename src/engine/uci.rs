@@ -258,7 +258,7 @@ impl UCIEngine {
                     }
                     {
                         let mut history = HISTORY_HEURISTIC.lock().unwrap();
-                        history.clear();
+                        *history = [[0; 64]; 64];
                     }
                     {
                         let mut material_table = MATERIAL_HASH_TABLE.lock().unwrap();
