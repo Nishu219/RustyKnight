@@ -980,6 +980,83 @@ fn evaluate_space(board: &Board, phase: i32) -> i32 {
     
     ((white_space - black_space) * phase * 4) / 24
 }
+
+fn evaluate_king_pawn_shield(board: &Board, phase: i32) -> i32 {
+    let mut score = 0;
+
+    let white_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::White))
+        .into_iter()
+        .next()
+        .unwrap();
+    let black_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::Black))
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+    let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+
+    score += get_king_shield_score(white_king_sq, white_pawns, Color::White);
+    score -= get_king_shield_score(black_king_sq, black_pawns, Color::Black);
+
+    (score * phase) / 24 // Taper score based on phase
+}
+
+fn get_king_shield_score(king_sq: Square, friendly_pawns: BitBoard, color: Color) -> i32 {
+    let mut score = 0;
+    let king_file = king_sq.get_file().to_index();
+
+    // Only evaluate when king is likely to be castled
+    let king_rank = king_sq.get_rank().to_index();
+    if (color == Color::White && king_rank > 1) || (color == Color::Black && king_rank < 6) {
+        return 0;
+    }
+
+    // Determine shield files based on king's position
+    let shield_files: &[usize] = if king_file <= 1 {
+        &[0, 1, 2] // Queen-side castle
+    } else if king_file >= 6 {
+        &[5, 6, 7] // King-side castle
+    } else {
+        // King in center or castled, check files around king
+        &[king_file - 1, king_file, king_file + 1]
+    };
+
+    let shield_rank = if color == Color::White { 1 } else { 6 };
+
+    for &file in shield_files {
+        let file_mask = FILE_MASKS[file];
+        let pawns_on_file = friendly_pawns & file_mask;
+
+        if pawns_on_file == BitBoard::new(0) {
+            score -= 30; // Missing pawn
+        } else {
+            let pawn_rank = if color == Color::White {
+                pawns_on_file
+                    .into_iter()
+                    .map(|s| s.get_rank().to_index())
+                    .min()
+                    .unwrap_or(7)
+            } else {
+                pawns_on_file
+                    .into_iter()
+                    .map(|s| s.get_rank().to_index())
+                    .max()
+                    .unwrap_or(0)
+            };
+
+            let rank_diff = (pawn_rank as i32 - shield_rank as i32).abs();
+            if rank_diff > 0 {
+                score -= 15 * rank_diff; // Pawn pushed
+            }
+            if pawns_on_file.popcnt() > 1 {
+                score -= 20; // Doubled pawns
+            }
+        }
+    }
+    score
+}
+
 pub fn evaluate(board: &Board) -> i32 {
     let in_check = *board.checkers() != BitBoard(0);
     let has_legal_moves = MoveGen::new_legal(board).next().is_some();
@@ -1063,6 +1140,7 @@ pub fn evaluate(board: &Board) -> i32 {
     score += evaluate_pawns(board);
     score += evaluate_king_tropism(board, phase);
     score += evaluate_king_ring_attacks(board, phase);
+    score += evaluate_king_pawn_shield(board, phase);
     score += evaluate_mobility(board, phase);
     score += evaluate_space(board, phase);
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
@@ -1079,3 +1157,4 @@ pub fn evaluate(board: &Board) -> i32 {
     };
     final_score
 }
+
