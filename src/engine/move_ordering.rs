@@ -15,7 +15,7 @@ lazy_static! {
         m
     };
     pub static ref KILLER_MOVES: Mutex<Vec<Vec<ChessMove>>> = Mutex::new(Vec::new());
-    pub static ref HISTORY_HEURISTIC: Mutex<HashMap<ChessMove, i32>> = Mutex::new(HashMap::new());
+    pub static ref HISTORY_HEURISTIC: Mutex<[[i32; 64]; 64]> = Mutex::new([[0; 64]; 64]);
     pub static ref COUNTER_MOVES: Mutex<[[Option<ChessMove>; 64]; 64]> = Mutex::new([[None; 64]; 64]);
 }
 
@@ -432,13 +432,13 @@ pub fn order_moves(
                             } else if killers[depth].len() > 1 && killers[depth][1] == mv {
                                 6000000
                             } else {
-                                *history.get(&mv).unwrap_or(&0)
+                                history[mv.get_source().to_index()][mv.get_dest().to_index()]
                             }
                         } else {
-                            *history.get(&mv).unwrap_or(&0)
+                            history[mv.get_source().to_index()][mv.get_dest().to_index()]
                         }
                     } else {
-                        *history.get(&mv).unwrap_or(&0)
+                        history[mv.get_source().to_index()][mv.get_dest().to_index()]
                     }
                 }
             };
@@ -474,3 +474,4 @@ pub fn clear_counter_moves() {
     let mut counter_moves = COUNTER_MOVES.lock().unwrap();
     *counter_moves = [[None; 64]; 64];
 }
+

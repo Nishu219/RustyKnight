@@ -589,8 +589,9 @@ fn negamax(
             if depth > 8 { r += 1; }
 
             let history = HISTORY_HEURISTIC.lock().unwrap();
-            let history_score = *history.get(mv).unwrap_or(&0);
-            if history_score > 1000 {
+            let from_sq = mv.get_source().to_index();
+            let to_sq = mv.get_dest().to_index();
+            if history[from_sq][to_sq] > 1000 {
                 r = r.saturating_sub(1);
             }
 
@@ -777,12 +778,12 @@ fn negamax(
                 {
                     let mut history = HISTORY_HEURISTIC.lock().unwrap();
                     let bonus = (depth * depth) as i32;
-                    *history.entry(*mv).or_insert(0) += bonus;
+                    let from_sq = mv.get_source().to_index();
+                    let to_sq = mv.get_dest().to_index();
+                    history[from_sq][to_sq] += bonus;
 
-                    if let Some(value) = history.get_mut(mv) {
-                        if *value > 10000 {
-                            *value = 10000;
-                        }
+                    if history[from_sq][to_sq] > 10000 {
+                        history[from_sq][to_sq] = 10000;
                     }
                 }
 
@@ -792,11 +793,12 @@ fn negamax(
                         && prev_mv.get_promotion().is_none()
                     {
                         let mut history = HISTORY_HEURISTIC.lock().unwrap();
-                        if let Some(value) = history.get_mut(prev_mv) {
-                            *value -= (depth * depth / 4) as i32;
-                            if *value < -1000 {
-                                *value = -1000;
-                            }
+                        let prev_from_sq = prev_mv.get_source().to_index();
+                        let prev_to_sq = prev_mv.get_dest().to_index();
+                        history[prev_from_sq][prev_to_sq] -= (depth * depth / 4) as i32;
+
+                        if history[prev_from_sq][prev_to_sq] < -1000 {
+                            history[prev_from_sq][prev_to_sq] = -1000;
                         }
                     }
                 }
