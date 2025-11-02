@@ -8,6 +8,13 @@ use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
+#[derive(Default, Clone)]
+pub struct SearchStats {
+    pub nodes: usize,
+    pub qnodes: usize,
+    pub tt_hits: usize,
+    pub seldepth: usize,
+}
 
 lazy_static! {
     pub static ref REPETITION_TABLE: Mutex<HashMap<u64, usize>> = Mutex::new(HashMap::new());
@@ -35,20 +42,21 @@ fn quiesce(
     mut alpha: i32,
     beta: i32,
     start_time: Instant,
-    stats: &mut HashMap<&str, usize>,
+    stats: &mut SearchStats,
     root_color: Color,
     max_time: f64,
     timeout_occurred: &mut bool,
+    ply: usize,
 ) -> i32 {
-    *stats.entry("nodes").or_insert(0) += 1;
-    *stats.entry("qnodes").or_insert(0) += 1;
-
+    stats.nodes += 1;
+    stats.qnodes += 1;
+    stats.seldepth = stats.seldepth.max(ply);
     if start_time.elapsed().as_secs_f64() > max_time {
         *timeout_occurred = true;
-        return evaluate(board);
+        return evaluate(board, 0);
     }
 
-    let stand_pat = evaluate(board);
+    let stand_pat = evaluate(board, 0);
 
     if stand_pat >= beta {
         return beta;
@@ -115,6 +123,7 @@ fn quiesce(
             root_color,
             max_time,
             timeout_occurred,
+            ply + 1,
         );
 
         if *timeout_occurred {
@@ -141,23 +150,25 @@ fn negamax(
     mut beta: i32,
     start_time: Instant,
     ply: usize,
-    stats: &mut HashMap<&str, usize>,
+    stats: &mut SearchStats,
     root_color: Color,
     tt: &mut TranspositionTable,
     max_time: f64,
     timeout_occurred: &mut bool,
-    previous_move: Option<ChessMove>,  
+    previous_move: Option<ChessMove>,
+    contempt: i32,
 ) -> i32 {
     let is_pv = beta - alpha > 1;
     let is_root = ply == 0;
     let original_alpha = alpha;
 
-    *stats.entry("nodes").or_insert(0) += 1;
+    stats.nodes += 1;
+    stats.seldepth = stats.seldepth.max(ply);
 
     // Timeout check
     if start_time.elapsed().as_secs_f64() > max_time {
         *timeout_occurred = true;
-        return if ply > 0 { evaluate(board) } else { 0 };
+        return if ply > 0 { evaluate(board, 0) } else { 0 };
     }
 
     let position_hash = compute_zobrist_hash(board);
@@ -166,9 +177,9 @@ fn negamax(
     if ply > 0 {
         if is_repetition(position_hash) {
             return if board.side_to_move() == root_color {
-                -CONTEMPT
+                -contempt
             } else {
-                CONTEMPT
+                contempt
             };
         }
 
@@ -178,9 +189,9 @@ fn negamax(
 
         if board.status() == BoardStatus::Stalemate {
             return if board.side_to_move() == root_color {
-                -CONTEMPT
+                -contempt
             } else {
-                CONTEMPT
+                contempt
             };
         }
 
@@ -198,7 +209,7 @@ fn negamax(
 
     // TT probe
     if let Some(stored_value) = tt.get(board_hash, depth, alpha, beta) {
-        *stats.entry("tt_hits").or_insert(0) += 1;
+        stats.tt_hits += 1;
         if !is_pv || !is_root {
             return stored_value;
         }
@@ -213,7 +224,7 @@ fn negamax(
     let static_eval = if in_check {
         -30000 + ply as i32
     } else {
-        evaluate(board)
+        evaluate(board, contempt)
     };
 
     // Quiescence at leaf
@@ -227,6 +238,7 @@ fn negamax(
             root_color,
             max_time,
             timeout_occurred,
+            ply,
         );
     }
 
@@ -254,9 +266,10 @@ fn negamax(
                     root_color,
                     max_time,
                     timeout_occurred,
+                    ply,
                 );
                 if *timeout_occurred {
-                    return evaluate(board);
+                    return evaluate(board, 0);
                 }
                 if razor_score <= razor_alpha {
                     return razor_score;
@@ -305,10 +318,11 @@ fn negamax(
                         max_time,
                         timeout_occurred,
                         None,
+                        contempt,
                     );
 
                     if *timeout_occurred {
-                        return evaluate(board);
+                        return evaluate(board, 0);
                     }
 
                     if null_score >= beta {
@@ -328,10 +342,11 @@ fn negamax(
                                 max_time,
                                 timeout_occurred,
                                 None,
+                                contempt,
                             );
 
                             if *timeout_occurred {
-                                return evaluate(board);
+                                return evaluate(board, 0);
                             }
 
                             if verification_score >= beta {
@@ -364,10 +379,11 @@ fn negamax(
                     max_time,
                     timeout_occurred,
                     previous_move,
+                    contempt,
                 );
 
                 if *timeout_occurred {
-                    return evaluate(board);
+                    return evaluate(board, 0);
                 }
 
                 if probcut_score >= probcut_beta {
@@ -393,6 +409,7 @@ fn negamax(
             max_time,
             timeout_occurred,
             previous_move,
+            contempt,
         );
         if !*timeout_occurred {
             hash_move = tt.get_move(board_hash);
@@ -449,6 +466,7 @@ fn negamax(
                         max_time,
                         timeout_occurred,
                         None,
+                        contempt,
                     );
                     
                     {
@@ -616,6 +634,7 @@ fn negamax(
                 max_time,
                 timeout_occurred,
                 Some(*mv),
+                contempt,
             );
 
             if *timeout_occurred {
@@ -659,6 +678,7 @@ fn negamax(
                 max_time,
                 timeout_occurred,
                 Some(*mv),
+                contempt,
             )
         } else {
             let mut search_score = -negamax(
@@ -674,10 +694,11 @@ fn negamax(
                 max_time,
                 timeout_occurred,
                 Some(*mv),
+                contempt,
             );
 
             if *timeout_occurred {
-                evaluate(board)
+                evaluate(board, 0)
             } else {
                 // Re-search at full depth if reduced
                 if !do_full_search && search_score > alpha {
@@ -695,12 +716,13 @@ fn negamax(
                         max_time,
                         timeout_occurred,
                         Some(*mv),
+                        contempt,
                     );
                 }
 
                 // PV re-search
                 if *timeout_occurred {
-                    evaluate(board)
+                    evaluate(board, 0)
                 } else if search_score > alpha {
                     if is_pv || (search_score < beta) {
                         -negamax(
@@ -716,6 +738,7 @@ fn negamax(
                             max_time,
                             timeout_occurred,
                             Some(*mv),
+                            contempt,
                         )
                     } else {
                         search_score
@@ -829,18 +852,22 @@ fn negamax(
 
     best_value
 }
-pub fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
+pub fn iterative_deepening(
+    board: &Board,
+    max_time: f64,
+    contempt: i32,
+) -> Option<ChessMove> {
     let start_time = Instant::now();
     let mut best_move = None;
     let mut best_score = 0;
     let root_color = board.side_to_move();
     let mut tt_guard = TRANSPOSITION_TABLE.lock().unwrap();
+    let mut stats = SearchStats::default();
     for depth in 1..=MAX_DEPTH {
         if start_time.elapsed().as_secs_f64() > max_time * 0.8 {
             break;
         }
 
-        let mut stats: HashMap<&str, usize> = HashMap::new();
         let mut timeout_occurred = false;
 
         // Determine initial aspiration window bounds
@@ -875,6 +902,7 @@ pub fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                 max_time,
                 &mut timeout_occurred,
                 None,
+                contempt,
             );
 
             if timeout_occurred {
@@ -942,7 +970,6 @@ pub fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                             // Extract and display principal variation
                             let mut pv = Vec::new();
                             let mut temp_board = *board;
-                            let mut pv_depth = 0;
 
                             for _ in 0..depth.min(20) {
                                 let h = compute_zobrist_hash(&temp_board);
@@ -951,7 +978,6 @@ pub fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                                     if movegen.into_iter().any(|legal_move| legal_move == pv_move) {
                                         pv.push(pv_move);
                                         temp_board = temp_board.make_move_new(pv_move);
-                                        pv_depth += 1;
                                     } else {
                                         break;
                                     }
@@ -960,10 +986,9 @@ pub fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                                 }
                             }
 
-                            let nodes = *stats.get("nodes").unwrap_or(&0);
                             let time_ms = (start_time.elapsed().as_secs_f64() * 1000.0) as u64;
                             let nps = if time_ms > 0 {
-                                nodes * 1000 / time_ms as usize
+                                stats.nodes * 1000 / time_ms as usize
                             } else {
                                 0
                             };
@@ -979,9 +1004,9 @@ pub fn iterative_deepening(board: &Board, max_time: f64) -> Option<ChessMove> {
                             println!(
                                 "info depth {} seldepth {} score cp {} nodes {} nps {} time {} hashfull {} pv {}",
                                 depth, 
-                                pv_depth.max(depth), 
+                                stats.seldepth, 
                                 best_score, 
-                                nodes, 
+                                stats.nodes, 
                                 nps, 
                                 time_ms,
                                 hashfull,

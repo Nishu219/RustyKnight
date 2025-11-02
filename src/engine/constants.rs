@@ -4,7 +4,6 @@ pub const MAX_DEPTH: usize = 99;
 pub const INITIAL_WINDOW: i32 = 50;
 pub const MAX_WINDOW: i32 = 400;
 pub const STATS: bool = true;
-pub const CONTEMPT: i32 = 25;
 pub const LMR_FULL_DEPTH_MOVES: usize = 4;
 pub const LMR_REDUCTION_LIMIT: usize = 5;
 pub const NULL_MOVE_DEPTH: usize = 3;

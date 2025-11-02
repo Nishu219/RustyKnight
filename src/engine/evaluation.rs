@@ -1057,7 +1057,7 @@ fn get_king_shield_score(king_sq: Square, friendly_pawns: BitBoard, color: Color
     score
 }
 
-pub fn evaluate(board: &Board) -> i32 {
+pub fn evaluate(board: &Board, contempt: i32) -> i32 {
     let in_check = *board.checkers() != BitBoard(0);
     let has_legal_moves = MoveGen::new_legal(board).next().is_some();
 
@@ -1065,7 +1065,7 @@ pub fn evaluate(board: &Board) -> i32 {
         return if in_check {
             if board.side_to_move() == Color::White { -30000 } else { 30000 }
         } else {
-            if board.side_to_move() == Color::White { CONTEMPT } else { -CONTEMPT }
+            if board.side_to_move() == Color::White { contempt } else { -contempt }
         };
     }
     let material_hash_table = MATERIAL_HASH_TABLE.lock().unwrap();

@@ -3,7 +3,7 @@ use crate::engine::search::{iterative_deepening, clear_repetition_table, update_
 use crate::engine::zobrist::compute_zobrist_hash;
 use crate::engine::transposition_table::TranspositionTable;
 use crate::engine::move_ordering::{KILLER_MOVES, HISTORY_HEURISTIC, clear_counter_moves};
-use crate::engine::evaluation::{MATERIAL_HASH_TABLE, PAWN_HASH_TABLE};
+use crate::engine::evaluation::{MATERIAL_HASH_TABLE, PAWN_HASH_TABLE, MaterialHashTable};
 use chess::{Board, ChessMove, Color};
 use std::io::{self, BufRead};
 use std::str::FromStr;
@@ -13,6 +13,7 @@ pub struct UCIEngine {
     debug: bool,
     position_history: Vec<u64>,
     hash_size: usize,
+    contempt: i32,
 }
 
 impl UCIEngine {
@@ -22,6 +23,7 @@ impl UCIEngine {
             debug: false,
             position_history: Vec::new(),
             hash_size: 256,
+            contempt: 0,
         }
     }
 
@@ -29,6 +31,7 @@ impl UCIEngine {
         println!("id name RustKnightv2.2");
         println!("id author Anish");
         println!("option name Hash type spin default 256 min 1 max 4096");
+        println!("option name Contempt type spin default 0 min -100 max 100");
         println!("uciok");
     }
 
@@ -47,6 +50,11 @@ impl UCIEngine {
                             let mut tt = TRANSPOSITION_TABLE.lock().unwrap();
                             *tt = TranspositionTable::new(clamped_size);
                         }
+                    }
+                }
+                "contempt" => {
+                    if let Ok(value) = tokens[4].parse::<i32>() {
+                        self.contempt = value.max(-100).min(100);
                     }
                 }
                 _ => {}
@@ -209,7 +217,7 @@ impl UCIEngine {
             self.calculate_time_budget(wtime, btime, winc, binc, movetime)
         };
 
-        if let Some(best_move) = iterative_deepening(&self.board, max_time) {
+        if let Some(best_move) = iterative_deepening(&self.board, max_time, self.contempt) {
             println!("bestmove {}", best_move);
         } else {
             println!("bestmove 0000");
@@ -262,7 +270,7 @@ impl UCIEngine {
                     }
                     {
                         let mut material_table = MATERIAL_HASH_TABLE.lock().unwrap();
-                        *material_table = crate::engine::evaluation::MaterialHashTable::new(16);
+                        *material_table = MaterialHashTable::new(16);
                     }
                     {
                         let mut pawn_table = PAWN_HASH_TABLE.lock().unwrap();
