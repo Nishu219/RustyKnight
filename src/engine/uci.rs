@@ -217,7 +217,11 @@ impl UCIEngine {
             self.calculate_time_budget(wtime, btime, winc, binc, movetime)
         };
 
-        if let Some(best_move) = iterative_deepening(&self.board, max_time, self.contempt) {
+        let is_movetime = movetime.is_some();
+
+        if let Some(best_move) =
+            iterative_deepening(&self.board, max_time, self.contempt, is_movetime)
+        {
             println!("bestmove {}", best_move);
         } else {
             println!("bestmove 0000");
