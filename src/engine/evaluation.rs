@@ -1,6 +1,6 @@
 use crate::engine::constants::*;
 use crate::engine::move_ordering::VALUES;
-use chess::{BitBoard, Board, Color, MoveGen, Piece, Rank, Square};
+use chess::{BitBoard, Board, Color, MoveGen, Piece, Rank, File, Square};
 use lazy_static::lazy_static;
 use std::sync::Mutex;
 
@@ -993,6 +993,16 @@ fn evaluate_king_pawn_shield(board: &Board, phase: i32) -> i32 {
         .next()
         .unwrap();
 
+    if phase < 12 {
+        return 0;
+    }
+    if white_king_sq.get_file() == File::E {
+        score -= 15;
+    }
+    if black_king_sq.get_file() == File::E {
+        score += 15;
+    }
+
     let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
     let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
 
@@ -1005,24 +1015,29 @@ fn evaluate_king_pawn_shield(board: &Board, phase: i32) -> i32 {
 fn get_king_shield_score(king_sq: Square, friendly_pawns: BitBoard, color: Color) -> i32 {
     let mut score = 0;
     let king_file = king_sq.get_file().to_index();
-
-    // Only evaluate when king is likely to be castled
     let king_rank = king_sq.get_rank().to_index();
-    if (color == Color::White && king_rank > 1) || (color == Color::Black && king_rank < 6) {
+
+    let (expected_king_rank, shield_rank) = if color == Color::White {
+        (0, 1) // King on rank 1, shield on rank 2
+    } else {
+        (7, 6) // King on rank 8, shield on rank 7
+    };
+
+    // Only evaluate kings on their home/castling rank
+    if king_rank != expected_king_rank {
         return 0;
     }
 
-    // Determine shield files based on king's position
-    let shield_files: &[usize] = if king_file <= 1 {
-        &[0, 1, 2] // Queen-side castle
-    } else if king_file >= 6 {
-        &[5, 6, 7] // King-side castle
+    // Determine which files to check.
+    let shield_files: &[usize] = if king_file <= 2 {
+        &[0, 1, 2] // Queenside (a, b, c)
+    } else if king_file >= 5 {
+        &[5, 6, 7] // Kingside (f, g, h)
     } else {
-        // King in center or castled, check files around king
-        &[king_file - 1, king_file, king_file + 1]
+
+        return 0;
     };
 
-    let shield_rank = if color == Color::White { 1 } else { 6 };
 
     for &file in shield_files {
         let file_mask = FILE_MASKS[file];
@@ -1157,4 +1172,6 @@ pub fn evaluate(board: &Board, contempt: i32) -> i32 {
     };
     final_score
 }
+
+
 
