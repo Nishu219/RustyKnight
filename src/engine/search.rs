@@ -1,6 +1,6 @@
 use crate::engine::constants::*;
 use crate::engine::evaluation::evaluate;
-use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, VALUES, update_counter_move};
+use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, PIECE_VALUES, update_counter_move};
 use crate::engine::transposition_table::{TranspositionTable, TTFlag};
 use crate::engine::zobrist::compute_zobrist_hash;
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
@@ -67,9 +67,9 @@ fn quiesce(
     }
 
     // Delta pruning: calculate the maximum possible gain
-    // We use queen value (900) as the base delta, plus a margin for promotions 
-    let big_delta = VALUES[&Piece::Queen] + DELTA_MARGIN;
-    
+    // We use queen value (900) as the base delta, plus a margin for promotions
+    let big_delta = PIECE_VALUES[Piece::Queen.to_index()] + DELTA_MARGIN;
+
     // If even capturing the opponent's queen cannot raise alpha, prune all moves
     if stand_pat + big_delta < alpha {
         return alpha;
@@ -95,10 +95,10 @@ fn quiesce(
         // Delta pruning for individual moves
         // Calculate the value of the captured piece
         let captured_value = if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
-            VALUES[&captured_piece]
+            PIECE_VALUES[captured_piece.to_index()]
         } else if mv.get_promotion().is_some() {
             // Promotion - assume queen for simplicity
-            VALUES[&Piece::Queen] - VALUES[&Piece::Pawn]
+            PIECE_VALUES[Piece::Queen.to_index()] - PIECE_VALUES[Piece::Pawn.to_index()]
         } else {
             0
         };
