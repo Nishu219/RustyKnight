@@ -254,6 +254,124 @@ lazy_static! {
         }
         masks
     };
+    pub static ref WHITE_PAWN_PUSHES: [BitBoard; 64] = {
+        let mut pushes = [BitBoard::new(0); 64];
+        for sq in 0..64 {
+            let rank = sq / 8;
+            if rank < 7 {
+                pushes[sq] = BitBoard::new(1u64 << (sq + 8));
+            }
+        }
+        pushes
+    };
+    
+    pub static ref BLACK_PAWN_PUSHES: [BitBoard; 64] = {
+        let mut pushes = [BitBoard::new(0); 64];
+        for sq in 0..64 {
+            let rank = sq / 8;
+            if rank > 0 {
+                pushes[sq] = BitBoard::new(1u64 << (sq - 8));
+            }
+        }
+        pushes
+    };
+    
+    pub static ref WHITE_PAWN_ATTACKS: [BitBoard; 64] = {
+        let mut attacks = [BitBoard::new(0); 64];
+        for sq in 0..64 {
+            let file = sq % 8;
+            let rank = sq / 8;
+            let mut attack = BitBoard::new(0);
+            
+            if rank < 7 {
+                if file > 0 {
+                    attack |= BitBoard::new(1u64 << (sq + 7));
+                }
+                if file < 7 {
+                    attack |= BitBoard::new(1u64 << (sq + 9));
+                }
+            }
+            attacks[sq] = attack;
+        }
+        attacks
+    };
+    
+    pub static ref BLACK_PAWN_ATTACKS: [BitBoard; 64] = {
+        let mut attacks = [BitBoard::new(0); 64];
+        for sq in 0..64 {
+            let file = sq % 8;
+            let rank = sq / 8;
+            let mut attack = BitBoard::new(0);
+            
+            if rank > 0 {
+                if file > 0 {
+                    attack |= BitBoard::new(1u64 << (sq - 9));
+                }
+                if file < 7 {
+                    attack |= BitBoard::new(1u64 << (sq - 7));
+                }
+            }
+            attacks[sq] = attack;
+        }
+        attacks
+    };
+    
+    pub static ref WHITE_PAWN_SUPPORT_SQUARES: [BitBoard; 64] = {
+        let mut support = [BitBoard::new(0); 64];
+        for sq in 0..64 {
+            let file = sq % 8;
+            let rank = sq / 8;
+            let mut supporters = BitBoard::new(0);
+            
+            if rank > 0 {
+                if file > 0 {
+                    supporters |= BitBoard::new(1u64 << (sq - 9));
+                }
+                if file < 7 {
+                    supporters |= BitBoard::new(1u64 << (sq - 7));
+                }
+            }
+            support[sq] = supporters;
+        }
+        support
+    };
+    
+    pub static ref BLACK_PAWN_SUPPORT_SQUARES: [BitBoard; 64] = {
+        let mut support = [BitBoard::new(0); 64];
+        for sq in 0..64 {
+            let file = sq % 8;
+            let rank = sq / 8;
+            let mut supporters = BitBoard::new(0);
+            
+            if rank < 7 {
+                if file > 0 {
+                    supporters |= BitBoard::new(1u64 << (sq + 7));
+                }
+                if file < 7 {
+                    supporters |= BitBoard::new(1u64 << (sq + 9));
+                }
+            }
+            support[sq] = supporters;
+        }
+        support
+    };
+    
+    pub static ref PHALANX_SQUARES: [BitBoard; 64] = {
+        let mut phalanx = [BitBoard::new(0); 64];
+        for sq in 0..64 {
+            let file = sq % 8;
+            let mut phalanx_bb = BitBoard::new(0);
+            
+            if file > 0 {
+                phalanx_bb |= BitBoard::new(1u64 << (sq - 1));
+            }
+            if file < 7 {
+                phalanx_bb |= BitBoard::new(1u64 << (sq + 1));
+            }
+            phalanx[sq] = phalanx_bb;
+        }
+        phalanx
+    };
 }
 
 pub struct MaterialHashTable {
@@ -445,225 +563,126 @@ fn evaluate_pawns(board: &Board) -> i32 {
     let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
 
     let mut score = 0;
+    
+    // Pre-compute pawn attack maps using efficient bit shifts
+    let not_a_file = BitBoard::new(0xFEFEFEFEFEFEFEFE);
+    let not_h_file = BitBoard::new(0x7F7F7F7F7F7F7F7F);
+    
+    let white_pawn_attacks = BitBoard::new(((white_pawns & not_a_file).0 << 7) | 
+                                           ((white_pawns & not_h_file).0 << 9));
+    let black_pawn_attacks = BitBoard::new(((black_pawns & not_a_file).0 >> 9) | 
+                                           ((black_pawns & not_h_file).0 >> 7));
+
+    // Pre-compute pawn support bitboards
+    let white_pawn_support = BitBoard::new(((white_pawns & not_a_file).0 >> 9) | 
+                                           ((white_pawns & not_h_file).0 >> 7));
+    let black_pawn_support = BitBoard::new(((black_pawns & not_a_file).0 << 7) | 
+                                           ((black_pawns & not_h_file).0 << 9));
+
+    // Build file count arrays
     let mut white_file_counts = [0u8; 8];
     let mut black_file_counts = [0u8; 8];
-    let mut white_file_ranks = [8u8; 8];
-    let mut black_file_ranks = [8u8; 8];
 
     for square in white_pawns {
-        let file = square.get_file().to_index();
-        let rank = square.get_rank().to_index();
-        white_file_counts[file] += 1;
-        white_file_ranks[file] = white_file_ranks[file].min(rank as u8);
+        white_file_counts[square.get_file().to_index()] += 1;
     }
     for square in black_pawns {
-        let file = square.get_file().to_index();
-        let rank = square.get_rank().to_index();
-        black_file_counts[file] += 1;
-        black_file_ranks[file] = black_file_ranks[file].min(rank as u8);
+        black_file_counts[square.get_file().to_index()] += 1;
     }
 
+    // Process file-based penalties (doubled + isolated)
     for file_idx in 0..8 {
-        if white_file_counts[file_idx] >= 2 {
-            score -= 15 * (white_file_counts[file_idx] - 1) as i32;
+        let w_count = white_file_counts[file_idx];
+        let b_count = black_file_counts[file_idx];
+        
+        // Doubled pawns
+        if w_count >= 2 {
+            score -= 15 * (w_count - 1) as i32;
         }
-        if black_file_counts[file_idx] >= 2 {
-            score += 15 * (black_file_counts[file_idx] - 1) as i32;
+        if b_count >= 2 {
+            score += 15 * (b_count - 1) as i32;
         }
-
-        if white_file_counts[file_idx] > 0 {
-            let has_adjacent = (file_idx > 0 && white_file_counts[file_idx - 1] > 0)
-                || (file_idx < 7 && white_file_counts[file_idx + 1] > 0);
+        
+        // Isolated pawns
+        if w_count > 0 {
+            let has_adjacent = (file_idx > 0 && white_file_counts[file_idx - 1] > 0) ||
+                              (file_idx < 7 && white_file_counts[file_idx + 1] > 0);
             if !has_adjacent {
                 score -= 12;
             }
         }
-
-        if black_file_counts[file_idx] > 0 {
-            let has_adjacent = (file_idx > 0 && black_file_counts[file_idx - 1] > 0)
-                || (file_idx < 7 && black_file_counts[file_idx + 1] > 0);
+        if b_count > 0 {
+            let has_adjacent = (file_idx > 0 && black_file_counts[file_idx - 1] > 0) ||
+                              (file_idx < 7 && black_file_counts[file_idx + 1] > 0);
             if !has_adjacent {
                 score += 12;
             }
         }
     }
 
+    // Evaluate white pawns
     for square in white_pawns {
         let sq_idx = square.to_index();
-        let file = square.get_file().to_index();
         let rank = square.get_rank().to_index();
+        let sq_bb = BitBoard::from_square(square);
 
-        if (WHITE_PASSED_MASKS[sq_idx] & black_pawns) == BitBoard::new(0) {
-            let passed_bonus = [0, 5, 10, 20, 35, 55, 80, 0][rank];
-            score += passed_bonus;
+        // Passed pawns (already optimized with lookup)
+        if (WHITE_PASSED_MASKS[sq_idx] & black_pawns).0 == 0 {
+            score += [0, 5, 10, 20, 35, 55, 80, 0][rank];
+        }
+        
+        // Phalanx pawns (side-by-side)
+        if (PHALANX_SQUARES[sq_idx] & white_pawns).0 != 0 {
+            score += WHITE_PHALANX_BONUS[rank];
+        }
+        
+        // Connected pawns (supported by friendly pawn)
+        if (WHITE_PAWN_SUPPORT_SQUARES[sq_idx] & white_pawns).0 != 0 {
+            score += 3;
         } else {
-            let mut can_advance = true;
-            let mut supported = false;
-
-            if file > 0
-                && white_file_counts[file - 1] > 0
-                && white_file_ranks[file - 1] <= rank as u8
-            {
-                supported = true;
-            }
-            if file < 7
-                && white_file_counts[file + 1] > 0
-                && white_file_ranks[file + 1] <= rank as u8
-            {
-                supported = true;
-            }
-
-            if rank < 7 {
-                let front_mask = BitBoard::new(1u64 << ((rank + 1) * 8 + file));
-                if (front_mask & white_pawns) != BitBoard::new(0) {
-                    can_advance = false;
+            // Backward pawns (no support AND can't advance safely)
+            // Check if this pawn is NOT supported
+            if (sq_bb & white_pawn_support).0 == 0 {
+                let push_sq = WHITE_PAWN_PUSHES[sq_idx];
+                // Only check if push square exists
+                if push_sq.0 != 0 {
+                    // Check if push is blocked or attacked
+                    if (push_sq & (black_pawns | black_pawn_attacks)).0 != 0 {
+                        score -= 8;
+                    }
                 }
-
-                let enemy_mask = if file > 0 {
-                    BitBoard::new(1u64 << ((rank + 1) * 8 + file - 1))
-                } else {
-                    BitBoard::new(0)
-                } | if file < 7 {
-                    BitBoard::new(1u64 << ((rank + 1) * 8 + file + 1))
-                } else {
-                    BitBoard::new(0)
-                };
-
-                if (enemy_mask & black_pawns) != BitBoard::new(0) {
-                    can_advance = false;
-                }
-            }
-
-            if !can_advance && !supported {
-                score -= 10;
-            }
-        }
-
-        let is_backward = if file > 0 && file < 7 {
-            let left_support =
-                white_file_counts[file - 1] > 0 && white_file_ranks[file - 1] < rank as u8;
-            let right_support =
-                white_file_counts[file + 1] > 0 && white_file_ranks[file + 1] < rank as u8;
-            let left_enemy =
-                black_file_counts[file - 1] > 0 && black_file_ranks[file - 1] >= rank as u8;
-            let right_enemy =
-                black_file_counts[file + 1] > 0 && black_file_ranks[file + 1] >= rank as u8;
-
-            !left_support && !right_support && (left_enemy || right_enemy)
-        } else if file == 0 {
-            let right_support = white_file_counts[1] > 0 && white_file_ranks[1] < rank as u8;
-            let right_enemy = black_file_counts[1] > 0 && black_file_ranks[1] >= rank as u8;
-            !right_support && right_enemy
-        } else {
-            let left_support = white_file_counts[6] > 0 && white_file_ranks[6] < rank as u8;
-            let left_enemy = black_file_counts[6] > 0 && black_file_ranks[6] >= rank as u8;
-            !left_support && left_enemy
-        };
-
-        if is_backward {
-            score -= 8;
-        }
-
-        if file > 0 {
-            let left_chain = unsafe { Square::new((sq_idx - 9) as u8) };
-            if rank > 0 && (BitBoard::from_square(left_chain) & white_pawns) != BitBoard::new(0) {
-                score += 3;
-            }
-        }
-        if file < 7 {
-            let right_chain = unsafe { Square::new((sq_idx - 7) as u8) };
-            if rank > 0 && (BitBoard::from_square(right_chain) & white_pawns) != BitBoard::new(0) {
-                score += 3;
             }
         }
     }
 
+    // Evaluate black pawns
     for square in black_pawns {
         let sq_idx = square.to_index();
-        let file = square.get_file().to_index();
         let rank = square.get_rank().to_index();
+        let sq_bb = BitBoard::from_square(square);
 
-        if (BLACK_PASSED_MASKS[sq_idx] & white_pawns) == BitBoard::new(0) {
-            let passed_bonus = [0, 80, 55, 35, 20, 10, 5, 0][rank];
-            score -= passed_bonus;
+        // Passed pawns
+        if (BLACK_PASSED_MASKS[sq_idx] & white_pawns).0 == 0 {
+            score -= [0, 80, 55, 35, 20, 10, 5, 0][rank];
+        }
+        
+        // Phalanx pawns
+        if (PHALANX_SQUARES[sq_idx] & black_pawns).0 != 0 {
+            score -= BLACK_PHALANX_BONUS[rank];
+        }
+        
+        // Connected pawns
+        if (BLACK_PAWN_SUPPORT_SQUARES[sq_idx] & black_pawns).0 != 0 {
+            score -= 3;
         } else {
-            let mut can_advance = true;
-            let mut supported = false;
-
-            if file > 0
-                && black_file_counts[file - 1] > 0
-                && black_file_ranks[file - 1] >= rank as u8
-            {
-                supported = true;
-            }
-            if file < 7
-                && black_file_counts[file + 1] > 0
-                && black_file_ranks[file + 1] >= rank as u8
-            {
-                supported = true;
-            }
-
-            if rank > 0 {
-                let front_mask = BitBoard::new(1u64 << ((rank - 1) * 8 + file));
-                if (front_mask & black_pawns) != BitBoard::new(0) {
-                    can_advance = false;
+            // Backward pawns
+            if (sq_bb & black_pawn_support).0 == 0 {
+                let push_sq = BLACK_PAWN_PUSHES[sq_idx];
+                if push_sq.0 != 0 {
+                    if (push_sq & (white_pawns | white_pawn_attacks)).0 != 0 {
+                        score += 8;
+                    }
                 }
-
-                let enemy_mask = if file > 0 {
-                    BitBoard::new(1u64 << ((rank - 1) * 8 + file - 1))
-                } else {
-                    BitBoard::new(0)
-                } | if file < 7 {
-                    BitBoard::new(1u64 << ((rank - 1) * 8 + file + 1))
-                } else {
-                    BitBoard::new(0)
-                };
-
-                if (enemy_mask & white_pawns) != BitBoard::new(0) {
-                    can_advance = false;
-                }
-            }
-
-            if !can_advance && !supported {
-                score += 10;
-            }
-        }
-
-        let is_backward = if file > 0 && file < 7 {
-            let left_support =
-                black_file_counts[file - 1] > 0 && black_file_ranks[file - 1] > rank as u8;
-            let right_support =
-                black_file_counts[file + 1] > 0 && black_file_ranks[file + 1] > rank as u8;
-            let left_enemy =
-                white_file_counts[file - 1] > 0 && white_file_ranks[file - 1] <= rank as u8;
-            let right_enemy =
-                white_file_counts[file + 1] > 0 && white_file_ranks[file + 1] <= rank as u8;
-
-            !left_support && !right_support && (left_enemy || right_enemy)
-        } else if file == 0 {
-            let right_support = black_file_counts[1] > 0 && black_file_ranks[1] > rank as u8;
-            let right_enemy = white_file_counts[1] > 0 && white_file_ranks[1] <= rank as u8;
-            !right_support && right_enemy
-        } else {
-            let left_support = black_file_counts[6] > 0 && black_file_ranks[6] > rank as u8;
-            let left_enemy = white_file_counts[6] > 0 && white_file_ranks[6] <= rank as u8;
-            !left_support && left_enemy
-        };
-
-        if is_backward {
-            score += 8;
-        }
-
-        if file > 0 {
-            let left_chain = unsafe { Square::new((sq_idx + 7) as u8) };
-            if rank < 7 && (BitBoard::from_square(left_chain) & black_pawns) != BitBoard::new(0) {
-                score -= 3;
-            }
-        }
-        if file < 7 {
-            let right_chain = unsafe { Square::new((sq_idx + 9) as u8) };
-            if rank < 7 && (BitBoard::from_square(right_chain) & black_pawns) != BitBoard::new(0) {
-                score -= 3;
             }
         }
     }
