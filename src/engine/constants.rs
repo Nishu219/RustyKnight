@@ -5,7 +5,6 @@ pub const INITIAL_WINDOW: i32 = 50;
 pub const MAX_WINDOW: i32 = 400;
 pub const STATS: bool = true;
 pub const LMR_FULL_DEPTH_MOVES: usize = 4;
-pub const LMR_REDUCTION_LIMIT: usize = 5;
 pub const NULL_MOVE_DEPTH: usize = 3;
 pub const IID_DEPTH: usize = 4;
 pub const RAZOR_DEPTH: usize = 4;
