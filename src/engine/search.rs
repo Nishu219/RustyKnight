@@ -596,24 +596,18 @@ fn negamax(
 
         // LMR
         if depth >= 3 && i >= LMR_FULL_DEPTH_MOVES && is_quiet && !gives_check {
-            let mut r: usize = 1;
+            // formula-based LMR
+            let mut r_f = 0.75 + (depth as f32).ln() * (i as f32).ln() / 2.25;
 
-            if i >= 6 { r += 1; }
-            if i >= 12 { r += 1; }
-            if i >= 24 { r += 1; }
+            if !is_pv { r_f += 0.5; }
+            if !improving { r_f += 0.5; }
 
-            if !improving { r += 1; }
-            if !is_pv { r += 1; }
-            if depth > 8 { r += 1; }
+            let history_score = HISTORY_HEURISTIC.lock().unwrap()[mv.get_source().to_index()][mv.get_dest().to_index()];
+            r_f -= history_score as f32 / 8192.0;
 
-            let history = HISTORY_HEURISTIC.lock().unwrap();
-            let from_sq = mv.get_source().to_index();
-            let to_sq = mv.get_dest().to_index();
-            if history[from_sq][to_sq] > 1000 {
-                r = r.saturating_sub(1);
-            }
+            let mut r = r_f.max(0.0) as usize;
 
-            r = r.min(LMR_REDUCTION_LIMIT).min(new_depth.saturating_sub(1));
+            r = r.min(depth.saturating_sub(1));
             new_depth = new_depth.saturating_sub(r);
             do_full_search = false;
         }
