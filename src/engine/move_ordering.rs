@@ -1,19 +1,10 @@
 use chess::{BitBoard, Board, ChessMove, Color, Piece, Square};
 use lazy_static::lazy_static;
-use std::collections::HashMap;
 use std::sync::Mutex;
 
+pub const PIECE_VALUES: [i32; 6] = [100, 320, 330, 500, 900, 0];
+
 lazy_static! {
-    pub static ref VALUES: HashMap<Piece, i32> = {
-        let mut m = HashMap::new();
-        m.insert(Piece::Pawn, 100);
-        m.insert(Piece::Knight, 320);
-        m.insert(Piece::Bishop, 330);
-        m.insert(Piece::Rook, 500);
-        m.insert(Piece::Queen, 900);
-        m.insert(Piece::King, 0);
-        m
-    };
     pub static ref KILLER_MOVES: Mutex<Vec<Vec<ChessMove>>> = Mutex::new(Vec::new());
     pub static ref HISTORY_HEURISTIC: Mutex<[[i32; 64]; 64]> = Mutex::new([[0; 64]; 64]);
     pub static ref COUNTER_MOVES: Mutex<[[Option<ChessMove>; 64]; 64]> = Mutex::new([[None; 64]; 64]);
@@ -37,7 +28,8 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
         None => {
             // Handle en passant
             if mv.get_promotion().is_some() {
-                return VALUES[&Piece::Queen] - VALUES[&Piece::Pawn] >= threshold;
+                return PIECE_VALUES[Piece::Queen.to_index()] - PIECE_VALUES[Piece::Pawn.to_index()]
+                    >= threshold;
             }
             return false; // Not a capture
         }
@@ -48,8 +40,8 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
         None => return false,
     };
 
-    let mut see_value = VALUES[&captured_piece];
-    let mut trophy_value = VALUES[&moving_piece];
+    let mut see_value = PIECE_VALUES[captured_piece.to_index()];
+    let mut trophy_value = PIECE_VALUES[moving_piece.to_index()];
 
     // Quick exit: obviously winning capture (e.g., PxQ)
     if see_value - trophy_value >= threshold {
@@ -80,7 +72,7 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
 
     // Early cutoff: can opponent's pawn capture and cause immediate fail?
     if attacks_opponent != BitBoard::new(0)
-        && see_value - trophy_value + VALUES[&Piece::Pawn] < threshold
+        && see_value - trophy_value + PIECE_VALUES[Piece::Pawn.to_index()] < threshold
     {
         return false;
     }
@@ -139,7 +131,7 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
         {
             // Opponent captures
             see_value -= trophy_value;
-            trophy_value = VALUES[&attacker_piece];
+            trophy_value = PIECE_VALUES[attacker_piece.to_index()];
 
             // Remove attacker from board
             let attacker_bb = BitBoard::from_square(attacker_sq);
@@ -176,7 +168,7 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
         ) {
             // Side-to-move recaptures
             see_value += trophy_value;
-            trophy_value = VALUES[&attacker_piece];
+            trophy_value = PIECE_VALUES[attacker_piece.to_index()];
 
             // Remove attacker from board
             let attacker_bb = BitBoard::from_square(attacker_sq);
@@ -373,15 +365,15 @@ fn get_king_attacks(square: Square) -> BitBoard {
 }
 pub fn mvv_lva_score(board: &Board, mv: ChessMove) -> i32 {
     let victim_value = if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
-        VALUES[&captured_piece]
+        PIECE_VALUES[captured_piece.to_index()]
     } else if mv.get_promotion().is_some() {
-        VALUES[&Piece::Queen] // Assume queen promotion
+        PIECE_VALUES[Piece::Queen.to_index()]
     } else {
         0
     };
 
     let attacker_value = if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
-        VALUES[&attacker_piece]
+        PIECE_VALUES[attacker_piece.to_index()]
     } else {
         0
     };
