@@ -1,5 +1,5 @@
 use crate::engine::constants::*;
-use crate::engine::move_ordering::VALUES;
+use crate::engine::move_ordering::PIECE_VALUES;
 use chess::{BitBoard, Board, Color, MoveGen, Piece, Rank, File, Square};
 use lazy_static::lazy_static;
 use std::sync::Mutex;
@@ -373,13 +373,13 @@ fn compute_material_key(board: &Board) -> u64 {
 }
 fn compute_material_eval(board: &Board) -> i32 {
     let mut material = 0;
-    for (&piece, &value) in VALUES.iter() {
+    for piece in chess::ALL_PIECES {
+        let value = PIECE_VALUES[piece.to_index()];
         let white_count =
             (board.pieces(piece) & board.color_combined(Color::White)).popcnt() as i32;
         let black_count =
             (board.pieces(piece) & board.color_combined(Color::Black)).popcnt() as i32;
-        material += white_count * value;
-        material -= black_count * value;
+        material += (white_count - black_count) * value;
     }
     material
 }
@@ -1071,7 +1071,6 @@ fn get_king_shield_score(king_sq: Square, friendly_pawns: BitBoard, color: Color
     }
     score
 }
-
 pub fn evaluate(board: &Board, contempt: i32) -> i32 {
     let in_check = *board.checkers() != BitBoard(0);
     let has_legal_moves = MoveGen::new_legal(board).next().is_some();
@@ -1172,6 +1171,4 @@ pub fn evaluate(board: &Board, contempt: i32) -> i32 {
     };
     final_score
 }
-
-
 
