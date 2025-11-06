@@ -1,29 +1,19 @@
-use chess::{BitBoard, Board, Color, Piece, Square};
+use chess::{BitBoard, Board, Color, Square};
 use lazy_static::lazy_static;
 use rand::Rng;
-use std::collections::HashMap;
 
 lazy_static! {
-    pub static ref ZOBRIST_PIECES: HashMap<(Piece, Color), Vec<u64>> = {
+    pub static ref ZOBRIST_PIECES: [[[u64; 64]; 2]; 6] = {
         let mut rng = rand::thread_rng();
-        let mut m = HashMap::new();
-        for piece in &[
-            Piece::Pawn,
-            Piece::Knight,
-            Piece::Bishop,
-            Piece::Rook,
-            Piece::Queen,
-            Piece::King,
-        ] {
-            for color in &[Color::White, Color::Black] {
-                let mut v = Vec::with_capacity(64);
-                for _ in 0..64 {
-                    v.push(rng.gen::<u64>());
+        let mut arr = [[[0; 64]; 2]; 6];
+        for piece in 0..6 {
+            for color in 0..2 {
+                for square in 0..64 {
+                    arr[piece][color][square] = rng.gen::<u64>();
                 }
-                m.insert((*piece, *color), v);
             }
         }
-        m
+        arr
     };
     pub static ref ZOBRIST_CASTLING: Vec<u64> = {
         let mut rng = rand::thread_rng();
@@ -49,7 +39,7 @@ pub fn compute_zobrist_hash(board: &Board) -> u64 {
             } else {
                 Color::Black
             };
-            h ^= ZOBRIST_PIECES[&(piece, piece_color)][sq_idx as usize];
+            h ^= ZOBRIST_PIECES[piece.to_index()][piece_color.to_index()][sq_idx as usize];
         }
     }
     let mut castling_rights = 0;
