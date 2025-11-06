@@ -36,3 +36,5 @@ pub const SINGULAR_DEPTH: usize = 8;
 pub const SINGULAR_MARGIN_MULTIPLIER: i32 = 2;
 pub const DOUBLE_EXTENSION_MARGIN: i32 = 16;
 pub const DOUBLE_EXTENSION_DEPTH: usize = 6;
+pub const WHITE_PHALANX_BONUS: [i32; 8] = [0, 3, 5, 8, 12, 18, 25, 0,];
+pub const BLACK_PHALANX_BONUS: [i32; 8] = [0, 25, 18, 12, 8, 5, 3, 0,];
