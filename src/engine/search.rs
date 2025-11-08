@@ -595,22 +595,42 @@ fn negamax(
         let mut do_full_search = true;
 
         // LMR
-        if depth >= 3 && i >= LMR_FULL_DEPTH_MOVES && is_quiet && !gives_check {
-            // formula-based LMR
-            let mut r_f = 0.75 + (depth as f32).ln() * (i as f32).ln() / 2.25;
+         if depth >= 3 && i >= LMR_FULL_DEPTH_MOVES && is_quiet && !gives_check {
+        // Base formula 
+        let mut r_f = 0.55 + (depth as f32).ln() * (i as f32).ln() / 1.85;
 
-            if !is_pv { r_f += 0.5; }
-            if !improving { r_f += 0.5; }
-
-            let history_score = HISTORY_HEURISTIC.lock().unwrap()[mv.get_source().to_index()][mv.get_dest().to_index()];
-            r_f -= history_score as f32 / 8192.0;
-
-            let mut r = r_f.max(0.0) as usize;
-
-            r = r.min(depth.saturating_sub(1));
-            new_depth = new_depth.saturating_sub(r);
-            do_full_search = false;
+        // PV nodes need less reduction
+        if !is_pv { 
+            r_f += 0.70; 
+        } else {
+            r_f -= 0.20;
         }
+    
+        // Reduce more when not improving
+        if !improving { 
+            r_f += 0.65; 
+        }
+    
+        // History-based adjustments with better scaling
+        let history_score = HISTORY_HEURISTIC.lock().unwrap()[mv.get_source().to_index()][mv.get_dest().to_index()];
+        let history_bonus = (history_score as f32 / 7000.0).clamp(-1.25, 1.25);
+        r_f -= history_bonus;
+    
+        if (static_eval - alpha).abs() > 150 {
+            r_f -= 0.25; 
+        }
+    
+        // Reduce more for very late moves
+        if i > 15 {
+            r_f += 0.5;
+        }
+
+        let mut r = r_f.max(0.0) as usize;
+
+        r = r.min(depth.saturating_sub(1));
+        new_depth = new_depth.saturating_sub(r);
+        do_full_search = false;
+    }
 
         // Multi-Cut
         if !is_pv && depth >= multi_cut_depth && i >= cut_threshold && !is_capture && cut_count > 0
