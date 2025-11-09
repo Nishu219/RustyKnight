@@ -1090,6 +1090,61 @@ fn get_king_shield_score(king_sq: Square, friendly_pawns: BitBoard, color: Color
     }
     score
 }
+fn evaluate_bad_bishops(board: &Board, phase: i32) -> i32 {
+    if phase < 8 {
+        return 0;
+    }
+    const DARK_SQUARES: BitBoard = BitBoard(0xAA55AA55AA55AA55);
+
+    let mut score = 0;
+
+    // White's bad bishops
+    let white_bishops = board.pieces(Piece::Bishop) & board.color_combined(Color::White);
+    if white_bishops != BitBoard::new(0) {
+        let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+        let white_pawns_on_dark = (white_pawns & DARK_SQUARES).popcnt();
+        let white_pawns_on_light = white_pawns.popcnt() - white_pawns_on_dark;
+
+        for bishop_sq in white_bishops {
+            if (BitBoard::from_square(bishop_sq) & DARK_SQUARES) != BitBoard::new(0) {
+                // Bishop on dark square
+                if white_pawns_on_dark > 3 {
+                    score -= 10;
+                }
+            } else {
+                // Bishop on light square
+                if white_pawns_on_light > 3 {
+                    score -= 10;
+                }
+            }
+        }
+    }
+
+    // Black's bad bishops
+    let black_bishops = board.pieces(Piece::Bishop) & board.color_combined(Color::Black);
+    if black_bishops != BitBoard::new(0) {
+        let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+        let black_pawns_on_dark = (black_pawns & DARK_SQUARES).popcnt();
+        let black_pawns_on_light = black_pawns.popcnt() - black_pawns_on_dark;
+
+        for bishop_sq in black_bishops {
+            if (BitBoard::from_square(bishop_sq) & DARK_SQUARES) != BitBoard::new(0) {
+                // Bishop on dark square
+                if black_pawns_on_dark > 3 {
+                    score += 10;
+                }
+            } else {
+                // Bishop on light square
+                if black_pawns_on_light > 3 {
+                    score += 10;
+                }
+            }
+        }
+    }
+
+    (score * phase) / 24
+}
+
 pub fn evaluate(board: &Board, contempt: i32) -> i32 {
     let in_check = *board.checkers() != BitBoard(0);
     let has_legal_moves = MoveGen::new_legal(board).next().is_some();
@@ -1176,6 +1231,7 @@ pub fn evaluate(board: &Board, contempt: i32) -> i32 {
     score += evaluate_king_pawn_shield(board, phase);
     score += evaluate_mobility(board, phase);
     score += evaluate_space(board, phase);
+    score += evaluate_bad_bishops(board, phase);
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
         score += ((25 * phase) + (40 * (24 - phase))) / 24;
     }
