@@ -4,9 +4,8 @@ use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILL
 use crate::engine::transposition_table::{TranspositionTable, TTFlag};
 use crate::engine::zobrist::compute_zobrist_hash;
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
-use lazy_static::lazy_static;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::cell::RefCell;
 use std::time::Instant;
 #[derive(Default, Clone)]
 pub struct SearchStats {
@@ -16,25 +15,27 @@ pub struct SearchStats {
     pub seldepth: usize,
 }
 
-lazy_static! {
-    pub static ref REPETITION_TABLE: Mutex<HashMap<u64, usize>> = Mutex::new(HashMap::new());
-    pub static ref TRANSPOSITION_TABLE: Mutex<TranspositionTable> =
-        Mutex::new(TranspositionTable::new(256));
+thread_local! {
+    pub static REPETITION_TABLE: RefCell<HashMap<u64, usize>> = RefCell::new(HashMap::new());
+    pub static TRANSPOSITION_TABLE: RefCell<TranspositionTable> = RefCell::new(TranspositionTable::new(256));
 }
 
 fn is_repetition(position_hash: u64) -> bool {
-    let rep_table = REPETITION_TABLE.lock().unwrap();
-    *rep_table.get(&position_hash).unwrap_or(&0) >= 2
+    REPETITION_TABLE.with(|table| {
+        *table.borrow().get(&position_hash).unwrap_or(&0) >= 2
+    })
 }
 
 pub fn update_repetition_table(position_hash: u64) {
-    let mut rep_table = REPETITION_TABLE.lock().unwrap();
-    *rep_table.entry(position_hash).or_insert(0) += 1;
+    REPETITION_TABLE.with(|table| {
+        *table.borrow_mut().entry(position_hash).or_insert(0) += 1;
+    });
 }
 
 pub fn clear_repetition_table() {
-    let mut rep_table = REPETITION_TABLE.lock().unwrap();
-    rep_table.clear();
+    REPETITION_TABLE.with(|table| {
+        table.borrow_mut().clear();
+    });
 }
 
 fn quiesce(
@@ -469,15 +470,15 @@ fn negamax(
                         contempt,
                     );
                     
-                    {
-                        let mut rep_table = REPETITION_TABLE.lock().unwrap();
+                    REPETITION_TABLE.with(|rep_table| {
+                        let mut rep_table = rep_table.borrow_mut();
                         if let Some(count) = rep_table.get_mut(&new_position_hash) {
                             *count = count.saturating_sub(1);
                             if *count == 0 {
                                 rep_table.remove(&new_position_hash);
                             }
                         }
-                    }
+                    });
                     
                     if *timeout_occurred {
                         break;
@@ -612,8 +613,10 @@ fn negamax(
         }
     
         // History-based adjustments with better scaling
-        let history_score = HISTORY_HEURISTIC.lock().unwrap()[mv.get_source().to_index()][mv.get_dest().to_index()];
-        let history_bonus = (history_score as f32 / 7000.0).clamp(-1.25, 1.25);
+        let history_bonus = HISTORY_HEURISTIC.with(|history| {
+            let history_score = history.borrow()[mv.get_source().to_index()][mv.get_dest().to_index()];
+            (history_score as f32 / 7000.0).clamp(-1.25, 1.25)
+        });
         r_f -= history_bonus;
     
         if (static_eval - alpha).abs() > 150 {
@@ -652,26 +655,30 @@ fn negamax(
             );
 
             if *timeout_occurred {
-                let mut rep_table = REPETITION_TABLE.lock().unwrap();
-                if let Some(count) = rep_table.get_mut(&new_position_hash) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        rep_table.remove(&new_position_hash);
-                    }
-                }
-                break;
-            }
-
-            if multi_cut_score >= beta {
-                cut_count += 1;
-                if cut_count >= cut_threshold {
-                    let mut rep_table = REPETITION_TABLE.lock().unwrap();
+                REPETITION_TABLE.with(|rep_table| {
+                    let mut rep_table = rep_table.borrow_mut();
                     if let Some(count) = rep_table.get_mut(&new_position_hash) {
                         *count = count.saturating_sub(1);
                         if *count == 0 {
                             rep_table.remove(&new_position_hash);
                         }
                     }
+                });
+                break;
+            }
+
+            if multi_cut_score >= beta {
+                cut_count += 1;
+                if cut_count >= cut_threshold {
+                    REPETITION_TABLE.with(|rep_table| {
+                        let mut rep_table = rep_table.borrow_mut();
+                        if let Some(count) = rep_table.get_mut(&new_position_hash) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                rep_table.remove(&new_position_hash);
+                            }
+                        }
+                    });
                     return beta;
                 }
             }
@@ -763,15 +770,15 @@ fn negamax(
             }
         };
 
-        {
-            let mut rep_table = REPETITION_TABLE.lock().unwrap();
+        REPETITION_TABLE.with(|rep_table| {
+            let mut rep_table = rep_table.borrow_mut();
             if let Some(count) = rep_table.get_mut(&new_position_hash) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     rep_table.remove(&new_position_hash);
                 }
             }
-        }
+        });
 
         if *timeout_occurred {
             break;
@@ -792,8 +799,8 @@ fn negamax(
 
             if is_quiet {
                 // Killer moves
-                {
-                    let mut killers = KILLER_MOVES.lock().unwrap();
+                KILLER_MOVES.with(|killers| {
+                    let mut killers = killers.borrow_mut();
                     if ply < 64 && killers.len() > ply {
                         if killers[ply].is_empty() || killers[ply][0] != *mv {
                             if killers[ply].len() >= 2 {
@@ -809,11 +816,11 @@ fn negamax(
                             }
                         }
                     }
-                }
+                });
 
                 // History heuristic
-                {
-                    let mut history = HISTORY_HEURISTIC.lock().unwrap();
+                HISTORY_HEURISTIC.with(|history| {
+                    let mut history = history.borrow_mut();
                     let bonus = (depth * depth) as i32;
                     let from_sq = mv.get_source().to_index();
                     let to_sq = mv.get_dest().to_index();
@@ -822,21 +829,23 @@ fn negamax(
                     if history[from_sq][to_sq] > 10000 {
                         history[from_sq][to_sq] = 10000;
                     }
-                }
+                });
 
                 // Reduce history for failed moves
                 for prev_mv in &moves[0..i] {
                     if board.piece_on(prev_mv.get_dest()).is_none()
                         && prev_mv.get_promotion().is_none()
                     {
-                        let mut history = HISTORY_HEURISTIC.lock().unwrap();
-                        let prev_from_sq = prev_mv.get_source().to_index();
-                        let prev_to_sq = prev_mv.get_dest().to_index();
-                        history[prev_from_sq][prev_to_sq] -= (depth * depth / 4) as i32;
+                        HISTORY_HEURISTIC.with(|history| {
+                            let mut history = history.borrow_mut();
+                            let prev_from_sq = prev_mv.get_source().to_index();
+                            let prev_to_sq = prev_mv.get_dest().to_index();
+                            history[prev_from_sq][prev_to_sq] -= (depth * depth / 4) as i32;
 
-                        if history[prev_from_sq][prev_to_sq] < -1000 {
-                            history[prev_from_sq][prev_to_sq] = -1000;
-                        }
+                            if history[prev_from_sq][prev_to_sq] < -1000 {
+                                history[prev_from_sq][prev_to_sq] = -1000;
+                            }
+                        });
                     }
                 }
             }
@@ -876,10 +885,11 @@ pub fn iterative_deepening(
     let mut best_move = None;
     let mut best_score = 0;
     let root_color = board.side_to_move();
-    let mut tt_guard = TRANSPOSITION_TABLE.lock().unwrap();
-    let mut stats = SearchStats::default();
-    for depth in 1..=MAX_DEPTH {
-        let elapsed = start_time.elapsed().as_secs_f64();
+    TRANSPOSITION_TABLE.with(|tt| {
+        let mut tt_guard = tt.borrow_mut();
+        let mut stats = SearchStats::default();
+        for depth in 1..=MAX_DEPTH {
+            let elapsed = start_time.elapsed().as_secs_f64();
         let time_limit = if is_movetime {
             max_time * 0.95
         } else {
@@ -919,7 +929,7 @@ pub fn iterative_deepening(
                 0,
                 &mut stats,
                 root_color,
-                &mut *tt_guard,
+                &mut tt_guard,
                 max_time,
                 &mut timeout_occurred,
                 None,
@@ -1064,5 +1074,6 @@ pub fn iterative_deepening(
     best_move.or_else(|| {
         let moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
         moves.first().copied()
+    })
     })
 }

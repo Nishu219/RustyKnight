@@ -46,10 +46,9 @@ impl UCIEngine {
                     if let Ok(size) = tokens[4].parse::<usize>() {
                         let clamped_size = size.max(1).min(4096);
                         self.hash_size = clamped_size;
-                        {
-                            let mut tt = TRANSPOSITION_TABLE.lock().unwrap();
-                            *tt = TranspositionTable::new(clamped_size);
-                        }
+                        TRANSPOSITION_TABLE.with(|tt| {
+                            *tt.borrow_mut() = TranspositionTable::new(clamped_size);
+                        });
                     }
                 }
                 "contempt" => {
@@ -258,28 +257,25 @@ impl UCIEngine {
                     self.position_history.clear();
                     self.position_history
                         .push(compute_zobrist_hash(&self.board));
-                    {
-                        let mut tt = TRANSPOSITION_TABLE.lock().unwrap();
+                    TRANSPOSITION_TABLE.with(|tt| {
+                        let mut tt = tt.borrow_mut();
                         *tt = TranspositionTable::new(self.hash_size);
                         tt.clear();
-                    }
-                    {
-                        let mut killers = KILLER_MOVES.lock().unwrap();
+                    });
+                    KILLER_MOVES.with(|killers| {
+                        let mut killers = killers.borrow_mut();
                         killers.clear();
                         killers.resize(MAX_DEPTH, Vec::new());
-                    }
-                    {
-                        let mut history = HISTORY_HEURISTIC.lock().unwrap();
-                        *history = [[0; 64]; 64];
-                    }
-                    {
-                        let mut material_table = MATERIAL_HASH_TABLE.lock().unwrap();
-                        *material_table = MaterialHashTable::new(16);
-                    }
-                    {
-                        let mut pawn_table = PAWN_HASH_TABLE.lock().unwrap();
-                        pawn_table.clear();
-                    }
+                    });
+                    HISTORY_HEURISTIC.with(|history| {
+                        *history.borrow_mut() = [[0; 64]; 64];
+                    });
+                    MATERIAL_HASH_TABLE.with(|material_table| {
+                        *material_table.borrow_mut() = MaterialHashTable::new(16);
+                    });
+                    PAWN_HASH_TABLE.with(|pawn_table| {
+                        pawn_table.borrow_mut().clear();
+                    });
                     clear_repetition_table();
                     clear_counter_moves();
                 }
