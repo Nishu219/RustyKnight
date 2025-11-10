@@ -2,7 +2,12 @@ use crate::engine::constants::*;
 use crate::engine::move_ordering::PIECE_VALUES;
 use chess::{BitBoard, Board, Color, MoveGen, Piece, Rank, File, Square};
 use lazy_static::lazy_static;
-use std::sync::Mutex;
+use std::cell::RefCell;
+
+thread_local! {
+    pub static MATERIAL_HASH_TABLE: RefCell<MaterialHashTable> = RefCell::new(MaterialHashTable::new(16));
+    pub static PAWN_HASH_TABLE: RefCell<PawnHashTable> = RefCell::new(PawnHashTable::new(16));
+}
 
 // Piece-Square Tables
 // Indexed as [piece_index][phase_index][square_index]
@@ -184,10 +189,6 @@ pub fn piece_to_index(piece: Piece) -> usize {
 }
 
 lazy_static! {
-    pub static ref MATERIAL_HASH_TABLE: Mutex<MaterialHashTable> =
-        Mutex::new(MaterialHashTable::new(16));
-    pub static ref PAWN_HASH_TABLE: Mutex<PawnHashTable> =
-        Mutex::new(PawnHashTable::new(16));
     pub static ref FILE_MASKS: [BitBoard; 8] = [
         BitBoard::new(0x0101010101010101),
         BitBoard::new(0x0202020202020202),
@@ -552,11 +553,11 @@ fn evaluate_rooks(board: &Board) -> i32 {
 fn evaluate_pawns(board: &Board) -> i32 {
     let pawn_hash = compute_pawn_hash(board);
 
-    {
-        let cache = PAWN_HASH_TABLE.lock().unwrap();
-        if let Some(cached_score) = cache.lookup(pawn_hash) {
-            return cached_score;
-        }
+    let cached_score = PAWN_HASH_TABLE.with(|cache| {
+        cache.borrow().lookup(pawn_hash)
+    });
+    if let Some(score) = cached_score {
+        return score;
     }
 
     let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
@@ -687,10 +688,9 @@ fn evaluate_pawns(board: &Board) -> i32 {
         }
     }
 
-    {
-        let mut cache = PAWN_HASH_TABLE.lock().unwrap();
-        cache.store(pawn_hash, score);
-    }
+    PAWN_HASH_TABLE.with(|cache| {
+        cache.borrow_mut().store(pawn_hash, score);
+    });
 
     score
 }
@@ -1156,16 +1156,17 @@ pub fn evaluate(board: &Board, contempt: i32) -> i32 {
             if board.side_to_move() == Color::White { contempt } else { -contempt }
         };
     }
-    let material_hash_table = MATERIAL_HASH_TABLE.lock().unwrap();
     let material_key = compute_material_key(board);
-    let material = material_hash_table.lookup(material_key);
-    drop(material_hash_table);
+    let material = MATERIAL_HASH_TABLE.with(|table| {
+        table.borrow().lookup(material_key)
+    });
     let material = match material {
         Some(m) => m,
         None => {
             let m = compute_material_eval(board);
-            let mut material_hash_table = MATERIAL_HASH_TABLE.lock().unwrap();
-            material_hash_table.store(material_key, m);
+            MATERIAL_HASH_TABLE.with(|table| {
+                table.borrow_mut().store(material_key, m);
+            });
             m
         }
     };
