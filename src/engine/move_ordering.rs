@@ -1,13 +1,12 @@
 use chess::{BitBoard, Board, ChessMove, Color, Piece, Square};
-use lazy_static::lazy_static;
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 pub const PIECE_VALUES: [i32; 6] = [100, 320, 330, 500, 900, 0];
 
-lazy_static! {
-    pub static ref KILLER_MOVES: Mutex<Vec<Vec<ChessMove>>> = Mutex::new(Vec::new());
-    pub static ref HISTORY_HEURISTIC: Mutex<[[i32; 64]; 64]> = Mutex::new([[0; 64]; 64]);
-    pub static ref COUNTER_MOVES: Mutex<[[Option<ChessMove>; 64]; 64]> = Mutex::new([[None; 64]; 64]);
+thread_local! {
+    pub static KILLER_MOVES: RefCell<Vec<Vec<ChessMove>>> = RefCell::new(Vec::new());
+    pub static HISTORY_HEURISTIC: RefCell<[[i32; 64]; 64]> = RefCell::new([[0; 64]; 64]);
+    pub static COUNTER_MOVES: RefCell<[[Option<ChessMove>; 64]; 64]> = RefCell::new([[None; 64]; 64]);
 }
 
 /// Static Exchange Evaluation with Threshold
@@ -411,27 +410,30 @@ pub fn order_moves(
                 if *new_board.checkers() != BitBoard(0) {
                     8000000
                 } else {
-                    let history = HISTORY_HEURISTIC.lock().unwrap();
-                    
-                    // Counter-move heuristic (between killers and history)
-                    if Some(mv) == counter_move {
-                        6500000  // Score between first killer and second killer
-                    } else if depth < 64 {
-                        let killers = KILLER_MOVES.lock().unwrap();
-                        if killers.len() > depth {
-                            if killers[depth].len() > 0 && killers[depth][0] == mv {
-                                7000000
-                            } else if killers[depth].len() > 1 && killers[depth][1] == mv {
-                                6000000
-                            } else {
-                                history[mv.get_source().to_index()][mv.get_dest().to_index()]
-                            }
+                    HISTORY_HEURISTIC.with(|history| {
+                        let history = history.borrow();
+                        // Counter-move heuristic (between killers and history)
+                        if Some(mv) == counter_move {
+                            6500000  // Score between first killer and second killer
+                        } else if depth < 64 {
+                            KILLER_MOVES.with(|killers| {
+                                let killers = killers.borrow();
+                                if killers.len() > depth {
+                                    if killers[depth].len() > 0 && killers[depth][0] == mv {
+                                        7000000
+                                    } else if killers[depth].len() > 1 && killers[depth][1] == mv {
+                                        6000000
+                                    } else {
+                                        history[mv.get_source().to_index()][mv.get_dest().to_index()]
+                                    }
+                                } else {
+                                    history[mv.get_source().to_index()][mv.get_dest().to_index()]
+                                }
+                            })
                         } else {
                             history[mv.get_source().to_index()][mv.get_dest().to_index()]
                         }
-                    } else {
-                        history[mv.get_source().to_index()][mv.get_dest().to_index()]
-                    }
+                    })
                 }
             };
             (mv, score)
@@ -447,8 +449,9 @@ pub fn update_counter_move(previous_move: Option<ChessMove>, refutation: ChessMo
         let from_sq = prev_mv.get_source().to_index();
         let to_sq = prev_mv.get_dest().to_index();
         
-        let mut counter_moves = COUNTER_MOVES.lock().unwrap();
-        counter_moves[from_sq][to_sq] = Some(refutation);
+        COUNTER_MOVES.with(|counter_moves| {
+            counter_moves.borrow_mut()[from_sq][to_sq] = Some(refutation);
+        });
     }
 }
 
@@ -457,13 +460,15 @@ pub fn get_counter_move(mv: ChessMove) -> Option<ChessMove> {
     let from_sq = mv.get_source().to_index();
     let to_sq = mv.get_dest().to_index();
     
-    let counter_moves = COUNTER_MOVES.lock().unwrap();
-    counter_moves[from_sq][to_sq]
+    COUNTER_MOVES.with(|counter_moves| {
+        counter_moves.borrow()[from_sq][to_sq]
+    })
 }
 
 /// Clear counter-moves table
 pub fn clear_counter_moves() {
-    let mut counter_moves = COUNTER_MOVES.lock().unwrap();
-    *counter_moves = [[None; 64]; 64];
+    COUNTER_MOVES.with(|counter_moves| {
+        *counter_moves.borrow_mut() = [[None; 64]; 64];
+    });
 }
 
