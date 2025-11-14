@@ -4,7 +4,8 @@ use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILL
 use crate::engine::transposition_table::{TranspositionTable, TTFlag};
 use crate::engine::zobrist::compute_zobrist_hash;
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
-use std::collections::HashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
+use lazy_static::lazy_static;
 use std::cell::RefCell;
 use std::time::Instant;
 #[derive(Default, Clone)]
@@ -15,27 +16,25 @@ pub struct SearchStats {
     pub seldepth: usize,
 }
 
+lazy_static! {
+    pub static ref REPETITION_TABLE: DashMap<u64, usize> = DashMap::new();
+}
 thread_local! {
-    pub static REPETITION_TABLE: RefCell<HashMap<u64, usize>> = RefCell::new(HashMap::new());
     pub static TRANSPOSITION_TABLE: RefCell<TranspositionTable> = RefCell::new(TranspositionTable::new(256));
 }
 
 fn is_repetition(position_hash: u64) -> bool {
-    REPETITION_TABLE.with(|table| {
-        *table.borrow().get(&position_hash).unwrap_or(&0) >= 2
-    })
+    REPETITION_TABLE
+        .get(&position_hash)
+        .map_or(false, |count| *count >= 2)
 }
 
 pub fn update_repetition_table(position_hash: u64) {
-    REPETITION_TABLE.with(|table| {
-        *table.borrow_mut().entry(position_hash).or_insert(0) += 1;
-    });
+        *REPETITION_TABLE.entry(position_hash).or_insert(0) += 1;
 }
 
 pub fn clear_repetition_table() {
-    REPETITION_TABLE.with(|table| {
-        table.borrow_mut().clear();
-    });
+    REPETITION_TABLE.clear();
 }
 
 fn quiesce(
@@ -470,15 +469,13 @@ fn negamax(
                         contempt,
                     );
                     
-                    REPETITION_TABLE.with(|rep_table| {
-                        let mut rep_table = rep_table.borrow_mut();
-                        if let Some(count) = rep_table.get_mut(&new_position_hash) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                rep_table.remove(&new_position_hash);
-                            }
+                    if let Entry::Occupied(mut entry) = REPETITION_TABLE.entry(new_position_hash) {
+                        let count = entry.get_mut();
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            entry.remove();
                         }
-                    });
+                    }
                     
                     if *timeout_occurred {
                         break;
@@ -655,30 +652,26 @@ fn negamax(
             );
 
             if *timeout_occurred {
-                REPETITION_TABLE.with(|rep_table| {
-                    let mut rep_table = rep_table.borrow_mut();
-                    if let Some(count) = rep_table.get_mut(&new_position_hash) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            rep_table.remove(&new_position_hash);
-                        }
+                if let Entry::Occupied(mut entry) = REPETITION_TABLE.entry(new_position_hash) {
+                    let count = entry.get_mut();
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        entry.remove();
                     }
-                });
+                }
                 break;
             }
 
             if multi_cut_score >= beta {
                 cut_count += 1;
                 if cut_count >= cut_threshold {
-                    REPETITION_TABLE.with(|rep_table| {
-                        let mut rep_table = rep_table.borrow_mut();
-                        if let Some(count) = rep_table.get_mut(&new_position_hash) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                rep_table.remove(&new_position_hash);
-                            }
+                    if let Entry::Occupied(mut entry) = REPETITION_TABLE.entry(new_position_hash) {
+                        let count = entry.get_mut();
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            entry.remove();
                         }
-                    });
+                    }
                     return beta;
                 }
             }
@@ -770,15 +763,13 @@ fn negamax(
             }
         };
 
-        REPETITION_TABLE.with(|rep_table| {
-            let mut rep_table = rep_table.borrow_mut();
-            if let Some(count) = rep_table.get_mut(&new_position_hash) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    rep_table.remove(&new_position_hash);
-                }
+        if let Entry::Occupied(mut entry) = REPETITION_TABLE.entry(new_position_hash) {
+            let count = entry.get_mut();
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                entry.remove();
             }
-        });
+        }
 
         if *timeout_occurred {
             break;
