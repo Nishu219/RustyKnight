@@ -1,6 +1,6 @@
 use crate::engine::constants::*;
 use crate::engine::evaluation::evaluate;
-use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, PIECE_VALUES, update_counter_move};
+use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, PIECE_VALUES, update_counter_move, update_capture_history, penalize_capture_history};
 use crate::engine::transposition_table::{TranspositionTable, TTFlag};
 use crate::engine::zobrist::compute_zobrist_hash;
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
@@ -846,6 +846,17 @@ fn negamax(
                                 history[prev_from_sq][prev_to_sq] = -1000;
                             }
                         });
+                    }
+                }
+            }
+            else {
+                // Capture succeeded - update capture history
+                update_capture_history(*mv, board, depth, i > 0);
+                
+                // Penalize failed captures
+                for prev_mv in &moves[0..i] {
+                    if board.piece_on(prev_mv.get_dest()).is_some() || prev_mv.get_promotion().is_some() {
+                        penalize_capture_history(*prev_mv, board, depth);
                     }
                 }
             }
