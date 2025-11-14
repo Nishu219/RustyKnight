@@ -7,6 +7,7 @@ thread_local! {
     pub static KILLER_MOVES: RefCell<Vec<Vec<ChessMove>>> = RefCell::new(Vec::new());
     pub static HISTORY_HEURISTIC: RefCell<[[i32; 64]; 64]> = RefCell::new([[0; 64]; 64]);
     pub static COUNTER_MOVES: RefCell<[[Option<ChessMove>; 64]; 64]> = RefCell::new([[None; 64]; 64]);
+    pub static CAPTURE_HISTORY: RefCell<[[[i32; 64]; 6]; 6]> = RefCell::new([[[0; 64]; 6]; 6]);
 }
 
 /// Static Exchange Evaluation with Threshold
@@ -398,12 +399,16 @@ pub fn order_moves(
             let score = if Some(mv) == hash_move {
                 10000000
             } else if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
+                let base_mvv_lva = mvv_lva_score(board, mv);
+                let capture_hist = get_capture_history_score(mv, board);
+                
                 if see_capture(board, mv, 300) {
-                    9500000 + mvv_lva_score(board, mv)
+                    9500000 + base_mvv_lva + capture_hist
                 } else if see_capture(board, mv, 0) {
-                    7500000 + mvv_lva_score(board, mv)
+                    7500000 + base_mvv_lva + capture_hist
                 } else {
-                    500000
+                    // Bad capture - use capture history to differentiate
+                    500000 + capture_hist
                 }
             } else {
                 let new_board = board.make_move_new(mv);
@@ -412,9 +417,8 @@ pub fn order_moves(
                 } else {
                     HISTORY_HEURISTIC.with(|history| {
                         let history = history.borrow();
-                        // Counter-move heuristic (between killers and history)
                         if Some(mv) == counter_move {
-                            6500000  // Score between first killer and second killer
+                            6500000
                         } else if depth < 64 {
                             KILLER_MOVES.with(|killers| {
                                 let killers = killers.borrow();
@@ -442,7 +446,6 @@ pub fn order_moves(
     scored_moves.sort_by(|a, b| b.1.cmp(&a.1));
     scored_moves.into_iter().map(|(mv, _)| mv).collect()
 }
-
 /// Update counter-move heuristic when a move causes a beta cutoff
 pub fn update_counter_move(previous_move: Option<ChessMove>, refutation: ChessMove) {
     if let Some(prev_mv) = previous_move {
@@ -472,3 +475,77 @@ pub fn clear_counter_moves() {
     });
 }
 
+/// Update capture history when a capture causes a beta cutoff
+pub fn update_capture_history(mv: ChessMove, board: &Board, depth: usize, failed_quiets: bool) {
+    if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
+        if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
+            let attacker_idx = attacker_piece.to_index();
+            let victim_idx = captured_piece.to_index();
+            let to_sq = mv.get_dest().to_index();
+            
+            let bonus = if failed_quiets {
+                // Bonus when capture succeeds after quiets failed
+                (depth * depth + depth * 2) as i32
+            } else {
+                // Standard bonus
+                (depth * depth) as i32
+            };
+            
+            CAPTURE_HISTORY.with(|ch| {
+                let mut ch = ch.borrow_mut();
+                ch[attacker_idx][victim_idx][to_sq] += bonus;
+                
+                // Cap the value to prevent overflow
+                if ch[attacker_idx][victim_idx][to_sq] > 16000 {
+                    ch[attacker_idx][victim_idx][to_sq] = 16000;
+                }
+            });
+        }
+    }
+}
+
+/// Penalize capture history for failed captures
+pub fn penalize_capture_history(mv: ChessMove, board: &Board, depth: usize) {
+    if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
+        if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
+            let attacker_idx = attacker_piece.to_index();
+            let victim_idx = captured_piece.to_index();
+            let to_sq = mv.get_dest().to_index();
+            
+            let penalty = (depth * depth / 2) as i32;
+            
+            CAPTURE_HISTORY.with(|ch| {
+                let mut ch = ch.borrow_mut();
+                ch[attacker_idx][victim_idx][to_sq] -= penalty;
+                
+                // Floor the value
+                if ch[attacker_idx][victim_idx][to_sq] < -4000 {
+                    ch[attacker_idx][victim_idx][to_sq] = -4000;
+                }
+            });
+        }
+    }
+}
+
+/// Get capture history score for move ordering
+pub fn get_capture_history_score(mv: ChessMove, board: &Board) -> i32 {
+    if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
+        if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
+            let attacker_idx = attacker_piece.to_index();
+            let victim_idx = captured_piece.to_index();
+            let to_sq = mv.get_dest().to_index();
+            
+            return CAPTURE_HISTORY.with(|ch| {
+                ch.borrow()[attacker_idx][victim_idx][to_sq]
+            });
+        }
+    }
+    0
+}
+
+/// Clear capture history table
+pub fn clear_capture_history() {
+    CAPTURE_HISTORY.with(|ch| {
+        *ch.borrow_mut() = [[[0; 64]; 6]; 6];
+    });
+}
