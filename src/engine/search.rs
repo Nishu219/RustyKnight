@@ -506,6 +506,36 @@ fn negamax(
         }
     }
 
+    // Mate threat extension
+    let mut mate_threat_extension = 0;
+    if !is_pv 
+        && !in_check 
+        && depth >= MATE_THREAT_DEPTH 
+        && static_eval < beta - 300
+    {
+        if let Some(null_board) = board.null_move() {
+            let threat_score = -negamax(
+                &null_board,
+                depth.saturating_sub(3),
+                -beta,
+                -beta + 1,
+                start_time,
+                ply + 1,
+                stats,
+                root_color,
+                tt,
+                max_time,
+                timeout_occurred,
+                None,
+                contempt,
+            );
+            
+            if !*timeout_occurred && threat_score >= beta && threat_score.abs() > 29000 {
+                mate_threat_extension = 1;
+            }
+        }
+    }
+
     let mut moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
 
     if moves.is_empty() {
@@ -568,6 +598,34 @@ fn negamax(
             }
         }
 
+        // Futility move count pruning
+        if !is_pv && !in_check && is_quiet && depth <= 4 && moves_searched > 0 {
+            let futility_value = static_eval + FUTILITY_MARGINS[depth.min(4)];
+            if futility_value <= alpha {
+                let move_count_limit = FUTILITY_MOVE_COUNTS[depth.min(4)];
+                if quiet_moves_searched >= move_count_limit {
+                    continue;
+                }
+            }
+        }
+
+        // History leaf pruning
+        if !is_pv 
+            && !in_check 
+            && is_quiet 
+            && depth <= HISTORY_PRUNING_DEPTH 
+            && moves_searched > 0 
+            && !is_hash_move
+        {
+            let history_score = HISTORY_HEURISTIC.with(|history| {
+                history.borrow()[mv.get_source().to_index()][mv.get_dest().to_index()]
+            });
+            
+            if history_score < HISTORY_PRUNING_THRESHOLD {
+                continue;
+            }
+        }
+
         let new_board = board.make_move_new(*mv);
         let new_position_hash = compute_zobrist_hash(&new_board);
         update_repetition_table(new_position_hash);
@@ -575,10 +633,10 @@ fn negamax(
         let gives_check = *new_board.checkers() != BitBoard(0);
 
         // Extensions
-        let mut extension = 0;
+        let mut extension = mate_threat_extension;
         
         if is_hash_move && singular_extension > 0 {
-            extension = singular_extension;
+            extension = extension.max(singular_extension);
         } else if gives_check && see_capture(board, *mv, 0) {
             extension += 1;
         } else if let Some(piece) = board.piece_on(mv.get_source()) {
