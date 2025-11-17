@@ -1,5 +1,6 @@
 use chess::Piece;
 
+pub const MATE_THREAT_DEPTH: usize = 4;
 pub const MAX_DEPTH: usize = 99;
 pub const INITIAL_WINDOW: i32 = 50;
 pub const MAX_WINDOW: i32 = 400;
@@ -13,6 +14,9 @@ pub const DELTA_MARGIN: i32 = 200;
 pub const REVERSE_FUTILITY_DEPTH: usize = 6;
 pub const REVERSE_FUTILITY_MARGIN: i32 = 120;
 pub const FUTILITY_DEPTH: usize = 4;
+pub const HISTORY_PRUNING_DEPTH: usize = 3;
+pub const HISTORY_PRUNING_THRESHOLD: i32 = -800;
+pub const FUTILITY_MOVE_COUNTS: [usize; 5] = [0, 3, 5, 8, 12];
 pub const FUTILITY_MARGINS: [i32; 5] = [0, 200, 400, 600, 800];
 pub const LMP_DEPTH: usize = 4;
 pub const TROPISM_WEIGHTS: [(i32, i32); 4] = [(3, 2), (2, 3), (1, 1), (2, 1)];
