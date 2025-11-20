@@ -7,6 +7,7 @@ use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
 use std::collections::HashMap;
 use std::cell::RefCell;
 use std::time::Instant;
+
 #[derive(Default, Clone)]
 pub struct SearchStats {
     pub nodes: usize,
@@ -143,7 +144,6 @@ fn quiesce(
     alpha
 }
 
-
 fn negamax(
     board: &Board,
     depth: usize,
@@ -228,6 +228,7 @@ fn negamax(
         evaluate(board, contempt)
     };
 
+
     // Quiescence at leaf
     if depth == 0 {
         return quiesce(
@@ -242,15 +243,6 @@ fn negamax(
             ply,
         );
     }
-
-    // Calculate improving flag
-    let improving = !in_check && ply >= 2 && {
-        if let Some(tt_val) = tt_value {
-            static_eval > tt_val
-        } else {
-            true
-        }
-    };
 
     if !is_pv && !in_check {
         // Razoring
@@ -280,8 +272,8 @@ fn negamax(
 
         // Reverse futility pruning
         if depth <= REVERSE_FUTILITY_DEPTH {
-            let rfp_margin =
-                REVERSE_FUTILITY_MARGIN * depth as i32 + if improving { 50 } else { 0 };
+            let rfp_margin = REVERSE_FUTILITY_MARGIN * depth as i32;
+            
             if static_eval - rfp_margin >= beta {
                 return static_eval;
             }
@@ -297,9 +289,7 @@ fn negamax(
             if has_non_pawn_pieces {
                 let mut r = 3 + depth / 4;
                 r += ((static_eval - beta) / 200).min(3) as usize;
-                if !improving {
-                    r += 1;
-                }
+                r += 1;
                 if depth > 12 {
                     r += 1;
                 }
@@ -567,10 +557,10 @@ fn negamax(
         // Late move pruning
         if !is_pv && !in_check && is_quiet && depth <= LMP_DEPTH {
             let mut lmp_threshold = match depth {
-                1 => if improving { 4 } else { 3 },
-                2 => if improving { 7 } else { 6 },
-                3 => if improving { 13 } else { 12 },
-                4 => if improving { 20 } else { 18 },
+                1 => 3,
+                2 => 6,
+                3 => 12,
+                4 => 18,
                 _ => 25,
             };
 
@@ -587,10 +577,7 @@ fn negamax(
 
         // Futility pruning
         if !is_pv && !in_check && is_quiet && depth <= FUTILITY_DEPTH && i > 0 {
-            let mut futility_margin = FUTILITY_MARGINS[depth.min(4)];
-            if !improving {
-                futility_margin += 50;
-            }
+            let futility_margin = FUTILITY_MARGINS[depth.min(4)];
 
             let futility_value = static_eval + futility_margin;
             if futility_value <= alpha {
@@ -654,44 +641,39 @@ fn negamax(
         let mut do_full_search = true;
 
         // LMR
-         if depth >= 3 && i >= LMR_FULL_DEPTH_MOVES && is_quiet && !gives_check {
-        // Base formula 
-        let mut r_f = 0.55 + (depth as f32).ln() * (i as f32).ln() / 1.85;
+        if depth >= 3 && i >= LMR_FULL_DEPTH_MOVES && is_quiet && !gives_check {
+            // Base formula
+            let mut r_f = 0.55 + (depth as f32).ln() * (i as f32).ln() / 1.85;
 
-        // PV nodes need less reduction
-        if !is_pv { 
-            r_f += 0.70; 
-        } else {
-            r_f -= 0.20;
-        }
-    
-        // Reduce more when not improving
-        if !improving { 
-            r_f += 0.65; 
-        }
-    
-        // History-based adjustments with better scaling
-        let history_bonus = HISTORY_HEURISTIC.with(|history| {
-            let history_score = history.borrow()[mv.get_source().to_index()][mv.get_dest().to_index()];
-            (history_score as f32 / 7000.0).clamp(-1.25, 1.25)
-        });
-        r_f -= history_bonus;
-    
-        if (static_eval - alpha).abs() > 150 {
-            r_f -= 0.25; 
-        }
-    
-        // Reduce more for very late moves
-        if i > 15 {
-            r_f += 0.5;
-        }
+            // PV nodes need less reduction
+            if !is_pv {
+                r_f += 0.70;
+            } else {
+                r_f -= 0.20;
+            }
 
-        let mut r = r_f.max(0.0) as usize;
+            // History-based adjustments with better scaling
+            let history_bonus = HISTORY_HEURISTIC.with(|history| {
+                let history_score = history.borrow()[mv.get_source().to_index()][mv.get_dest().to_index()];
+                (history_score as f32 / 7000.0).clamp(-1.25, 1.25)
+            });
+            r_f -= history_bonus;
 
-        r = r.min(depth.saturating_sub(1));
-        new_depth = new_depth.saturating_sub(r);
-        do_full_search = false;
-    }
+            if (static_eval - alpha).abs() > 150 {
+                r_f -= 0.25;
+            }
+
+            // Reduce more for very late moves
+            if i > 15 {
+                r_f += 0.5;
+            }
+
+            let mut r = r_f.max(0.0) as usize;
+
+            r = r.min(depth.saturating_sub(1));
+            new_depth = new_depth.saturating_sub(r);
+            do_full_search = false;
+        }
 
         // Multi-Cut
         if !is_pv && depth >= multi_cut_depth && i >= cut_threshold && !is_capture && cut_count > 0
@@ -921,7 +903,6 @@ fn negamax(
         }
 
         if alpha >= beta {
-   
             if is_quiet {
                 update_counter_move(previous_move, *mv);
             }
@@ -944,6 +925,7 @@ fn negamax(
 
     best_value
 }
+
 pub fn iterative_deepening(
     board: &Board,
     max_time: f64,
@@ -954,60 +936,61 @@ pub fn iterative_deepening(
     let mut best_move = None;
     let mut best_score = 0;
     let root_color = board.side_to_move();
+
     TRANSPOSITION_TABLE.with(|tt| {
         let mut tt_guard = tt.borrow_mut();
         let mut stats = SearchStats::default();
         for depth in 1..=MAX_DEPTH {
             let elapsed = start_time.elapsed().as_secs_f64();
-        let time_limit = if is_movetime {
-            max_time * 0.95
-        } else {
-            max_time * 0.80
-        };
-        if elapsed > time_limit {
-            break;
-        }
-
-        let mut timeout_occurred = false;
-
-        // Determine initial aspiration window bounds
-        let (initial_alpha, initial_beta) = if depth <= 4 || best_move.is_none() {
-            // Full window for early depths or when no best move exists
-            (-31000, 31000)
-        } else {
-            // Narrow aspiration window centered on previous iteration's score
-            (best_score - INITIAL_WINDOW, best_score + INITIAL_WINDOW)
-        };
-
-        let mut alpha = initial_alpha;
-        let mut beta = initial_beta;
-        let mut window_size = INITIAL_WINDOW;
-        let mut search_iterations = 0;
-        const MAX_ASPIRATION_ITERATIONS: usize = 6;
-
-        // Aspiration window re-search loop
-        loop {
-            search_iterations += 1;
-
-            let score = negamax(
-                board,
-                depth,
-                alpha,
-                beta,
-                start_time,
-                0,
-                &mut stats,
-                root_color,
-                &mut tt_guard,
-                max_time,
-                &mut timeout_occurred,
-                None,
-                contempt,
-            );
-
-            if timeout_occurred {
+            let time_limit = if is_movetime {
+                max_time * 0.95
+            } else {
+                max_time * 0.80
+            };
+            if elapsed > time_limit {
                 break;
             }
+
+            let mut timeout_occurred = false;
+
+            // Determine initial aspiration window bounds
+            let (initial_alpha, initial_beta) = if depth <= 4 || best_move.is_none() {
+                // Full window for early depths or when no best move exists
+                (-31000, 31000)
+            } else {
+                // Narrow aspiration window centered on previous iteration's score
+                (best_score - INITIAL_WINDOW, best_score + INITIAL_WINDOW)
+            };
+
+            let mut alpha = initial_alpha;
+            let mut beta = initial_beta;
+            let mut window_size = INITIAL_WINDOW;
+            let mut search_iterations = 0;
+            const MAX_ASPIRATION_ITERATIONS: usize = 6;
+
+            // Aspiration window re-search loop
+            loop {
+                search_iterations += 1;
+
+                let score = negamax(
+                    board,
+                    depth,
+                    alpha,
+                    beta,
+                    start_time,
+                    0,
+                    &mut stats,
+                    root_color,
+                    &mut tt_guard,
+                    max_time,
+                    &mut timeout_occurred,
+                    None,
+                    contempt,
+                );
+
+                if timeout_occurred {
+                    break;
+                }
 
             // Check if we failed low or high
             if score <= alpha {
