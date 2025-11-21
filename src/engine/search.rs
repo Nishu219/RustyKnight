@@ -544,6 +544,17 @@ fn negamax(
     let cut_threshold = 3 + (depth / 4);
     let multi_cut_depth = 3;
 
+    let mut killer_moves = [None, None];
+    if ply < 64 {
+        KILLER_MOVES.with(|k| {
+            let k = k.borrow();
+            if k.len() > ply {
+                if k[ply].len() > 0 { killer_moves[0] = Some(k[ply][0]); }
+                if k[ply].len() > 1 { killer_moves[1] = Some(k[ply][1]); }
+            }
+        });
+    }
+
     for (i, mv) in moves.iter().enumerate() {
         if *timeout_occurred {
             break;
@@ -641,7 +652,14 @@ fn negamax(
         let mut do_full_search = true;
 
         // LMR
-        if depth >= 3 && i >= LMR_FULL_DEPTH_MOVES && is_quiet && !gives_check {
+        let is_killer = Some(*mv) == killer_moves[0] || Some(*mv) == killer_moves[1];
+
+        if depth >= 3 
+            && i >= LMR_FULL_DEPTH_MOVES 
+            && is_quiet 
+            && !gives_check 
+            && !is_killer
+        {
             // Base formula
             let mut r_f = 0.55 + (depth as f32).ln() * (i as f32).ln() / 1.85;
 
@@ -861,14 +879,19 @@ fn negamax(
                 // History heuristic
                 HISTORY_HEURISTIC.with(|history| {
                     let mut history = history.borrow_mut();
-                    let bonus = (depth * depth) as i32;
+                    
+                    // Standard bonus scaled by depth
+                    let bonus = (depth * depth).min(400) as i32; 
+                    
                     let from_sq = mv.get_source().to_index();
                     let to_sq = mv.get_dest().to_index();
-                    history[from_sq][to_sq] += bonus;
-
-                    if history[from_sq][to_sq] > 10000 {
-                        history[from_sq][to_sq] = 10000;
-                    }
+                    
+                    let current = history[from_sq][to_sq];
+                    
+                    // Gravity formula: 
+                    // approach the target (bonus) while decaying the current value
+                    // 10000 is your arbitrary clamp, used here as the scaling divisor
+                    history[from_sq][to_sq] = current + bonus - (current * bonus.abs()) / 10000;
                 });
 
                 // Reduce history for failed moves
@@ -878,13 +901,14 @@ fn negamax(
                     {
                         HISTORY_HEURISTIC.with(|history| {
                             let mut history = history.borrow_mut();
-                            let prev_from_sq = prev_mv.get_source().to_index();
-                            let prev_to_sq = prev_mv.get_dest().to_index();
-                            history[prev_from_sq][prev_to_sq] -= (depth * depth / 4) as i32;
-
-                            if history[prev_from_sq][prev_to_sq] < -1000 {
-                                history[prev_from_sq][prev_to_sq] = -1000;
-                            }
+                            let prev_from = prev_mv.get_source().to_index();
+                            let prev_to = prev_mv.get_dest().to_index();
+                            
+                            let penalty = -((depth * depth).min(400) as i32);
+                            let current = history[prev_from][prev_to];
+                            
+                            // Same gravity formula for penalty
+                            history[prev_from][prev_to] = current + penalty - (current * penalty.abs()) / 10000;
                         });
                     }
                 }
