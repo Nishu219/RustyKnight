@@ -373,6 +373,20 @@ lazy_static! {
         }
         phalanx
     };
+
+    pub static ref CHEBYSHEV_DISTANCE: [[i32; 64]; 64] = {
+        let mut distances = [[0; 64]; 64];
+        for sq1 in 0..64 {
+            for sq2 in 0..64 {
+                let file1 = sq1 % 8;
+                let rank1 = sq1 / 8;
+                let file2 = sq2 % 8;
+                let rank2 = sq2 / 8;
+                distances[sq1][sq2] = ((file1 as i32) - (file2 as i32)).abs().max(((rank1 as i32) - (rank2 as i32)).abs());
+            }
+        }
+        distances
+    };
 }
 
 pub struct MaterialHashTable {
@@ -563,6 +577,18 @@ fn evaluate_pawns(board: &Board) -> i32 {
     let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
     let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
 
+    let white_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::White))
+        .into_iter()
+        .next()
+        .unwrap();
+    let black_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::Black))
+        .into_iter()
+        .next()
+        .unwrap();
+    
+    let white_king_idx = white_king_sq.to_index();
+    let black_king_idx = black_king_sq.to_index();
+
     let mut score = 0;
     
     // Pre-compute pawn attack maps using efficient bit shifts
@@ -630,6 +656,17 @@ fn evaluate_pawns(board: &Board) -> i32 {
         // Passed pawns (already optimized with lookup)
         if (WHITE_PASSED_MASKS[sq_idx] & black_pawns).0 == 0 {
             score += [0, 5, 10, 20, 35, 55, 80, 0][rank];
+            
+            // King proximity bonus for endgames
+            let friendly_dist = CHEBYSHEV_DISTANCE[white_king_idx][sq_idx];
+            let enemy_dist = CHEBYSHEV_DISTANCE[black_king_idx][sq_idx];
+            
+            // Rank factor: more advanced = more important
+            let rank_factor = [0, 1, 2, 3, 4, 5, 6, 0][rank];
+            
+            // Enemy king far = good, friendly king close = good
+            score += (enemy_dist - 2) * rank_factor;
+            score -= (friendly_dist - 1) * rank_factor;
         }
         
         // Phalanx pawns (side-by-side)
@@ -665,6 +702,17 @@ fn evaluate_pawns(board: &Board) -> i32 {
         // Passed pawns
         if (BLACK_PASSED_MASKS[sq_idx] & white_pawns).0 == 0 {
             score -= [0, 80, 55, 35, 20, 10, 5, 0][rank];
+            
+            // King proximity bonus for endgames
+            let friendly_dist = CHEBYSHEV_DISTANCE[black_king_idx][sq_idx];
+            let enemy_dist = CHEBYSHEV_DISTANCE[white_king_idx][sq_idx];
+            
+            // Rank factor: for black, lower rank = more advanced
+            let rank_factor = [0, 6, 5, 4, 3, 2, 1, 0][rank];
+            
+            // Enemy king far = good, friendly king close = good
+            score -= (enemy_dist - 2) * rank_factor;
+            score += (friendly_dist - 1) * rank_factor;
         }
         
         // Phalanx pawns
