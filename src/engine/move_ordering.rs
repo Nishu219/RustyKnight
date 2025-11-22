@@ -1,551 +1,1155 @@
-use chess::{BitBoard, Board, ChessMove, Color, Piece, Square};
+use crate::engine::constants::*;
+use crate::engine::evaluation::evaluate;
+use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, PIECE_VALUES, update_counter_move, update_capture_history, penalize_capture_history};
+use crate::engine::transposition_table::{TranspositionTable, TTFlag};
+use crate::engine::zobrist::compute_zobrist_hash;
+use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
+use std::collections::HashMap;
 use std::cell::RefCell;
+use std::time::Instant;
 
-pub const PIECE_VALUES: [i32; 6] = [100, 320, 330, 500, 900, 0];
+#[derive(Default, Clone)]
+pub struct SearchStats {
+    pub nodes: usize,
+    pub qnodes: usize,
+    pub tt_hits: usize,
+    pub seldepth: usize,
+}
 
 thread_local! {
-    pub static KILLER_MOVES: RefCell<Vec<Vec<ChessMove>>> = RefCell::new(Vec::new());
-    pub static HISTORY_HEURISTIC: RefCell<[[i32; 64]; 64]> = RefCell::new([[0; 64]; 64]);
-    pub static COUNTER_MOVES: RefCell<[[Option<ChessMove>; 64]; 64]> = RefCell::new([[None; 64]; 64]);
-    pub static CAPTURE_HISTORY: RefCell<[[[i32; 64]; 6]; 6]> = RefCell::new([[[0; 64]; 6]; 6]);
+    pub static REPETITION_TABLE: RefCell<HashMap<u64, usize>> = RefCell::new(HashMap::new());
+    pub static TRANSPOSITION_TABLE: RefCell<TranspositionTable> = RefCell::new(TranspositionTable::new(256));
 }
 
-/// Static Exchange Evaluation with Threshold
-/// Returns TRUE if the capture sequence meets or exceeds the threshold
-/// Returns FALSE if the capture sequence is below the threshold
-///
-/// This allows efficient pruning decisions:
-/// - see_capture(board, mv, 0) -> Is capture winning or equal?
-/// - see_capture(board, mv, -100) -> Is capture not too bad (loss < 1 pawn)?
-/// - see_capture(board, mv, 200) -> Does capture win at least 2 pawns?
-pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
-    let to_square = mv.get_dest();
-    let from_square = mv.get_source();
-
-    // Get initial capture value
-    let captured_piece = match board.piece_on(to_square) {
-        Some(p) => p,
-        None => {
-            // Handle en passant
-            if mv.get_promotion().is_some() {
-                return PIECE_VALUES[Piece::Queen.to_index()] - PIECE_VALUES[Piece::Pawn.to_index()]
-                    >= threshold;
-            }
-            return false; // Not a capture
-        }
-    };
-
-    let moving_piece = match board.piece_on(from_square) {
-        Some(p) => p,
-        None => return false,
-    };
-
-    let mut see_value = PIECE_VALUES[captured_piece.to_index()];
-    let mut trophy_value = PIECE_VALUES[moving_piece.to_index()];
-
-    // Quick exit: obviously winning capture (e.g., PxQ)
-    if see_value - trophy_value >= threshold {
-        return true;
-    }
-
-    // Quick exit: captured piece value alone doesn't meet threshold
-    if see_value < threshold {
-        return false;
-    }
-
-    // Determine sides
-    let to_move_mask = board.color_combined(board.side_to_move());
-    let to_move = if (BitBoard::from_square(from_square) & to_move_mask) != BitBoard::new(0) {
-        board.side_to_move()
-    } else {
-        !board.side_to_move()
-    };
-    let opponent = !to_move;
-
-    // Generate all attackers for both sides
-    let mut attacks_to_move = BitBoard::new(0);
-    let mut attacks_opponent = BitBoard::new(0);
-
-    // Pawns
-    attacks_to_move |= get_pawn_attackers(to_square, to_move, board);
-    attacks_opponent |= get_pawn_attackers(to_square, opponent, board);
-
-    // Early cutoff: can opponent's pawn capture and cause immediate fail?
-    if attacks_opponent != BitBoard::new(0)
-        && see_value - trophy_value + PIECE_VALUES[Piece::Pawn.to_index()] < threshold
-    {
-        return false;
-    }
-
-    // Knights
-    let knight_attacks = chess::get_knight_moves(to_square);
-    attacks_to_move |= knight_attacks & board.pieces(Piece::Knight) & board.color_combined(to_move);
-    attacks_opponent |=
-        knight_attacks & board.pieces(Piece::Knight) & board.color_combined(opponent);
-
-    // Kings
-    let king_attacks = get_king_attacks(to_square);
-    attacks_to_move |= king_attacks & board.pieces(Piece::King) & board.color_combined(to_move);
-    attacks_opponent |= king_attacks & board.pieces(Piece::King) & board.color_combined(opponent);
-
-    // Bishops and Queens (diagonal)
-    let bishop_rays = chess::get_bishop_rays(to_square);
-    attacks_to_move |= bishop_rays
-        & (board.pieces(Piece::Bishop) | board.pieces(Piece::Queen))
-        & board.color_combined(to_move);
-    attacks_opponent |= bishop_rays
-        & (board.pieces(Piece::Bishop) | board.pieces(Piece::Queen))
-        & board.color_combined(opponent);
-
-    // Rooks and Queens (straight)
-    let rook_rays = chess::get_rook_rays(to_square);
-    attacks_to_move |= rook_rays
-        & (board.pieces(Piece::Rook) | board.pieces(Piece::Queen))
-        & board.color_combined(to_move);
-    attacks_opponent |= rook_rays
-        & (board.pieces(Piece::Rook) | board.pieces(Piece::Queen))
-        & board.color_combined(opponent);
-
-    // Track occupied squares (remove initial attacker)
-    let mut all_pieces = *board.combined();
-    let from_bb = BitBoard::from_square(from_square);
-    attacks_to_move ^= from_bb;
-    all_pieces ^= from_bb;
-
-    // Main exchange loop
-    loop {
-        // ===== OPPONENT'S TURN TO CAPTURE =====
-
-        // Check if opponent has any attackers
-        if attacks_opponent == BitBoard::new(0) {
-            trophy_value = 0;
-        // Jump to opponent cut test
-        } else if let Some((attacker_sq, attacker_piece)) =
-            find_least_valuable_attacker_threshold(
-                board,
-                opponent,
-                attacks_opponent,
-                all_pieces,
-                to_square,
-            )
-        {
-            // Opponent captures
-            see_value -= trophy_value;
-            trophy_value = PIECE_VALUES[attacker_piece.to_index()];
-
-            // Remove attacker from board
-            let attacker_bb = BitBoard::from_square(attacker_sq);
-            attacks_opponent ^= attacker_bb;
-            all_pieces ^= attacker_bb;
-        } else {
-            trophy_value = 0;
-        }
-
-        // Opponent cut test: Can we prune here?
-
-        // Upper bound test: side-to-move can stand pat and still win
-        if see_value >= threshold {
-            return true;
-        }
-
-        // Lower bound test: even if side-to-move captures, still loses
-        if see_value + trophy_value < threshold {
-            return false;
-        }
-
-        // ===== SIDE-TO-MOVE'S TURN TO RECAPTURE =====
-
-        // Check if side-to-move has any attackers
-        if attacks_to_move == BitBoard::new(0) {
-            trophy_value = 0;
-        // Jump to to_move cut test
-        } else if let Some((attacker_sq, attacker_piece)) = find_least_valuable_attacker_threshold(
-            board,
-            to_move,
-            attacks_to_move,
-            all_pieces,
-            to_square,
-        ) {
-            // Side-to-move recaptures
-            see_value += trophy_value;
-            trophy_value = PIECE_VALUES[attacker_piece.to_index()];
-
-            // Remove attacker from board
-            let attacker_bb = BitBoard::from_square(attacker_sq);
-            attacks_to_move ^= attacker_bb;
-            all_pieces ^= attacker_bb;
-        } else {
-            trophy_value = 0;
-        }
-
-        // To-move cut test
-
-        // Upper bound test: even if opponent captures, side-to-move still wins
-        if see_value - trophy_value >= threshold {
-            return true;
-        }
-
-        // Lower bound test: opponent can stand pat and win
-        if see_value < threshold {
-            return false;
-        }
-
-        // Continue exchange loop
-    }
-}
-
-/// Get pawn attackers of a square for a specific color
-fn get_pawn_attackers(square: Square, color: Color, board: &Board) -> BitBoard {
-    // Pawns attack diagonally opposite to their move direction
-    let file = square.get_file().to_index() as i32;
-    let rank = square.get_rank().to_index() as i32;
-    let mut attackers = BitBoard::new(0);
-
-    match color {
-        Color::White => {
-            // White pawns attack from below (lower ranks)
-            if rank > 0 {
-                if file > 0 {
-                    let sq = unsafe { Square::new(((rank - 1) * 8 + file - 1) as u8) };
-                    attackers |= BitBoard::from_square(sq);
-                }
-                if file < 7 {
-                    let sq = unsafe { Square::new(((rank - 1) * 8 + file + 1) as u8) };
-                    attackers |= BitBoard::from_square(sq);
-                }
-            }
-        }
-        Color::Black => {
-            // Black pawns attack from above (higher ranks)
-            if rank < 7 {
-                if file > 0 {
-                    let sq = unsafe { Square::new(((rank + 1) * 8 + file - 1) as u8) };
-                    attackers |= BitBoard::from_square(sq);
-                }
-                if file < 7 {
-                    let sq = unsafe { Square::new(((rank + 1) * 8 + file + 1) as u8) };
-                    attackers |= BitBoard::from_square(sq);
-                }
-            }
-        }
-    }
-
-    attackers & board.pieces(Piece::Pawn) & board.color_combined(color)
-}
-
-/// Find least valuable attacker considering blockers
-/// Returns (Square, Piece) of the attacker, or None if no unblocked attacker exists
-fn find_least_valuable_attacker_threshold(
-    board: &Board,
-    color: Color,
-    attackers: BitBoard,
-    all_pieces: BitBoard,
-    target_square: Square,
-) -> Option<(Square, Piece)> {
-    // Check pieces in order of value: Pawn, Knight, Bishop, Rook, Queen, King
-
-    // Pawns (no blocking check needed)
-    let pawns = attackers & board.pieces(Piece::Pawn) & board.color_combined(color);
-    if pawns != BitBoard::new(0) {
-        for sq in pawns {
-            return Some((sq, Piece::Pawn));
-        }
-    }
-
-    // Knights (no blocking check needed)
-    let knights = attackers & board.pieces(Piece::Knight) & board.color_combined(color);
-    if knights != BitBoard::new(0) {
-        for sq in knights {
-            return Some((sq, Piece::Knight));
-        }
-    }
-
-    // Bishops (must check for blockers)
-    let bishops = attackers & board.pieces(Piece::Bishop) & board.color_combined(color);
-    if bishops != BitBoard::new(0) {
-        for sq in bishops {
-            if !is_path_blocked(sq, target_square, all_pieces) {
-                return Some((sq, Piece::Bishop));
-            }
-        }
-    }
-
-    // Rooks (must check for blockers)
-    let rooks = attackers & board.pieces(Piece::Rook) & board.color_combined(color);
-    if rooks != BitBoard::new(0) {
-        for sq in rooks {
-            if !is_path_blocked(sq, target_square, all_pieces) {
-                return Some((sq, Piece::Rook));
-            }
-        }
-    }
-
-    // Queens (must check for blockers)
-    let queens = attackers & board.pieces(Piece::Queen) & board.color_combined(color);
-    if queens != BitBoard::new(0) {
-        for sq in queens {
-            if !is_path_blocked(sq, target_square, all_pieces) {
-                return Some((sq, Piece::Queen));
-            }
-        }
-    }
-
-    // King (no blocking check needed)
-    let kings = attackers & board.pieces(Piece::King) & board.color_combined(color);
-    if kings != BitBoard::new(0) {
-        for sq in kings {
-            return Some((sq, Piece::King));
-        }
-    }
-
-    None
-}
-
-/// Check if path between two squares is blocked
-fn is_path_blocked(from: Square, to: Square, occupied: BitBoard) -> bool {
-    let from_file = from.get_file().to_index() as i32;
-    let from_rank = from.get_rank().to_index() as i32;
-    let to_file = to.get_file().to_index() as i32;
-    let to_rank = to.get_rank().to_index() as i32;
-
-    let file_diff = to_file - from_file;
-    let rank_diff = to_rank - from_rank;
-
-    // Determine direction
-    let file_step = if file_diff > 0 {
-        1
-    } else if file_diff < 0 {
-        -1
-    } else {
-        0
-    };
-    let rank_step = if rank_diff > 0 {
-        1
-    } else if rank_diff < 0 {
-        -1
-    } else {
-        0
-    };
-
-    // Check squares between from and to
-    let mut current_file = from_file + file_step;
-    let mut current_rank = from_rank + rank_step;
-
-    while current_file != to_file || current_rank != to_rank {
-        let sq = unsafe { Square::new((current_rank * 8 + current_file) as u8) };
-        if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
-            return true; // Blocked
-        }
-        current_file += file_step;
-        current_rank += rank_step;
-    }
-
-    false // Not blocked
-}
-fn get_king_attacks(square: Square) -> BitBoard {
-    let file = square.get_file().to_index() as i32;
-    let rank = square.get_rank().to_index() as i32;
-    let mut attacks = BitBoard::new(0);
-
-    for df in -1..=1 {
-        for dr in -1..=1 {
-            if df == 0 && dr == 0 {
-                continue;
-            }
-            let new_file = file + df;
-            let new_rank = rank + dr;
-            if new_file >= 0 && new_file < 8 && new_rank >= 0 && new_rank < 8 {
-                let sq = unsafe { Square::new((new_rank * 8 + new_file) as u8) };
-                attacks |= BitBoard::from_square(sq);
-            }
-        }
-    }
-
-    attacks
-}
-pub fn mvv_lva_score(board: &Board, mv: ChessMove) -> i32 {
-    let victim_value = if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
-        PIECE_VALUES[captured_piece.to_index()]
-    } else if mv.get_promotion().is_some() {
-        PIECE_VALUES[Piece::Queen.to_index()]
-    } else {
-        0
-    };
-
-    let attacker_value = if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
-        PIECE_VALUES[attacker_piece.to_index()]
-    } else {
-        0
-    };
-
-    if victim_value > 0 {
-        victim_value * 10 - attacker_value
-    } else {
-        0
-    }
-}
-pub fn order_moves(
-    board: &Board,
-    moves: Vec<ChessMove>,
-    hash_move: Option<ChessMove>,
-    depth: usize,
-    previous_move: Option<ChessMove>, 
-) -> Vec<ChessMove> {
-    let counter_move = previous_move.and_then(|prev_mv| get_counter_move(prev_mv));
-    
-    let mut scored_moves: Vec<(ChessMove, i32)> = moves
-        .into_iter()
-        .map(|mv| {
-            let score = if Some(mv) == hash_move {
-                10000000
-            } else if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
-                let base_mvv_lva = mvv_lva_score(board, mv);
-                let capture_hist = get_capture_history_score(mv, board);
-                
-                if see_capture(board, mv, 300) {
-                    9500000 + base_mvv_lva + capture_hist
-                } else if see_capture(board, mv, 0) {
-                    7500000 + base_mvv_lva + capture_hist
-                } else {
-                    // Bad capture - use capture history to differentiate
-                    500000 + capture_hist
-                }
-            } else {
-                let new_board = board.make_move_new(mv);
-                if *new_board.checkers() != BitBoard(0) {
-                    8000000
-                } else {
-                    HISTORY_HEURISTIC.with(|history| {
-                        let history = history.borrow();
-                        if Some(mv) == counter_move {
-                            6500000
-                        } else if depth < 64 {
-                            KILLER_MOVES.with(|killers| {
-                                let killers = killers.borrow();
-                                if killers.len() > depth {
-                                    if killers[depth].len() > 0 && killers[depth][0] == mv {
-                                        7000000
-                                    } else if killers[depth].len() > 1 && killers[depth][1] == mv {
-                                        6000000
-                                    } else {
-                                        history[mv.get_source().to_index()][mv.get_dest().to_index()]
-                                    }
-                                } else {
-                                    history[mv.get_source().to_index()][mv.get_dest().to_index()]
-                                }
-                            })
-                        } else {
-                            history[mv.get_source().to_index()][mv.get_dest().to_index()]
-                        }
-                    })
-                }
-            };
-            (mv, score)
-        })
-        .collect();
-    scored_moves.sort_by(|a, b| b.1.cmp(&a.1));
-    scored_moves.into_iter().map(|(mv, _)| mv).collect()
-}
-/// Update counter-move heuristic when a move causes a beta cutoff
-pub fn update_counter_move(previous_move: Option<ChessMove>, refutation: ChessMove) {
-    if let Some(prev_mv) = previous_move {
-        let from_sq = prev_mv.get_source().to_index();
-        let to_sq = prev_mv.get_dest().to_index();
-        
-        COUNTER_MOVES.with(|counter_moves| {
-            counter_moves.borrow_mut()[from_sq][to_sq] = Some(refutation);
-        });
-    }
-}
-
-/// Get counter-move for a given move
-pub fn get_counter_move(mv: ChessMove) -> Option<ChessMove> {
-    let from_sq = mv.get_source().to_index();
-    let to_sq = mv.get_dest().to_index();
-    
-    COUNTER_MOVES.with(|counter_moves| {
-        counter_moves.borrow()[from_sq][to_sq]
+fn is_repetition(position_hash: u64) -> bool {
+    REPETITION_TABLE.with(|table| {
+        *table.borrow().get(&position_hash).unwrap_or(&0) >= 2
     })
 }
 
-/// Clear counter-moves table
-pub fn clear_counter_moves() {
-    COUNTER_MOVES.with(|counter_moves| {
-        *counter_moves.borrow_mut() = [[None; 64]; 64];
+pub fn update_repetition_table(position_hash: u64) {
+    REPETITION_TABLE.with(|table| {
+        *table.borrow_mut().entry(position_hash).or_insert(0) += 1;
     });
 }
 
-/// Update capture history when a capture causes a beta cutoff
-pub fn update_capture_history(mv: ChessMove, board: &Board, depth: usize, failed_quiets: bool) {
-    if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
-        if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
-            let attacker_idx = attacker_piece.to_index();
-            let victim_idx = captured_piece.to_index();
-            let to_sq = mv.get_dest().to_index();
-            
-            let bonus = if failed_quiets {
-                // Bonus when capture succeeds after quiets failed
-                (depth * depth + depth * 2) as i32
+pub fn clear_repetition_table() {
+    REPETITION_TABLE.with(|table| {
+        table.borrow_mut().clear();
+    });
+}
+
+fn quiesce(
+    board: &Board,
+    mut alpha: i32,
+    beta: i32,
+    start_time: Instant,
+    stats: &mut SearchStats,
+    root_color: Color,
+    max_time: f64,
+    timeout_occurred: &mut bool,
+    ply: usize,
+) -> i32 {
+    stats.nodes += 1;
+    stats.qnodes += 1;
+    stats.seldepth = stats.seldepth.max(ply);
+    if start_time.elapsed().as_secs_f64() > max_time {
+        *timeout_occurred = true;
+        return evaluate(board, 0);
+    }
+
+    let stand_pat = evaluate(board, 0);
+
+    if stand_pat >= beta {
+        return beta;
+    }
+
+    if stand_pat > alpha {
+        alpha = stand_pat;
+    }
+
+    // Delta pruning: calculate the maximum possible gain
+    // We use queen value (900) as the base delta, plus a margin for promotions
+    let big_delta = PIECE_VALUES[Piece::Queen.to_index()] + DELTA_MARGIN;
+
+    // If even capturing the opponent's queen cannot raise alpha, prune all moves
+    if stand_pat + big_delta < alpha {
+        return alpha;
+    }
+
+    let mut captures = Vec::new();
+    let movegen = MoveGen::new_legal(board);
+
+    for mv in movegen {
+        if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
+            let mvv_lva = mvv_lva_score(board, mv);
+            captures.push((mv, mvv_lva));
+        }
+    }
+
+    captures.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for (mv, _) in captures {
+        if *timeout_occurred {
+            break;
+        }
+        
+        // Delta pruning for individual moves
+        // Calculate the value of the captured piece
+        let captured_value = if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
+            PIECE_VALUES[captured_piece.to_index()]
+        } else if mv.get_promotion().is_some() {
+            // Promotion - assume queen for simplicity
+            PIECE_VALUES[Piece::Queen.to_index()] - PIECE_VALUES[Piece::Pawn.to_index()]
+        } else {
+            0
+        };
+        
+        // If the material gain plus the stand_pat score and margin cannot raise alpha, skip this move
+        if stand_pat + captured_value + DELTA_MARGIN < alpha {
+            continue;
+        }
+        
+        // SEE pruning - skip obviously bad captures
+        if !see_capture(board, mv, -50) {
+            continue;
+        }
+
+        let new_board = board.make_move_new(mv);
+        let score = -quiesce(
+            &new_board,
+            -beta,
+            -alpha,
+            start_time,
+            stats,
+            root_color,
+            max_time,
+            timeout_occurred,
+            ply + 1,
+        );
+
+        if *timeout_occurred {
+            break;
+        }
+
+        if score >= beta {
+            return beta;
+        }
+
+        if score > alpha {
+            alpha = score;
+        }
+    }
+
+    alpha
+}
+
+fn negamax(
+    board: &Board,
+    depth: usize,
+    mut alpha: i32,
+    mut beta: i32,
+    start_time: Instant,
+    ply: usize,
+    stats: &mut SearchStats,
+    root_color: Color,
+    tt: &mut TranspositionTable,
+    max_time: f64,
+    timeout_occurred: &mut bool,
+    previous_move: Option<ChessMove>,
+    contempt: i32,
+) -> i32 {
+    let is_pv = beta - alpha > 1;
+    let is_root = ply == 0;
+    let original_alpha = alpha;
+
+    stats.nodes += 1;
+    stats.seldepth = stats.seldepth.max(ply);
+
+    // Timeout check
+    if start_time.elapsed().as_secs_f64() > max_time {
+        *timeout_occurred = true;
+        return if ply > 0 { evaluate(board, 0) } else { 0 };
+    }
+
+    let position_hash = compute_zobrist_hash(board);
+
+    // Draw detection and mate distance pruning
+    if ply > 0 {
+        if is_repetition(position_hash) {
+            return if board.side_to_move() == root_color {
+                -contempt
             } else {
-                // Standard bonus
-                (depth * depth) as i32
+                contempt
             };
-            
-            CAPTURE_HISTORY.with(|ch| {
-                let mut ch = ch.borrow_mut();
-                ch[attacker_idx][victim_idx][to_sq] += bonus;
-                
-                // Cap the value to prevent overflow
-                if ch[attacker_idx][victim_idx][to_sq] > 16000 {
-                    ch[attacker_idx][victim_idx][to_sq] = 16000;
+        }
+
+        if board.status() == BoardStatus::Checkmate {
+            return -30000 + ply as i32;
+        }
+
+        if board.status() == BoardStatus::Stalemate {
+            return if board.side_to_move() == root_color {
+                -contempt
+            } else {
+                contempt
+            };
+        }
+
+        // Mate distance pruning
+        alpha = alpha.max(-30000 + ply as i32);
+        beta = beta.min(30000 - ply as i32);
+        if alpha >= beta {
+            return alpha;
+        }
+    }
+
+    let board_hash = position_hash;
+    let mut hash_move = None;
+    let mut tt_value = None;
+
+    // TT probe
+    if let Some(stored_value) = tt.get(board_hash, depth, alpha, beta) {
+        stats.tt_hits += 1;
+        if !is_pv || !is_root {
+            return stored_value;
+        }
+        tt_value = Some(stored_value);
+    }
+
+    if hash_move.is_none() {
+        hash_move = tt.get_move(board_hash);
+    }
+    
+    let in_check = *board.checkers() != BitBoard(0);
+    let static_eval = if in_check {
+        -30000 + ply as i32
+    } else {
+        evaluate(board, contempt)
+    };
+
+
+    // Quiescence at leaf
+    if depth == 0 {
+        return quiesce(
+            board,
+            alpha,
+            beta,
+            start_time,
+            stats,
+            root_color,
+            max_time,
+            timeout_occurred,
+            ply,
+        );
+    }
+
+    if !is_pv && !in_check {
+        // Razoring
+        if depth <= RAZOR_DEPTH {
+            let razor_margin = RAZOR_MARGIN + 50 * (depth as i32 - 1);
+            if static_eval + razor_margin < alpha {
+                let razor_alpha = alpha - razor_margin;
+                let razor_score = quiesce(
+                    board,
+                    razor_alpha,
+                    razor_alpha + 1,
+                    start_time,
+                    stats,
+                    root_color,
+                    max_time,
+                    timeout_occurred,
+                    ply,
+                );
+                if *timeout_occurred {
+                    return evaluate(board, 0);
                 }
-            });
-        }
-    }
-}
-
-/// Penalize capture history for failed captures
-pub fn penalize_capture_history(mv: ChessMove, board: &Board, depth: usize) {
-    if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
-        if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
-            let attacker_idx = attacker_piece.to_index();
-            let victim_idx = captured_piece.to_index();
-            let to_sq = mv.get_dest().to_index();
-            
-            let penalty = (depth * depth / 2) as i32;
-            
-            CAPTURE_HISTORY.with(|ch| {
-                let mut ch = ch.borrow_mut();
-                ch[attacker_idx][victim_idx][to_sq] -= penalty;
-                
-                // Floor the value
-                if ch[attacker_idx][victim_idx][to_sq] < -4000 {
-                    ch[attacker_idx][victim_idx][to_sq] = -4000;
+                if razor_score <= razor_alpha {
+                    return razor_score;
                 }
-            });
+            }
         }
-    }
-}
 
-/// Get capture history score for move ordering
-pub fn get_capture_history_score(mv: ChessMove, board: &Board) -> i32 {
-    if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
-        if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
-            let attacker_idx = attacker_piece.to_index();
-            let victim_idx = captured_piece.to_index();
-            let to_sq = mv.get_dest().to_index();
+        // Reverse futility pruning
+        if depth <= REVERSE_FUTILITY_DEPTH {
+            let rfp_margin = REVERSE_FUTILITY_MARGIN * depth as i32;
             
-            return CAPTURE_HISTORY.with(|ch| {
-                ch.borrow()[attacker_idx][victim_idx][to_sq]
-            });
+            if static_eval - rfp_margin >= beta {
+                return static_eval;
+            }
+        }
+
+        // Null move pruning
+        if depth >= NULL_MOVE_DEPTH && static_eval >= beta {
+            let has_non_pawn_pieces = (board.combined() & board.color_combined(board.side_to_move())).0
+                    != ((board.pieces(chess::Piece::King) | board.pieces(chess::Piece::Pawn))
+                        & board.color_combined(board.side_to_move()))
+                    .0;
+
+            if has_non_pawn_pieces {
+                let mut r = 3 + depth / 4;
+                r += ((static_eval - beta) / 200).min(3) as usize;
+                r += 1;
+                if depth > 12 {
+                    r += 1;
+                }
+                r = r.min(depth - 1);
+
+                if let Some(null_board) = board.null_move() {
+                    let null_score = -negamax(
+                        &null_board,
+                        depth.saturating_sub(r),
+                        -beta,
+                        -beta + 1,
+                        start_time,
+                        ply + 1,
+                        stats,
+                        root_color,
+                        tt,
+                        max_time,
+                        timeout_occurred,
+                        None,
+                        contempt,
+                    );
+
+                    if *timeout_occurred {
+                        return evaluate(board, 0);
+                    }
+
+                    if null_score >= beta {
+                        // Null move verification
+                        if depth >= 12 {
+                            let verification_depth = depth.saturating_sub(r + 1);
+                            let verification_score = negamax(
+                                board,
+                                verification_depth,
+                                beta - 1,
+                                beta,
+                                start_time,
+                                ply,
+                                stats,
+                                root_color,
+                                tt,
+                                max_time,
+                                timeout_occurred,
+                                None,
+                                contempt,
+                            );
+
+                            if *timeout_occurred {
+                                return evaluate(board, 0);
+                            }
+
+                            if verification_score >= beta {
+                                return null_score;
+                            }
+                        } else {
+                            return null_score;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ProbCut
+        if depth >= 5 && !hash_move.is_some() {
+            let probcut_beta = beta + 200;
+            let probcut_depth = depth / 4 * 3;
+
+            if probcut_depth >= 1 {
+                let probcut_score = negamax(
+                    board,
+                    probcut_depth,
+                    probcut_beta - 1,
+                    probcut_beta,
+                    start_time,
+                    ply,
+                    stats,
+                    root_color,
+                    tt,
+                    max_time,
+                    timeout_occurred,
+                    previous_move,
+                    contempt,
+                );
+
+                if *timeout_occurred {
+                    return evaluate(board, 0);
+                }
+
+                if probcut_score >= probcut_beta {
+                    return probcut_score;
+                }
+            }
         }
     }
-    0
+
+    // IID
+    if is_pv && depth >= IID_DEPTH && hash_move.is_none() {
+        let iid_depth = depth - 2 - if is_pv { 0 } else { 1 };
+        negamax(
+            board,
+            iid_depth,
+            alpha,
+            beta,
+            start_time,
+            ply,
+            stats,
+            root_color,
+            tt,
+            max_time,
+            timeout_occurred,
+            previous_move,
+            contempt,
+        );
+        if !*timeout_occurred {
+            hash_move = tt.get_move(board_hash);
+        }
+    }
+
+    // Singular extensions
+    let mut singular_extension = 0;
+    if !is_root 
+        && depth >= SINGULAR_DEPTH 
+        && hash_move.is_some() 
+        && !in_check
+        && tt_value.is_some()
+    {
+        let tt_entry_depth = tt.get_depth(board_hash);
+        
+        if let Some(entry_depth) = tt_entry_depth {
+            if entry_depth >= depth - 3 {
+                let hash_mv = hash_move.unwrap();
+                let tt_val = tt_value.unwrap();
+                
+                let singular_beta = tt_val - depth as i32 * SINGULAR_MARGIN_MULTIPLIER;
+                let singular_depth = (depth - 1) / 2;
+                
+                let mut singular_value = -32000;
+                let mut non_singular_found = false;
+                
+                let mut temp_moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
+                temp_moves = order_moves(board, temp_moves, None, ply, None);
+                
+                for mv in temp_moves.iter() {
+                    if *mv == hash_mv {
+                        continue;
+                    }
+                    
+                    if *timeout_occurred {
+                        break;
+                    }
+                    
+                    let new_board = board.make_move_new(*mv);
+                    let new_position_hash = compute_zobrist_hash(&new_board);
+                    update_repetition_table(new_position_hash);
+                    
+                    let score = -negamax(
+                        &new_board,
+                        singular_depth,
+                        -singular_beta - 1,
+                        -singular_beta,
+                        start_time,
+                        ply + 1,
+                        stats,
+                        root_color,
+                        tt,
+                        max_time,
+                        timeout_occurred,
+                        None,
+                        contempt,
+                    );
+                    
+                    REPETITION_TABLE.with(|rep_table| {
+                        let mut rep_table = rep_table.borrow_mut();
+                        if let Some(count) = rep_table.get_mut(&new_position_hash) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                rep_table.remove(&new_position_hash);
+                            }
+                        }
+                    });
+                    
+                    if *timeout_occurred {
+                        break;
+                    }
+                    
+                    singular_value = singular_value.max(score);
+                    
+                    if score >= singular_beta {
+                        non_singular_found = true;
+                        break;
+                    }
+                }
+                
+                if !*timeout_occurred && !non_singular_found {
+                    singular_extension = 1;
+                    
+                    // Double extension
+                    if depth >= DOUBLE_EXTENSION_DEPTH 
+                        && singular_value < singular_beta - DOUBLE_EXTENSION_MARGIN
+                    {
+                        singular_extension = 2;
+                    }
+                }
+            }
+        }
+    }
+
+    // Mate threat extension
+    let mut mate_threat_extension = 0;
+    if !is_pv 
+        && !in_check 
+        && depth >= MATE_THREAT_DEPTH 
+        && static_eval < beta - 300
+    {
+        if let Some(null_board) = board.null_move() {
+            let threat_score = -negamax(
+                &null_board,
+                depth.saturating_sub(3),
+                -beta,
+                -beta + 1,
+                start_time,
+                ply + 1,
+                stats,
+                root_color,
+                tt,
+                max_time,
+                timeout_occurred,
+                None,
+                contempt,
+            );
+            
+            if !*timeout_occurred && threat_score >= beta && threat_score.abs() > 29000 {
+                mate_threat_extension = 1;
+            }
+        }
+    }
+
+    let mut moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
+
+    if moves.is_empty() {
+        return if in_check { -30000 + ply as i32 } else { 0 };
+    }
+
+    moves = order_moves(board, moves, hash_move, ply, previous_move);
+
+    let mut best_value = -31000;
+    let mut best_move = None;
+    let mut moves_searched = 0;
+    let mut quiet_moves_searched = 0;
+
+    // Multi-Cut
+    let mut cut_count = 0;
+    let cut_threshold = 3 + (depth / 4);
+    let multi_cut_depth = 3;
+
+    let mut killer_moves = [None, None];
+    if ply < 64 {
+        KILLER_MOVES.with(|k| {
+            let k = k.borrow();
+            if k.len() > ply {
+                if k[ply].len() > 0 { killer_moves[0] = Some(k[ply][0]); }
+                if k[ply].len() > 1 { killer_moves[1] = Some(k[ply][1]); }
+            }
+        });
+    }
+
+    for (i, mv) in moves.iter().enumerate() {
+        if *timeout_occurred {
+            break;
+        }
+
+        let is_capture = board.piece_on(mv.get_dest()).is_some();
+        let is_promotion = mv.get_promotion().is_some();
+        let is_quiet = !is_capture && !is_promotion;
+        let is_hash_move = hash_move.is_some() && *mv == hash_move.unwrap();
+
+        // Late move pruning
+        if !is_pv && !in_check && is_quiet && depth <= LMP_DEPTH {
+            let mut lmp_threshold = match depth {
+                1 => 3,
+                2 => 6,
+                3 => 12,
+                4 => 18,
+                _ => 25,
+            };
+
+            if static_eval + 200 < alpha {
+                lmp_threshold /= 2;
+            } else if static_eval > alpha + 200 {
+                lmp_threshold = (lmp_threshold * 3) / 2;
+            }
+
+            if quiet_moves_searched >= lmp_threshold {
+                continue;
+            }
+        }
+
+        // Futility pruning
+        if !is_pv && !in_check && is_quiet && depth <= FUTILITY_DEPTH && i > 0 {
+            let futility_margin = FUTILITY_MARGINS[depth.min(4)];
+
+            let futility_value = static_eval + futility_margin;
+            if futility_value <= alpha {
+                continue;
+            }
+        }
+
+        // Futility move count pruning
+        if !is_pv && !in_check && is_quiet && depth <= 4 && moves_searched > 0 {
+            let futility_value = static_eval + FUTILITY_MARGINS[depth.min(4)];
+            if futility_value <= alpha {
+                let move_count_limit = FUTILITY_MOVE_COUNTS[depth.min(4)];
+                if quiet_moves_searched >= move_count_limit {
+                    continue;
+                }
+            }
+        }
+
+        // History leaf pruning
+        if !is_pv 
+            && !in_check 
+            && is_quiet 
+            && depth <= HISTORY_PRUNING_DEPTH 
+            && moves_searched > 0 
+            && !is_hash_move
+        {
+            let history_score = HISTORY_HEURISTIC.with(|history| {
+                history.borrow()[mv.get_source().to_index()][mv.get_dest().to_index()]
+            });
+            
+            if history_score < HISTORY_PRUNING_THRESHOLD {
+                continue;
+            }
+        }
+
+        let new_board = board.make_move_new(*mv);
+        let new_position_hash = compute_zobrist_hash(&new_board);
+        update_repetition_table(new_position_hash);
+
+        let gives_check = *new_board.checkers() != BitBoard(0);
+
+        // Extensions
+        let mut extension = mate_threat_extension;
+        
+        if is_hash_move && singular_extension > 0 {
+            extension = extension.max(singular_extension);
+        } else if gives_check && see_capture(board, *mv, 0) {
+            extension += 1;
+        } else if let Some(piece) = board.piece_on(mv.get_source()) {
+            if piece == chess::Piece::Pawn {
+                let dest_rank = mv.get_dest().get_rank();
+                if dest_rank == chess::Rank::Seventh || dest_rank == chess::Rank::Second {
+                    extension += 1;
+                }
+            }
+        }
+        
+        extension = extension.min(2);
+        
+        let mut new_depth = depth - 1 + extension;
+        let mut do_full_search = true;
+
+        // LMR
+        let is_killer = Some(*mv) == killer_moves[0] || Some(*mv) == killer_moves[1];
+
+        if depth >= 3 
+            && i >= LMR_FULL_DEPTH_MOVES 
+            && is_quiet 
+            && !gives_check 
+            && !is_killer
+        {
+            // Base formula
+            let mut r_f = 0.55 + (depth as f32).ln() * (i as f32).ln() / 1.85;
+
+            // PV nodes need less reduction
+            if !is_pv {
+                r_f += 0.70;
+            } else {
+                r_f -= 0.20;
+            }
+
+            // History-based adjustments with better scaling
+            let history_bonus = HISTORY_HEURISTIC.with(|history| {
+                let history_score = history.borrow()[mv.get_source().to_index()][mv.get_dest().to_index()];
+                (history_score as f32 / 7000.0).clamp(-1.25, 1.25)
+            });
+            r_f -= history_bonus;
+
+            if (static_eval - alpha).abs() > 150 {
+                r_f -= 0.25;
+            }
+
+            // Reduce more for very late moves
+            if i > 15 {
+                r_f += 0.5;
+            }
+
+            let mut r = r_f.max(0.0) as usize;
+
+            r = r.min(depth.saturating_sub(1));
+            new_depth = new_depth.saturating_sub(r);
+            do_full_search = false;
+        }
+
+        // Multi-Cut
+        if !is_pv && depth >= multi_cut_depth && i >= cut_threshold && !is_capture && cut_count > 0
+        {
+            let multi_cut_score = -negamax(
+                &new_board,
+                depth / 2,
+                -beta,
+                -beta + 1,
+                start_time,
+                ply + 1,
+                stats,
+                root_color,
+                tt,
+                max_time,
+                timeout_occurred,
+                Some(*mv),
+                contempt,
+            );
+
+            if *timeout_occurred {
+                REPETITION_TABLE.with(|rep_table| {
+                    let mut rep_table = rep_table.borrow_mut();
+                    if let Some(count) = rep_table.get_mut(&new_position_hash) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            rep_table.remove(&new_position_hash);
+                        }
+                    }
+                });
+                break;
+            }
+
+            if multi_cut_score >= beta {
+                cut_count += 1;
+                if cut_count >= cut_threshold {
+                    REPETITION_TABLE.with(|rep_table| {
+                        let mut rep_table = rep_table.borrow_mut();
+                        if let Some(count) = rep_table.get_mut(&new_position_hash) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                rep_table.remove(&new_position_hash);
+                            }
+                        }
+                    });
+                    return beta;
+                }
+            }
+        }
+
+        // PVS
+        let score = if i == 0 {
+            -negamax(
+                &new_board,
+                new_depth,
+                -beta,
+                -alpha,
+                start_time,
+                ply + 1,
+                stats,
+                root_color,
+                tt,
+                max_time,
+                timeout_occurred,
+                Some(*mv),
+                contempt,
+            )
+        } else {
+            let mut search_score = -negamax(
+                &new_board,
+                new_depth,
+                -alpha - 1,
+                -alpha,
+                start_time,
+                ply + 1,
+                stats,
+                root_color,
+                tt,
+                max_time,
+                timeout_occurred,
+                Some(*mv),
+                contempt,
+            );
+
+            if *timeout_occurred {
+                evaluate(board, 0)
+            } else {
+                // Re-search at full depth if reduced
+                if !do_full_search && search_score > alpha {
+                    new_depth = depth - 1 + extension;
+                    search_score = -negamax(
+                        &new_board,
+                        new_depth,
+                        -alpha - 1,
+                        -alpha,
+                        start_time,
+                        ply + 1,
+                        stats,
+                        root_color,
+                        tt,
+                        max_time,
+                        timeout_occurred,
+                        Some(*mv),
+                        contempt,
+                    );
+                }
+
+                // PV re-search
+                if *timeout_occurred {
+                    evaluate(board, 0)
+                } else if search_score > alpha {
+                    if is_pv || (search_score < beta) {
+                        -negamax(
+                            &new_board,
+                            new_depth,
+                            -beta,
+                            -alpha,
+                            start_time,
+                            ply + 1,
+                            stats,
+                            root_color,
+                            tt,
+                            max_time,
+                            timeout_occurred,
+                            Some(*mv),
+                            contempt,
+                        )
+                    } else {
+                        search_score
+                    }
+                } else {
+                    search_score
+                }
+            }
+        };
+
+        REPETITION_TABLE.with(|rep_table| {
+            let mut rep_table = rep_table.borrow_mut();
+            if let Some(count) = rep_table.get_mut(&new_position_hash) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    rep_table.remove(&new_position_hash);
+                }
+            }
+        });
+
+        if *timeout_occurred {
+            break;
+        }
+
+        moves_searched += 1;
+        if is_quiet {
+            quiet_moves_searched += 1;
+        }
+
+        if score > best_value {
+            best_value = score;
+            best_move = Some(*mv);
+        }
+
+        if score > alpha {
+            alpha = score;
+
+            if is_quiet {
+                // Killer moves
+                KILLER_MOVES.with(|killers| {
+                    let mut killers = killers.borrow_mut();
+                    if ply < 64 && killers.len() > ply {
+                        if killers[ply].is_empty() || killers[ply][0] != *mv {
+                            if killers[ply].len() >= 2 {
+                                killers[ply][1] = killers[ply][0];
+                            } else if killers[ply].len() == 1 {
+                                let first_killer = killers[ply][0];
+                                killers[ply].push(first_killer);
+                            }
+                            if killers[ply].is_empty() {
+                                killers[ply].push(*mv);
+                            } else {
+                                killers[ply][0] = *mv;
+                            }
+                        }
+                    }
+                });
+
+                // History heuristic
+                HISTORY_HEURISTIC.with(|history| {
+                    let mut history = history.borrow_mut();
+                    
+                    // Standard bonus scaled by depth
+                    let bonus = (depth * depth).min(400) as i32; 
+                    
+                    let from_sq = mv.get_source().to_index();
+                    let to_sq = mv.get_dest().to_index();
+                    
+                    let current = history[from_sq][to_sq];
+                    
+                    // Gravity formula: 
+                    // approach the target (bonus) while decaying the current value
+                    // 10000 is your arbitrary clamp, used here as the scaling divisor
+                    history[from_sq][to_sq] = current + bonus - (current * bonus.abs()) / 10000;
+                });
+
+                // Reduce history for failed moves
+                for prev_mv in &moves[0..i] {
+                    if board.piece_on(prev_mv.get_dest()).is_none()
+                        && prev_mv.get_promotion().is_none()
+                    {
+                        HISTORY_HEURISTIC.with(|history| {
+                            let mut history = history.borrow_mut();
+                            let prev_from = prev_mv.get_source().to_index();
+                            let prev_to = prev_mv.get_dest().to_index();
+                            
+                            let penalty = -((depth * depth).min(400) as i32);
+                            let current = history[prev_from][prev_to];
+                            
+                            // Same gravity formula for penalty
+                            history[prev_from][prev_to] = current + penalty - (current * penalty.abs()) / 10000;
+                        });
+                    }
+                }
+            }
+            else {
+                // Capture succeeded - update capture history
+                update_capture_history(*mv, board, depth, i > 0);
+                
+                // Penalize failed captures
+                for prev_mv in &moves[0..i] {
+                    if board.piece_on(prev_mv.get_dest()).is_some() || prev_mv.get_promotion().is_some() {
+                        penalize_capture_history(*prev_mv, board, depth);
+                    }
+                }
+            }
+        }
+
+        if alpha >= beta {
+            if is_quiet {
+                update_counter_move(previous_move, *mv);
+            }
+            break;
+        }
+    }
+
+    // TT store
+    if !*timeout_occurred && moves_searched > 0 {
+        let flag = if best_value <= original_alpha {
+            TTFlag::Upper
+        } else if best_value >= beta {
+            TTFlag::Lower
+        } else {
+            TTFlag::Exact
+        };
+
+        tt.store(board_hash, depth, best_value, flag, best_move);
+    }
+
+    best_value
 }
 
-/// Clear capture history table
-pub fn clear_capture_history() {
-    CAPTURE_HISTORY.with(|ch| {
-        *ch.borrow_mut() = [[[0; 64]; 6]; 6];
-    });
+pub fn iterative_deepening(
+    board: &Board,
+    max_time: f64,
+    contempt: i32,
+    is_movetime: bool,
+) -> Option<ChessMove> {
+    let start_time = Instant::now();
+    let mut best_move = None;
+    let mut best_score = 0;
+    let root_color = board.side_to_move();
+
+    TRANSPOSITION_TABLE.with(|tt| {
+        let mut tt_guard = tt.borrow_mut();
+        let mut stats = SearchStats::default();
+        for depth in 1..=MAX_DEPTH {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let time_limit = if is_movetime {
+                max_time * 0.95
+            } else {
+                max_time * 0.80
+            };
+            if elapsed > time_limit {
+                break;
+            }
+
+            let mut timeout_occurred = false;
+
+            // Determine initial aspiration window bounds
+            let (initial_alpha, initial_beta) = if depth <= 4 || best_move.is_none() {
+                // Full window for early depths or when no best move exists
+                (-31000, 31000)
+            } else {
+                // Narrow aspiration window centered on previous iteration's score
+                (best_score - INITIAL_WINDOW, best_score + INITIAL_WINDOW)
+            };
+
+            let mut alpha = initial_alpha;
+            let mut beta = initial_beta;
+            let mut window_size = INITIAL_WINDOW;
+            let mut search_iterations = 0;
+            const MAX_ASPIRATION_ITERATIONS: usize = 6;
+
+            // Aspiration window re-search loop
+            loop {
+                search_iterations += 1;
+
+                let score = negamax(
+                    board,
+                    depth,
+                    alpha,
+                    beta,
+                    start_time,
+                    0,
+                    &mut stats,
+                    root_color,
+                    &mut tt_guard,
+                    max_time,
+                    &mut timeout_occurred,
+                    None,
+                    contempt,
+                );
+
+                if timeout_occurred {
+                    break;
+                }
+
+            // Check if we failed low or high
+            if score <= alpha {
+                // FAIL LOW: True score is <= alpha
+                // Standard PVS: Open the window downward, keep beta
+                if STATS {
+                    println!(
+                        "info string Aspiration fail-low at depth {} (score {} <= alpha {})",
+                        depth, score, alpha
+                    );
+                }
+
+                // Widen window exponentially
+                window_size *= 2;
+
+                if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
+                    // Give up on aspiration, do full search
+                    alpha = -31000;
+                    beta = initial_beta.max(score + INITIAL_WINDOW);
+                } else {
+                    // Re-search with lowered alpha, keeping beta stable
+                    alpha = (score - window_size).max(-31000);
+                    // Beta remains at initial_beta or can be narrowed slightly
+                    beta = initial_beta;
+                }
+            } else if score >= beta {
+                // FAIL HIGH: True score is >= beta
+                // Standard PVS: Open the window upward, keep alpha
+                if STATS {
+                    println!(
+                        "info string Aspiration fail-high at depth {} (score {} >= beta {})",
+                        depth, score, beta
+                    );
+                }
+
+                // Widen window exponentially
+                window_size *= 2;
+
+                if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
+                    // Give up on aspiration, do full search
+                    alpha = initial_alpha.min(score - INITIAL_WINDOW);
+                    beta = 31000;
+                } else {
+                    // Re-search with raised beta, keeping alpha stable
+                    beta = (score + window_size).min(31000);
+                    // Alpha remains at initial_alpha or can be narrowed slightly
+                    alpha = initial_alpha;
+                }
+            } else {
+                // SUCCESS: Score is within [alpha, beta]
+                best_score = score;
+
+                let board_hash = compute_zobrist_hash(board);
+                if let Some(mv) = tt_guard.get_move(board_hash) {
+                    let movegen = MoveGen::new_legal(board);
+                    if movegen.into_iter().any(|legal_move| legal_move == mv) {
+                        best_move = Some(mv);
+
+                        if STATS {
+                            // Extract and display principal variation
+                            let mut pv = Vec::new();
+                            let mut temp_board = *board;
+
+                            for _ in 0..depth.min(20) {
+                                let h = compute_zobrist_hash(&temp_board);
+                                if let Some(pv_move) = tt_guard.get_move(h) {
+                                    let movegen = MoveGen::new_legal(&temp_board);
+                                    if movegen.into_iter().any(|legal_move| legal_move == pv_move) {
+                                        pv.push(pv_move);
+                                        temp_board = temp_board.make_move_new(pv_move);
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            let time_ms = (start_time.elapsed().as_secs_f64() * 1000.0) as u64;
+                            let nps = if time_ms > 0 {
+                                stats.nodes * 1000 / time_ms as usize
+                            } else {
+                                0
+                            };
+                            let pv_string = pv
+                                .iter()
+                                .map(|m| format!("{}", m))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+
+                            // Calculate hash usage percentage
+                            let hashfull = tt_guard.hashfull();
+
+                            println!(
+                                "info depth {} seldepth {} score cp {} nodes {} nps {} time {} hashfull {} pv {}",
+                                depth, 
+                                stats.seldepth, 
+                                best_score, 
+                                stats.nodes, 
+                                nps, 
+                                time_ms,
+                                hashfull,
+                                pv_string
+                            );
+                        }
+
+                        // Early exit if mate found
+                        if best_score.abs() > 29000 {
+                            break;
+                        }
+                    }
+                }
+                break; // Exit aspiration window loop on success
+            }
+
+            // Safety: prevent infinite loops
+            if timeout_occurred || search_iterations >= MAX_ASPIRATION_ITERATIONS * 2 {
+                if STATS && search_iterations >= MAX_ASPIRATION_ITERATIONS * 2 {
+                    println!(
+                        "info string Aspiration window abandoned after {} iterations",
+                        search_iterations
+                    );
+                }
+                break;
+            }
+        }
+
+        if timeout_occurred {
+            break;
+        }
+    }
+
+    best_move.or_else(|| {
+        let moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
+        moves.first().copied()
+    })
+    })
 }
