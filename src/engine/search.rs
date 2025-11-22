@@ -111,7 +111,7 @@ fn quiesce(
         }
         
         // SEE pruning - skip obviously bad captures
-        if !see_capture(board, mv, 0) {
+        if !see_capture(board, mv, -50) {
             continue;
         }
 
