@@ -317,35 +317,7 @@ fn negamax(
                     }
 
                     if null_score >= beta {
-                        // Null move verification
-                        if depth >= 12 {
-                            let verification_depth = depth.saturating_sub(r + 1);
-                            let verification_score = negamax(
-                                board,
-                                verification_depth,
-                                beta - 1,
-                                beta,
-                                start_time,
-                                ply,
-                                stats,
-                                root_color,
-                                tt,
-                                max_time,
-                                timeout_occurred,
-                                None,
-                                contempt,
-                            );
-
-                            if *timeout_occurred {
-                                return evaluate(board, 0);
-                            }
-
-                            if verification_score >= beta {
-                                return null_score;
-                            }
-                        } else {
-                            return null_score;
-                        }
+                        return null_score;
                     }
                 }
             }
