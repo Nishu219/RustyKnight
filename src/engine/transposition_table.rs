@@ -1,10 +1,10 @@
 use chess::{ChessMove, Piece, Square};
 
-// Pack ChessMove into 16 bits: source(6) + dest(6) + promotion(4)
+// Layout: source(6) + dest(6) + promotion(3) = 15 bits used
 #[inline(always)]
-pub fn pack_move(mv: ChessMove) -> u32 {
-    let source = mv.get_source().to_index() as u32;
-    let dest = mv.get_dest().to_index() as u32;
+pub fn pack_move(mv: ChessMove) -> u16 {
+    let source = mv.get_source().to_index() as u16;
+    let dest = mv.get_dest().to_index() as u16;
     let promotion = match mv.get_promotion() {
         None => 0,
         Some(Piece::Knight) => 1,
@@ -17,10 +17,10 @@ pub fn pack_move(mv: ChessMove) -> u32 {
 }
 
 #[inline(always)]
-pub fn unpack_move(packed: u32) -> ChessMove {
+pub fn unpack_move(packed: u16) -> ChessMove {
     let source = unsafe { Square::new((packed & 0x3F) as u8) };
     let dest = unsafe { Square::new(((packed >> 6) & 0x3F) as u8) };
-    let promotion = match (packed >> 12) & 0xF {
+    let promotion = match (packed >> 12) & 0x7 {
         1 => Some(Piece::Knight),
         2 => Some(Piece::Bishop),
         3 => Some(Piece::Rook),
@@ -38,14 +38,15 @@ pub enum TTFlag {
     Upper,
 }
 
-// Optimized entry: 12 bytes (best achievable with alignment)
-// Rust pads to 4-byte alignment, so 10 bytes becomes 12
-// Still better than original 16 bytes (25% memory savings)
-// Layout: key(4) + move(4) + value(2) + packed(2) + padding(2)
+// 10 bytes packed 
+// Alignment is 2 bytes
+// Layout: key_low(2) + key_high(2) + move(2) + value(2) + packed(2)
 #[derive(Clone, Copy)]
+#[repr(C)] // Ensure standard C layout ordering
 pub struct TTEntry {
-    key: u32,      // Upper 32 bits of zobrist hash
-    move_: u32,    // Packed move
+    key_low: u16,  // Split u32 key to enforce u16 alignment
+    key_high: u16, 
+    move_: u16,    // Compressed move
     value: i16,    // Evaluation score
     packed: u16,   // depth:6, flag:2, age:8
 }
@@ -53,7 +54,8 @@ pub struct TTEntry {
 impl Default for TTEntry {
     fn default() -> Self {
         Self {
-            key: 0,
+            key_low: 0,
+            key_high: 0,
             move_: 0,
             value: 0,
             packed: 0,
@@ -62,6 +64,19 @@ impl Default for TTEntry {
 }
 
 impl TTEntry {
+    // Helper to reconstruct the full 32-bit key
+    #[inline(always)]
+    pub fn key(&self) -> u32 {
+        (self.key_low as u32) | ((self.key_high as u32) << 16)
+    }
+
+    // Helper to set the full 32-bit key
+    #[inline(always)]
+    pub fn set_key(&mut self, key: u32) {
+        self.key_low = (key & 0xFFFF) as u16;
+        self.key_high = (key >> 16) as u16;
+    }
+
     // Extract depth (0-63) from bits 0-5
     #[inline(always)]
     pub fn depth(&self) -> u8 {
@@ -111,6 +126,7 @@ impl TTEntry {
 }
 
 // 4-way set associative bucket
+// Bucket size is 4 * 10 = 40 bytes 
 #[derive(Clone)]
 struct TTBucket {
     entries: [TTEntry; 4],
@@ -152,7 +168,6 @@ impl TranspositionTable {
     }
 
     // Probe TT for stored evaluation
-    // Returns Some(value) if entry is usable for cutoff, None otherwise
     #[inline(always)]
     pub fn get(&mut self, key: u64, depth: usize, alpha: i32, beta: i32) -> Option<i32> {
         let index = (key as usize) % self.size;
@@ -160,7 +175,8 @@ impl TranspositionTable {
         let bucket = &self.table[index];
         
         for entry in &bucket.entries {
-            if entry.key == key32 && entry.flag() != TTFlag::None {
+            // Use .key() helper to reconstruct the comparison key
+            if entry.key() == key32 && entry.flag() != TTFlag::None {
                 if entry.depth() as usize >= depth {
                     self.hits += 1;
                     let val = entry.value as i32;
@@ -178,7 +194,6 @@ impl TranspositionTable {
     }
 
     // Store position evaluation and best move
-    // Uses replacement scheme: same position > old entries > lower depth
     #[inline(always)]
     pub fn store(
         &mut self,
@@ -201,8 +216,7 @@ impl TranspositionTable {
         let mut replace_score = i32::MAX;
         
         for (i, entry) in bucket.entries.iter().enumerate() {
-            // Always update exact position match
-            if entry.key == key32 {
+            if entry.key() == key32 {
                 let mut updated_entry = *entry;
                 updated_entry.set_depth(depth_u8);
                 updated_entry.value = value_i16;
@@ -239,7 +253,7 @@ impl TranspositionTable {
         
         // Create and store new entry
         let mut new_entry = TTEntry::default();
-        new_entry.key = key32;
+        new_entry.set_key(key32); 
         new_entry.set_depth(depth_u8);
         new_entry.value = value_i16;
         new_entry.set_flag(flag);
@@ -248,7 +262,7 @@ impl TranspositionTable {
         bucket.entries[replace_idx] = new_entry;
     }
 
-    // Retrieve best move for position (for move ordering)
+    // Retrieve best move for position
     #[inline(always)]
     pub fn get_move(&self, key: u64) -> Option<ChessMove> {
         let index = (key as usize) % self.size;
@@ -258,7 +272,7 @@ impl TranspositionTable {
         let mut best_depth = 0;
         
         for entry in &bucket.entries {
-            if entry.key == key32 && entry.move_ != 0 {
+            if entry.key() == key32 && entry.move_ != 0 {
                 if entry.depth() > best_depth {
                     best_depth = entry.depth();
                     best_move = Some(unpack_move(entry.move_));
@@ -268,8 +282,7 @@ impl TranspositionTable {
         best_move
     }
     
-    // Calculate hash table fill rate (per mille: 0-1000)
-    // Samples first 1000 buckets for efficiency
+    // Hashfull calculation
     pub fn hashfull(&self) -> usize {
         let sample_size = 1000.min(self.size);
         let mut filled = 0;
@@ -277,7 +290,8 @@ impl TranspositionTable {
         for i in 0..sample_size {
             let bucket = &self.table[i];
             for entry in &bucket.entries {
-                if entry.age() == self.age && entry.key != 0 {
+                // Use .key() helper
+                if entry.age() == self.age && entry.key() != 0 {
                     filled += 1;
                     break;
                 }
@@ -286,7 +300,7 @@ impl TranspositionTable {
         (filled * 1000) / sample_size
     }
 
-    // Get stored depth for singular extension checks
+    // Get stored depth
     #[inline(always)]
     pub fn get_depth(&self, key: u64) -> Option<usize> {
         let index = (key as usize) % self.size;
@@ -297,7 +311,7 @@ impl TranspositionTable {
         let mut found = false;
         
         for entry in &bucket.entries {
-            if entry.key == key32 && entry.flag() != TTFlag::None {
+            if entry.key() == key32 && entry.flag() != TTFlag::None {
                 if entry.depth() as usize > best_depth {
                     best_depth = entry.depth() as usize;
                     found = true;
