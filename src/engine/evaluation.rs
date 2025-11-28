@@ -564,7 +564,7 @@ fn evaluate_rooks(board: &Board) -> i32 {
 
     score
 }
-fn evaluate_pawns(board: &Board) -> i32 {
+fn evaluate_pawns(board: &Board, white_pawn_attacks: BitBoard, black_pawn_attacks: BitBoard) -> i32 {
     let pawn_hash = compute_pawn_hash(board);
 
     let cached_score = PAWN_HASH_TABLE.with(|cache| {
@@ -591,16 +591,11 @@ fn evaluate_pawns(board: &Board) -> i32 {
 
     let mut score = 0;
     
-    // Pre-compute pawn attack maps using efficient bit shifts
+    // Use pre-computed pawn attacks passed as parameters
+    // Compute pawn support bitboards (these are different from attacks)
     let not_a_file = BitBoard::new(0xFEFEFEFEFEFEFEFE);
     let not_h_file = BitBoard::new(0x7F7F7F7F7F7F7F7F);
     
-    let white_pawn_attacks = BitBoard::new(((white_pawns & not_a_file).0 << 7) | 
-                                           ((white_pawns & not_h_file).0 << 9));
-    let black_pawn_attacks = BitBoard::new(((black_pawns & not_a_file).0 >> 9) | 
-                                           ((black_pawns & not_h_file).0 >> 7));
-
-    // Pre-compute pawn support bitboards
     let white_pawn_support = BitBoard::new(((white_pawns & not_a_file).0 >> 9) | 
                                            ((white_pawns & not_h_file).0 >> 7));
     let black_pawn_support = BitBoard::new(((black_pawns & not_a_file).0 << 7) | 
@@ -906,27 +901,27 @@ fn evaluate_king_ring_attacks(board: &Board, phase: i32) -> i32 {
 
     ((mg_score * phase) + (eg_score * (24 - phase))) / 24
 }
-fn evaluate_mobility(board: &Board, phase: i32) -> i32 {
+fn evaluate_mobility(board: &Board, phase: i32, white_pawn_attacks: BitBoard, black_pawn_attacks: BitBoard) -> i32 {
     let mut score_mg = 0;
     let mut score_eg = 0;
     let white_pieces = board.color_combined(Color::White);
     let black_pieces = board.color_combined(Color::Black);
     let occupied = board.combined();
     
-    // Compute mobility for all pieces in optimized order
-    
     // Knights 
     let white_knights = board.pieces(Piece::Knight) & white_pieces;
     let black_knights = board.pieces(Piece::Knight) & black_pieces;
     
+    // Safe mobility for white knights (exclude squares attacked by black pawns)
     let wn_mob = (white_knights.into_iter()
-        .map(|sq| (chess::get_knight_moves(sq) & !white_pieces).popcnt())
-        .sum::<u32>() as usize).min(8);
-    let bn_mob = (black_knights.into_iter()
-        .map(|sq| (chess::get_knight_moves(sq) & !black_pieces).popcnt())
+        .map(|sq| (chess::get_knight_moves(sq) & !white_pieces & !black_pawn_attacks).popcnt())
         .sum::<u32>() as usize).min(8);
     
-    // Use lookup tables for aggregated mobility
+    // Safe mobility for black knights (exclude squares attacked by white pawns)
+    let bn_mob = (black_knights.into_iter()
+        .map(|sq| (chess::get_knight_moves(sq) & !black_pieces & !white_pawn_attacks).popcnt())
+        .sum::<u32>() as usize).min(8);
+    
     score_mg += KNIGHT_MOBILITY_MG[wn_mob] - KNIGHT_MOBILITY_MG[bn_mob];
     score_eg += KNIGHT_MOBILITY_EG[wn_mob] - KNIGHT_MOBILITY_EG[bn_mob];
     
@@ -935,13 +930,13 @@ fn evaluate_mobility(board: &Board, phase: i32) -> i32 {
     let black_bishops = board.pieces(Piece::Bishop) & black_pieces;
     
     for sq in white_bishops {
-        let mobility = (chess::get_bishop_moves(sq, *occupied) & !white_pieces).popcnt().min(13) as usize;
+        let mobility = (chess::get_bishop_moves(sq, *occupied) & !white_pieces & !black_pawn_attacks).popcnt().min(13) as usize;
         score_mg += BISHOP_MOBILITY_MG[mobility];
         score_eg += BISHOP_MOBILITY_EG[mobility];
     }
     
     for sq in black_bishops {
-        let mobility = (chess::get_bishop_moves(sq, *occupied) & !black_pieces).popcnt().min(13) as usize;
+        let mobility = (chess::get_bishop_moves(sq, *occupied) & !black_pieces & !white_pawn_attacks).popcnt().min(13) as usize;
         score_mg -= BISHOP_MOBILITY_MG[mobility];
         score_eg -= BISHOP_MOBILITY_EG[mobility];
     }
@@ -951,13 +946,13 @@ fn evaluate_mobility(board: &Board, phase: i32) -> i32 {
     let black_rooks = board.pieces(Piece::Rook) & black_pieces;
     
     for sq in white_rooks {
-        let mobility = (chess::get_rook_moves(sq, *occupied) & !white_pieces).popcnt().min(14) as usize;
+        let mobility = (chess::get_rook_moves(sq, *occupied) & !white_pieces & !black_pawn_attacks).popcnt().min(14) as usize;
         score_mg += ROOK_MOBILITY_MG[mobility];
         score_eg += ROOK_MOBILITY_EG[mobility];
     }
     
     for sq in black_rooks {
-        let mobility = (chess::get_rook_moves(sq, *occupied) & !black_pieces).popcnt().min(14) as usize;
+        let mobility = (chess::get_rook_moves(sq, *occupied) & !black_pieces & !white_pawn_attacks).popcnt().min(14) as usize;
         score_mg -= ROOK_MOBILITY_MG[mobility];
         score_eg -= ROOK_MOBILITY_EG[mobility];
     }
@@ -967,14 +962,14 @@ fn evaluate_mobility(board: &Board, phase: i32) -> i32 {
     let black_queens = board.pieces(Piece::Queen) & black_pieces;
     
     for sq in white_queens {
-        let mobility = ((chess::get_rook_moves(sq, *occupied) | chess::get_bishop_moves(sq, *occupied)) & !white_pieces)
+        let mobility = ((chess::get_rook_moves(sq, *occupied) | chess::get_bishop_moves(sq, *occupied)) & !white_pieces & !black_pawn_attacks)
             .popcnt().min(27) as usize;
         score_mg += QUEEN_MOBILITY_MG[mobility];
         score_eg += QUEEN_MOBILITY_EG[mobility];
     }
     
     for sq in black_queens {
-        let mobility = ((chess::get_rook_moves(sq, *occupied) | chess::get_bishop_moves(sq, *occupied)) & !black_pieces)
+        let mobility = ((chess::get_rook_moves(sq, *occupied) | chess::get_bishop_moves(sq, *occupied)) & !black_pieces & !white_pawn_attacks)
             .popcnt().min(27) as usize;
         score_mg -= QUEEN_MOBILITY_MG[mobility];
         score_eg -= QUEEN_MOBILITY_EG[mobility];
@@ -1224,6 +1219,18 @@ pub fn evaluate(board: &Board, contempt: i32) -> i32 {
     phase += (board.pieces(Piece::Rook).popcnt() * 2) as i32;
     phase += (board.pieces(Piece::Queen).popcnt() * 4) as i32;
     phase = phase.min(24);
+
+    // Pre-compute pawn attack maps for safe mobility
+    let not_a_file = BitBoard::new(0xFEFEFEFEFEFEFEFE);
+    let not_h_file = BitBoard::new(0x7F7F7F7F7F7F7F7F);
+
+    let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+    let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+
+    let white_pawn_attacks = BitBoard::new(((white_pawns & not_a_file).0 << 7) | 
+                                           ((white_pawns & not_h_file).0 << 9));
+    let black_pawn_attacks = BitBoard::new(((black_pawns & not_a_file).0 >> 9) | 
+                                           ((black_pawns & not_h_file).0 >> 7));
     
     for sq_idx in 0..64 {
         let square = unsafe { Square::new(sq_idx) };
@@ -1274,11 +1281,11 @@ pub fn evaluate(board: &Board, contempt: i32) -> i32 {
     }
     
     score += evaluate_rooks(board);
-    score += evaluate_pawns(board);
+    score += evaluate_pawns(board, white_pawn_attacks, black_pawn_attacks);
     score += evaluate_king_tropism(board, phase);
     score += evaluate_king_ring_attacks(board, phase);
     score += evaluate_king_pawn_shield(board, phase);
-    score += evaluate_mobility(board, phase);
+    score += evaluate_mobility(board, phase, white_pawn_attacks, black_pawn_attacks);
     score += evaluate_space(board, phase);
     score += evaluate_bad_bishops(board, phase);
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
