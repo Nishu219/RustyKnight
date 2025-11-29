@@ -927,6 +927,7 @@ pub fn iterative_deepening(
     max_time: f64,
     contempt: i32,
     is_movetime: bool,
+    max_depth: Option<usize>,
 ) -> Option<ChessMove> {
     let start_time = Instant::now();
     let mut best_move = None;
@@ -937,15 +938,19 @@ pub fn iterative_deepening(
         let mut tt_guard = tt.borrow_mut();
         let mut stats = SearchStats::default();
 
-        for depth in 1..=MAX_DEPTH {
-            let elapsed = start_time.elapsed().as_secs_f64();
-            let time_limit = if is_movetime {
-                max_time * 0.95
-            } else {
-                max_time * 0.80
-            };
-            if elapsed > time_limit {
-                break;
+        let max_search_depth = max_depth.unwrap_or(MAX_DEPTH);
+
+        for depth in 1..=max_search_depth {
+            if max_depth.is_none() {
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let time_limit = if is_movetime {
+                    max_time * 0.95
+                } else {
+                    max_time * 0.80
+                };
+                if elapsed > time_limit {
+                    break;
+                }
             }
 
             let mut timeout_occurred = false;
