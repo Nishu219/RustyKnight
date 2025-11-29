@@ -936,6 +936,7 @@ pub fn iterative_deepening(
     TRANSPOSITION_TABLE.with(|tt| {
         let mut tt_guard = tt.borrow_mut();
         let mut stats = SearchStats::default();
+
         for depth in 1..=MAX_DEPTH {
             let elapsed = start_time.elapsed().as_secs_f64();
             let time_limit = if is_movetime {
@@ -949,12 +950,10 @@ pub fn iterative_deepening(
 
             let mut timeout_occurred = false;
 
-            // Determine initial aspiration window bounds
+            // Aspiration window setup
             let (initial_alpha, initial_beta) = if depth <= 4 || best_move.is_none() {
-                // Full window for early depths or when no best move exists
-                (-31000, 31000)
+                (-31000, 31000)  // Full window for early depths
             } else {
-                // Narrow aspiration window centered on previous iteration's score
                 (best_score - INITIAL_WINDOW, best_score + INITIAL_WINDOW)
             };
 
@@ -988,140 +987,135 @@ pub fn iterative_deepening(
                     break;
                 }
 
-            // Check if we failed low or high
-            if score <= alpha {
-                // FAIL LOW: True score is <= alpha
-                // Standard PVS: Open the window downward, keep beta
-                if STATS {
-                    println!(
-                        "info string Aspiration fail-low at depth {} (score {} <= alpha {})",
-                        depth, score, alpha
-                    );
-                }
+                // Check if we failed low or high
+                if score <= alpha {
+                    // FAIL LOW: True score is <= alpha
+                    // Widen window exponentially
+                    window_size = (window_size * 2).min(MAX_WINDOW);
 
-                // Widen window exponentially
-                window_size *= 2;
-
-                if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
-                    // Give up on aspiration, do full search
-                    alpha = -31000;
-                    beta = initial_beta.max(score + INITIAL_WINDOW);
-                } else {
-                    // Re-search with lowered alpha, keeping beta stable
-                    alpha = (score - window_size).max(-31000);
-                    // Beta remains at initial_beta or can be narrowed slightly
-                    beta = initial_beta;
-                }
-            } else if score >= beta {
-                // FAIL HIGH: True score is >= beta
-                // Standard PVS: Open the window upward, keep alpha
-                if STATS {
-                    println!(
-                        "info string Aspiration fail-high at depth {} (score {} >= beta {})",
-                        depth, score, beta
-                    );
-                }
-
-                // Widen window exponentially
-                window_size *= 2;
-
-                if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
-                    // Give up on aspiration, do full search
-                    alpha = initial_alpha.min(score - INITIAL_WINDOW);
-                    beta = 31000;
-                } else {
-                    // Re-search with raised beta, keeping alpha stable
-                    beta = (score + window_size).min(31000);
-                    // Alpha remains at initial_alpha or can be narrowed slightly
-                    alpha = initial_alpha;
-                }
-            } else {
-                // SUCCESS: Score is within [alpha, beta]
-                best_score = score;
-
-                let board_hash = compute_zobrist_hash(board);
-                if let Some(mv) = tt_guard.get_move(board_hash) {
-                    let movegen = MoveGen::new_legal(board);
-                    if movegen.into_iter().any(|legal_move| legal_move == mv) {
-                        best_move = Some(mv);
+                    if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
+                        // Give up, use full window
+                        alpha = -31000;
+                        beta = 31000;
+                        if STATS {
+                            println!("info string Giving up on aspiration, using full window");
+                        }
+                    } else {
+                        // Adjust window symmetrically around best score
+                        alpha = (best_score - window_size).max(-31000);
+                        beta = (best_score + window_size).min(31000);
 
                         if STATS {
-                            // Extract and display principal variation
-                            let mut pv = Vec::new();
-                            let mut temp_board = *board;
+                            println!("info string Re-searching with window [{}, {}]", alpha, beta);
+                        }
+                    }
+                } else if score >= beta {
+                    // FAIL HIGH: True score is >= beta
+                    // Widen window exponentially
+                    window_size = (window_size * 2).min(MAX_WINDOW);
 
-                            for _ in 0..depth.min(20) {
-                                let h = compute_zobrist_hash(&temp_board);
-                                if let Some(pv_move) = tt_guard.get_move(h) {
-                                    let movegen = MoveGen::new_legal(&temp_board);
-                                    if movegen.into_iter().any(|legal_move| legal_move == pv_move) {
-                                        pv.push(pv_move);
-                                        temp_board = temp_board.make_move_new(pv_move);
+                    if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
+                        // Give up, use full window
+                        alpha = -31000;
+                        beta = 31000;
+                        if STATS {
+                            println!("info string Giving up on aspiration, using full window");
+                        }
+                    } else {
+                        // Adjust window symmetrically around best score
+                        alpha = (best_score - window_size).max(-31000);
+                        beta = (best_score + window_size).min(31000);
+
+                        if STATS {
+                            println!("info string Re-searching with window [{}, {}]", alpha, beta);
+                        }
+                    }
+                } else {
+                    // SUCCESS: Score is within [alpha, beta]
+                    best_score = score;
+
+                    let board_hash = compute_zobrist_hash(board);
+                    if let Some(mv) = tt_guard.get_move(board_hash) {
+                        let movegen = MoveGen::new_legal(board);
+                        if movegen.into_iter().any(|legal_move| legal_move == mv) {
+                            best_move = Some(mv);
+
+                            if STATS {
+                                // Extract PV
+                                let mut pv = Vec::new();
+                                let mut temp_board = *board;
+
+                                for _ in 0..depth.min(20) {
+                                    let h = compute_zobrist_hash(&temp_board);
+                                    if let Some(pv_move) = tt_guard.get_move(h) {
+                                        let movegen = MoveGen::new_legal(&temp_board);
+                                        if movegen.into_iter().any(|legal_move| legal_move == pv_move) {
+                                            pv.push(pv_move);
+                                            temp_board = temp_board.make_move_new(pv_move);
+                                        } else {
+                                            break;
+                                        }
                                     } else {
                                         break;
                                     }
-                                } else {
-                                    break;
                                 }
+
+                                let time_ms = (start_time.elapsed().as_secs_f64() * 1000.0) as u64;
+                                let nps = if time_ms > 0 {
+                                    stats.nodes * 1000 / time_ms as usize
+                                } else {
+                                    0
+                                };
+                                let pv_string = pv
+                                    .iter()
+                                    .map(|m| format!("{}", m))
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+
+                                let hashfull = tt_guard.hashfull();
+
+                                println!(
+                                    "info depth {} seldepth {} score cp {} nodes {} nps {} time {} hashfull {} pv {}",
+                                    depth,
+                                    stats.seldepth,
+                                    best_score,
+                                    stats.nodes,
+                                    nps,
+                                    time_ms,
+                                    hashfull,
+                                    pv_string
+                                );
                             }
 
-                            let time_ms = (start_time.elapsed().as_secs_f64() * 1000.0) as u64;
-                            let nps = if time_ms > 0 {
-                                stats.nodes * 1000 / time_ms as usize
-                            } else {
-                                0
-                            };
-                            let pv_string = pv
-                                .iter()
-                                .map(|m| format!("{}", m))
-                                .collect::<Vec<_>>()
-                                .join(" ");
-
-                            // Calculate hash usage percentage
-                            let hashfull = tt_guard.hashfull();
-
-                            println!(
-                                "info depth {} seldepth {} score cp {} nodes {} nps {} time {} hashfull {} pv {}",
-                                depth, 
-                                stats.seldepth, 
-                                best_score, 
-                                stats.nodes, 
-                                nps, 
-                                time_ms,
-                                hashfull,
-                                pv_string
-                            );
-                        }
-
-                        // Early exit if mate found
-                        if best_score.abs() > 29000 {
-                            break;
+                            // Early exit if mate found
+                            if best_score.abs() > 29000 {
+                                break;
+                            }
                         }
                     }
+                    break; // Exit aspiration loop on success
                 }
-                break; // Exit aspiration window loop on success
+
+                // Safety check
+                if timeout_occurred || search_iterations >= MAX_ASPIRATION_ITERATIONS * 2 {
+                    if STATS && search_iterations >= MAX_ASPIRATION_ITERATIONS * 2 {
+                        println!(
+                            "info string Aspiration window abandoned after {} iterations",
+                            search_iterations
+                        );
+                    }
+                    break;
+                }
             }
 
-            // Safety: prevent infinite loops
-            if timeout_occurred || search_iterations >= MAX_ASPIRATION_ITERATIONS * 2 {
-                if STATS && search_iterations >= MAX_ASPIRATION_ITERATIONS * 2 {
-                    println!(
-                        "info string Aspiration window abandoned after {} iterations",
-                        search_iterations
-                    );
-                }
+            if timeout_occurred {
                 break;
             }
         }
 
-        if timeout_occurred {
-            break;
-        }
-    }
-
-    best_move.or_else(|| {
-        let moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
-        moves.first().copied()
-    })
+        best_move.or_else(|| {
+            let moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
+            moves.first().copied()
+        })
     })
 }
