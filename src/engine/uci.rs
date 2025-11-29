@@ -157,6 +157,7 @@ impl UCIEngine {
         let mut winc = None;
         let mut binc = None;
         let mut movetime = None;
+        let mut depth = None;
         let mut infinite = false;
 
         let mut i = 1;
@@ -202,6 +203,14 @@ impl UCIEngine {
                         i += 1;
                     }
                 }
+                "depth" => {
+                    if i + 1 < tokens.len() {
+                        depth = tokens[i + 1].parse().ok();
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
                 "infinite" => {
                     infinite = true;
                     i += 1;
@@ -219,7 +228,7 @@ impl UCIEngine {
         let is_movetime = movetime.is_some();
 
         if let Some(best_move) =
-            iterative_deepening(&self.board, max_time, self.contempt, is_movetime)
+            iterative_deepening(&self.board, max_time, self.contempt, is_movetime, depth)
         {
             println!("bestmove {}", best_move);
         } else {
