@@ -2,6 +2,7 @@ use chess::Piece;
 
 pub const MATE_THREAT_DEPTH: usize = 4;
 pub const MAX_DEPTH: usize = 99;
+pub const MAX_ASPIRATION_ITERATIONS: usize = 6;
 pub const INITIAL_WINDOW: i32 = 50;
 pub const MAX_WINDOW: i32 = 400;
 pub const STATS: bool = true;

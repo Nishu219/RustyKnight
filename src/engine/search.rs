@@ -966,7 +966,6 @@ pub fn iterative_deepening(
             let mut beta = initial_beta;
             let mut window_size = INITIAL_WINDOW;
             let mut search_iterations = 0;
-            const MAX_ASPIRATION_ITERATIONS: usize = 6;
 
             // Aspiration window re-search loop
             loop {
