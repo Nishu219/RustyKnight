@@ -1232,49 +1232,43 @@ pub fn evaluate(board: &Board, contempt: i32) -> i32 {
     let black_pawn_attacks = BitBoard::new(((black_pawns & not_a_file).0 >> 9) | 
                                            ((black_pawns & not_h_file).0 >> 7));
     
-    for sq_idx in 0..64 {
-        let square = unsafe { Square::new(sq_idx) };
-        if let Some(piece) = board.piece_on(square) {
-            let piece_color = if (*board.color_combined(Color::White)
-                & BitBoard::from_square(square))
-                != BitBoard(0)
-            {
-                Color::White
-            } else {
-                Color::Black
-            };
-            let piece_idx = piece_to_index(piece);
-            let pst_index = if piece_color == Color::White {
-                (sq_idx ^ 56) as usize
-            } else {
-                sq_idx as usize
-            };
+    // PST Evaluation
+    let white_pieces = board.color_combined(Color::White);
+    let black_pieces = board.color_combined(Color::Black);
+
+    for piece in chess::ALL_PIECES {
+        let piece_idx = piece_to_index(piece);
+        
+        // White pieces
+        for square in board.pieces(piece) & white_pieces {
+            let sq_idx = square.to_index();
+            let pst_index = sq_idx ^ 56;
             let mg_pst = PST[piece_idx][0][pst_index];
             let eg_pst = PST[piece_idx][1][pst_index];
-            let pst_value = ((mg_pst * phase) + (eg_pst * (24 - phase))) / 24;
-            if piece_color == Color::White {
-                score += pst_value;
-            } else {
-                score -= pst_value;
+            score += ((mg_pst * phase) + (eg_pst * (24 - phase))) / 24;
+
+            // Bonus for minor pieces with a pawn directly in front
+            if (piece == Piece::Knight || piece == Piece::Bishop) && square.get_rank().to_index() < 7 {
+                let ahead_sq = unsafe { Square::new((sq_idx + 8) as u8) };
+                if (white_pawns & BitBoard::from_square(ahead_sq)) != BitBoard::new(0) {
+                    score += 15;
+                }
             }
-            // Bonus for minor pieces with pawn directly in front
-            if piece == Piece::Knight || piece == Piece::Bishop {
-                let rank = square.get_rank().to_index();
-                let file = square.get_file().to_index();
-                if piece_color == Color::White && rank < 7 {
-                    let ahead_sq = unsafe { Square::new(((rank + 1) * 8 + file) as u8) };
-                    let white_pawns =
-                        board.pieces(Piece::Pawn) & board.color_combined(Color::White);
-                    if (white_pawns & BitBoard::from_square(ahead_sq)) != BitBoard::new(0) {
-                        score += 15;
-                    }
-                } else if piece_color == Color::Black && rank > 0 {
-                    let ahead_sq = unsafe { Square::new(((rank - 1) * 8 + file) as u8) };
-                    let black_pawns =
-                        board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
-                    if (black_pawns & BitBoard::from_square(ahead_sq)) != BitBoard::new(0) {
-                        score -= 15;
-                    }
+        }
+        
+        // Black pieces
+        for square in board.pieces(piece) & black_pieces {
+            let sq_idx = square.to_index();
+            let pst_index = sq_idx;
+            let mg_pst = PST[piece_idx][0][pst_index];
+            let eg_pst = PST[piece_idx][1][pst_index];
+            score -= ((mg_pst * phase) + (eg_pst * (24 - phase))) / 24;
+
+            // Bonus for minor pieces with a pawn directly in front
+            if (piece == Piece::Knight || piece == Piece::Bishop) && square.get_rank().to_index() > 0 {
+                let ahead_sq = unsafe { Square::new((sq_idx - 8) as u8) };
+                if (black_pawns & BitBoard::from_square(ahead_sq)) != BitBoard::new(0) {
+                    score -= 15;
                 }
             }
         }
