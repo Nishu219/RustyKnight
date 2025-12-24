@@ -1188,7 +1188,7 @@ fn evaluate_bad_bishops(board: &Board, phase: i32) -> i32 {
     (score * phase) / 24
 }
 
-pub fn evaluate(board: &Board, contempt: i32) -> i32 {
+pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
     let in_check = *board.checkers() != BitBoard(0);
     let has_legal_moves = MoveGen::new_legal(board).next().is_some();
 
@@ -1220,17 +1220,8 @@ pub fn evaluate(board: &Board, contempt: i32) -> i32 {
     phase += (board.pieces(Piece::Queen).popcnt() * 4) as i32;
     phase = phase.min(24);
 
-    // Pre-compute pawn attack maps for safe mobility
-    let not_a_file = BitBoard::new(0xFEFEFEFEFEFEFEFE);
-    let not_h_file = BitBoard::new(0x7F7F7F7F7F7F7F7F);
-
     let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
     let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
-
-    let white_pawn_attacks = BitBoard::new(((white_pawns & not_a_file).0 << 7) | 
-                                           ((white_pawns & not_h_file).0 << 9));
-    let black_pawn_attacks = BitBoard::new(((black_pawns & not_a_file).0 >> 9) | 
-                                           ((black_pawns & not_h_file).0 >> 7));
     
     // PST Evaluation
     let white_pieces = board.color_combined(Color::White);
@@ -1273,6 +1264,23 @@ pub fn evaluate(board: &Board, contempt: i32) -> i32 {
             }
         }
     }
+
+    // LAZY EVALUATION CHECK 
+    let current_lazy_score = if board.side_to_move() == Color::White { score } else { -score };
+    
+    if let Some(beta_val) = beta {
+        if current_lazy_score - LAZY_EVAL_MARGIN >= beta_val {
+            return current_lazy_score;
+        }
+    }
+    
+    // Pre-compute pawn attack maps for safe mobility
+    let not_a_file = BitBoard::new(0xFEFEFEFEFEFEFEFE);
+    let not_h_file = BitBoard::new(0x7F7F7F7F7F7F7F7F);
+    let white_pawn_attacks = BitBoard::new(((white_pawns & not_a_file).0 << 7) | 
+                                           ((white_pawns & not_h_file).0 << 9));
+    let black_pawn_attacks = BitBoard::new(((black_pawns & not_a_file).0 >> 9) | 
+                                           ((black_pawns & not_h_file).0 >> 7));
     
     score += evaluate_rooks(board);
     score += evaluate_pawns(board, white_pawn_attacks, black_pawn_attacks);
