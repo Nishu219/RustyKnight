@@ -55,10 +55,11 @@ fn quiesce(
     stats.seldepth = stats.seldepth.max(ply);
     if start_time.elapsed().as_secs_f64() > max_time {
         *timeout_occurred = true;
-        return evaluate(board, 0);
+        return evaluate(board, 0, None);
     }
 
-    let stand_pat = evaluate(board, 0);
+    // Pass beta for lazy eval optimization
+    let stand_pat = evaluate(board, 0, Some(beta));
 
     if stand_pat >= beta {
         return beta;
@@ -169,7 +170,7 @@ fn negamax(
     // Timeout check
     if start_time.elapsed().as_secs_f64() > max_time {
         *timeout_occurred = true;
-        return if ply > 0 { evaluate(board, 0) } else { 0 };
+        return if ply > 0 { evaluate(board, 0, None) } else { 0 };
     }
 
     let position_hash = compute_zobrist_hash(board);
@@ -225,7 +226,8 @@ fn negamax(
     let static_eval = if in_check {
         -30000 + ply as i32
     } else {
-        evaluate(board, contempt)
+        // Pass beta to trigger lazy eval
+        evaluate(board, contempt, Some(beta))
     };
 
 
@@ -262,7 +264,7 @@ fn negamax(
                     ply,
                 );
                 if *timeout_occurred {
-                    return evaluate(board, 0);
+                    return evaluate(board, 0, None);
                 }
                 if razor_score <= razor_alpha {
                     return razor_score;
@@ -313,7 +315,7 @@ fn negamax(
                     );
 
                     if *timeout_occurred {
-                        return evaluate(board, 0);
+                        return evaluate(board, 0, None);
                     }
 
                     if null_score >= beta {
@@ -346,7 +348,7 @@ fn negamax(
                 );
 
                 if *timeout_occurred {
-                    return evaluate(board, 0);
+                    return evaluate(board, 0, None);
                 }
 
                 if probcut_score >= probcut_beta {
@@ -749,7 +751,7 @@ fn negamax(
             );
 
             if *timeout_occurred {
-                evaluate(board, 0)
+                evaluate(board, 0, None)
             } else {
                 // Re-search at full depth if reduced
                 if !do_full_search && search_score > alpha {
@@ -773,7 +775,7 @@ fn negamax(
 
                 // PV re-search
                 if *timeout_occurred {
-                    evaluate(board, 0)
+                    evaluate(board, 0, None)
                 } else if search_score > alpha {
                     if is_pv || (search_score < beta) {
                         -negamax(
