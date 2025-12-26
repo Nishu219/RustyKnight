@@ -78,7 +78,7 @@ fn quiesce(
         return alpha;
     }
 
-    let mut captures = Vec::new();
+    let mut captures = Vec::with_capacity(32);
     let movegen = MoveGen::new_legal(board);
 
     for mv in movegen {
