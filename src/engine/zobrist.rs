@@ -1,4 +1,4 @@
-use chess::{BitBoard, Board, Color, Square};
+use chess::{BitBoard, Board, Color};
 use lazy_static::lazy_static;
 use rand::Rng;
 
@@ -28,39 +28,35 @@ lazy_static! {
 
 pub fn compute_zobrist_hash(board: &Board) -> u64 {
     let mut h = 0;
-    for sq_idx in 0..64 {
-        let square = unsafe { Square::new(sq_idx) };
-        if let Some(piece) = board.piece_on(square) {
-            let piece_color = if (*board.color_combined(Color::White)
-                & BitBoard::from_square(square))
-                != BitBoard(0)
-            {
-                Color::White
-            } else {
-                Color::Black
-            };
-            h ^= ZOBRIST_PIECES[piece.to_index()][piece_color.to_index()][sq_idx as usize];
-        }
+    
+    // Iterate over occupied squares 
+    let occupied_squares = board.color_combined(Color::White) | board.color_combined(Color::Black);
+    for square in occupied_squares {
+        let piece = board.piece_on(square).unwrap();
+        let piece_color = if (board.color_combined(Color::White) & BitBoard::from_square(square)) != BitBoard(0) {
+            Color::White
+        } else {
+            Color::Black
+        };
+        h ^= ZOBRIST_PIECES[piece.to_index()][piece_color.to_index()][square.to_index()];
     }
-    let mut castling_rights = 0;
-    if board.castle_rights(Color::White).has_kingside() {
-        castling_rights |= 1;
-    }
-    if board.castle_rights(Color::White).has_queenside() {
-        castling_rights |= 2;
-    }
-    if board.castle_rights(Color::Black).has_kingside() {
-        castling_rights |= 4;
-    }
-    if board.castle_rights(Color::Black).has_queenside() {
-        castling_rights |= 8;
-    }
+    
+    // Castling rights calculation
+    let white_castle = board.castle_rights(Color::White);
+    let black_castle = board.castle_rights(Color::Black);
+    let castling_rights = (white_castle.has_kingside() as u8) 
+        | ((white_castle.has_queenside() as u8) << 1)
+        | ((black_castle.has_kingside() as u8) << 2)
+        | ((black_castle.has_queenside() as u8) << 3);
     h ^= ZOBRIST_CASTLING[castling_rights as usize];
+    
     if let Some(ep_sq) = board.en_passant() {
         h ^= ZOBRIST_EP[ep_sq.get_file() as usize];
     }
+    
     if board.side_to_move() == Color::Black {
         h ^= *ZOBRIST_TURN;
     }
+    
     h
 }
