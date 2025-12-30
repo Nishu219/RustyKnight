@@ -1003,31 +1003,21 @@ fn evaluate_space(board: &Board, phase: i32) -> i32 {
         left_attacks | right_attacks
     };
     
-    // Calculate squares behind pawns using rank masks
+    // Calculate squares behind pawns using a fill algorithm for better performance
     let white_behind = {
-        let mut behind = BitBoard::new(0);
-        for pawn_sq in white_pawns {
-            let file = pawn_sq.get_file().to_index();
-            let rank = pawn_sq.get_rank().to_index();
-            // Mask for all squares below this rank on the same file
-            let file_mask = 0x0101010101010101u64 << file;
-            let rank_mask = (1u64 << (rank * 8)) - 1;
-            behind |= BitBoard::new(file_mask & rank_mask);
-        }
-        behind
+        let mut behind = white_pawns.0;
+        behind |= behind >> 8;
+        behind |= behind >> 16;
+        behind |= behind >> 32;
+        BitBoard(behind >> 8)
     };
-    
+
     let black_behind = {
-        let mut behind = BitBoard::new(0);
-        for pawn_sq in black_pawns {
-            let file = pawn_sq.get_file().to_index();
-            let rank = pawn_sq.get_rank().to_index();
-            // Mask for all squares above this rank on the same file
-            let file_mask = 0x0101010101010101u64 << file;
-            let rank_mask = !((1u64 << ((rank + 1) * 8)) - 1);
-            behind |= BitBoard::new(file_mask & rank_mask);
-        }
-        behind
+        let mut behind = black_pawns.0;
+        behind |= behind << 8;
+        behind |= behind << 16;
+        behind |= behind << 32;
+        BitBoard(behind << 8)
     };
     
     // Calculate space with bonus for controlled squares behind pawns
@@ -1304,4 +1294,5 @@ pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
     };
     final_score
 }
+
 
