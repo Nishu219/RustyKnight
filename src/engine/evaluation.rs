@@ -387,6 +387,28 @@ lazy_static! {
         }
         distances
     };
+
+    pub static ref KING_RING: [BitBoard; 64] = {
+        let mut rings = [BitBoard::new(0); 64];
+        for sq_idx in 0..64 {
+            let file = (sq_idx % 8) as i32;
+            let rank = (sq_idx / 8) as i32;
+            let mut ring_bb = BitBoard::new(0);
+            for file_offset in -1..=1 {
+                for rank_offset in -1..=1 {
+                    if file_offset == 0 && rank_offset == 0 { continue; }
+                    let new_file = file + file_offset;
+                    let new_rank = rank + rank_offset;
+                    if new_file >= 0 && new_file < 8 && new_rank >= 0 && new_rank < 8 {
+                        let new_sq_idx = (new_rank * 8 + new_file) as u8;
+                        ring_bb |= BitBoard(1u64 << new_sq_idx);
+                    }
+                }
+            }
+            rings[sq_idx] = ring_bb;
+        }
+        rings
+    };
 }
 
 pub struct MaterialHashTable {
@@ -809,25 +831,9 @@ fn evaluate_king_tropism(board: &Board, phase: i32) -> i32 {
 
     ((mg_score * phase) + (eg_score * (24 - phase))) / 24
 }
+#[inline(always)]
 fn get_king_ring(king_sq: Square) -> BitBoard {
-    let king_file = king_sq.get_file().to_index() as i32;
-    let king_rank = king_sq.get_rank().to_index() as i32;
-    let mut ring = BitBoard::new(0);
-
-    for file_offset in -1..=1 {
-        for rank_offset in -1..=1 {
-            if file_offset == 0 && rank_offset == 0 {
-                continue;
-            }
-            let new_file = king_file + file_offset;
-            let new_rank = king_rank + rank_offset;
-            if new_file >= 0 && new_file < 8 && new_rank >= 0 && new_rank < 8 {
-                let sq_idx = (new_rank * 8 + new_file) as u8;
-                ring |= BitBoard::from_square(unsafe { Square::new(sq_idx) });
-            }
-        }
-    }
-    ring
+    KING_RING[king_sq.to_index()]
 }
 
 fn count_piece_attacks(
