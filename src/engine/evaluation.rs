@@ -1183,7 +1183,57 @@ fn evaluate_bad_bishops(board: &Board, phase: i32) -> i32 {
 
     (score * phase) / 24
 }
-
+fn evaluate_pawn_threats(
+    board: &Board,
+    white_pawn_attacks: BitBoard,
+    black_pawn_attacks: BitBoard,
+    phase: i32,
+) -> i32 {
+    let mut score = 0;
+    
+    let black_pieces = board.color_combined(Color::Black);
+    
+    for piece_idx in 0..PAWN_ATTACK_THREAT.len() {
+        let piece = match piece_idx {
+            0 => Piece::Knight,
+            1 => Piece::Bishop,
+            2 => Piece::Rook,
+            3 => Piece::Queen,
+            _ => Piece::Pawn,
+        };
+        let black_piece_bb = board.pieces(piece) & black_pieces;
+        let attacked_pieces = black_piece_bb & white_pawn_attacks;
+        
+        if attacked_pieces != BitBoard::new(0) {
+            let count = attacked_pieces.popcnt() as i32;
+            let (mg_penalty, eg_penalty) = PAWN_ATTACK_THREAT[piece_idx];
+            score += count * ((mg_penalty * phase) + (eg_penalty * (24 - phase))) / 24;
+        }
+    }
+    
+    let white_pieces = board.color_combined(Color::White);
+    
+    for piece_idx in 0..PAWN_ATTACK_THREAT.len() {
+        let piece = match piece_idx {
+            0 => Piece::Knight,
+            1 => Piece::Bishop,
+            2 => Piece::Rook,
+            3 => Piece::Queen,
+            _ => Piece::Pawn,
+        };
+        
+        let white_piece_bb = board.pieces(piece) & white_pieces;
+        let attacked_pieces = white_piece_bb & black_pawn_attacks;
+        
+        if attacked_pieces != BitBoard::new(0) {
+            let count = attacked_pieces.popcnt() as i32;
+            let (mg_penalty, eg_penalty) = PAWN_ATTACK_THREAT[piece_idx];
+            score -= count * ((mg_penalty * phase) + (eg_penalty * (24 - phase))) / 24;
+        }
+    }
+    
+    score
+}
 pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
     let in_check = *board.checkers() != BitBoard(0);
     let has_legal_moves = MoveGen::new_legal(board).next().is_some();
@@ -1286,6 +1336,7 @@ pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
     score += evaluate_mobility(board, phase, white_pawn_attacks, black_pawn_attacks);
     score += evaluate_space(board, phase);
     score += evaluate_bad_bishops(board, phase);
+    score += evaluate_pawn_threats(board, white_pawn_attacks, black_pawn_attacks, phase);   
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
         score += ((25 * phase) + (40 * (24 - phase))) / 24;
     }
