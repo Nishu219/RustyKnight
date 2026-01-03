@@ -381,7 +381,7 @@ fn negamax(
         }
     }
 
-    // Singular extensions
+    // Singular extensions 
     let mut singular_extension = 0;
     if !is_root 
         && depth >= SINGULAR_DEPTH 
@@ -399,22 +399,22 @@ fn negamax(
                 let singular_beta = tt_val - depth as i32 * SINGULAR_MARGIN_MULTIPLIER;
                 let singular_depth = (depth - 1) / 2;
                 
-                let mut singular_value = -32000;
-                let mut non_singular_found = false;
+                let mut best_singular_score = -32000;
+                let mut is_singular = true;
                 
-                let mut temp_moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
-                temp_moves = order_moves(board, temp_moves, None, ply, None);
+                let movegen = MoveGen::new_legal(board);
                 
-                for mv in temp_moves.iter() {
-                    if *mv == hash_mv {
+                for mv in movegen {
+                    if mv == hash_mv {
                         continue;
                     }
                     
                     if *timeout_occurred {
+                        is_singular = false;
                         break;
                     }
                     
-                    let new_board = board.make_move_new(*mv);
+                    let new_board = board.make_move_new(mv);
                     let new_position_hash = compute_zobrist_hash(&new_board);
                     update_repetition_table(new_position_hash);
                     
@@ -445,23 +445,24 @@ fn negamax(
                     });
                     
                     if *timeout_occurred {
+                        is_singular = false;
                         break;
                     }
                     
-                    singular_value = singular_value.max(score);
+                    best_singular_score = best_singular_score.max(score);
                     
                     if score >= singular_beta {
-                        non_singular_found = true;
+                        is_singular = false;
                         break;
                     }
                 }
                 
-                if !*timeout_occurred && !non_singular_found {
+                if !*timeout_occurred && is_singular {
                     singular_extension = 1;
                     
-                    // Double extension
+                    // Double extensions
                     if depth >= DOUBLE_EXTENSION_DEPTH 
-                        && singular_value < singular_beta - DOUBLE_EXTENSION_MARGIN
+                        && best_singular_score < singular_beta - DOUBLE_EXTENSION_MARGIN
                     {
                         singular_extension = 2;
                     }
