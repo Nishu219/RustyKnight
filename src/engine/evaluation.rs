@@ -1284,11 +1284,15 @@ pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
             let eg_pst = PST[piece_idx][1][pst_index];
             score += ((mg_pst * phase) + (eg_pst * (24 - phase))) / 24;
 
-            // Bonus for minor pieces with a pawn directly in front
+            // Bonus for minor pieces with a pawn directly in front and penalty for undefended knight
             if (piece == Piece::Knight || piece == Piece::Bishop) && square.get_rank().to_index() < 7 {
                 let ahead_sq = unsafe { Square::new((sq_idx + 8) as u8) };
                 if (white_pawns & BitBoard::from_square(ahead_sq)) != BitBoard::new(0) {
                     score += 15;
+                }
+                let defended = (WHITE_PAWN_SUPPORT_SQUARES[sq_idx] & white_pawns) != BitBoard::new(0);
+                if !defended && piece == Piece::Knight {
+                    score -= ((13 * phase) + (8 * (24 - phase))) / 24;
                 }
             }
         }
@@ -1301,11 +1305,15 @@ pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
             let eg_pst = PST[piece_idx][1][pst_index];
             score -= ((mg_pst * phase) + (eg_pst * (24 - phase))) / 24;
 
-            // Bonus for minor pieces with a pawn directly in front
+            // Bonus for minor pieces with a pawn directly in front and penalty for undefended knight
             if (piece == Piece::Knight || piece == Piece::Bishop) && square.get_rank().to_index() > 0 {
                 let ahead_sq = unsafe { Square::new((sq_idx - 8) as u8) };
                 if (black_pawns & BitBoard::from_square(ahead_sq)) != BitBoard::new(0) {
                     score -= 15;
+                }
+                let defended = (BLACK_PAWN_SUPPORT_SQUARES[sq_idx] & black_pawns) != BitBoard::new(0);
+                if !defended && piece == Piece::Knight {
+                    score += ((13 * phase) + (8 * (24 - phase))) / 24;
                 }
             }
         }
