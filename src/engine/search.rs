@@ -326,34 +326,80 @@ fn negamax(
         }
 
         // ProbCut
-        if depth >= 5 && !hash_move.is_some() {
+        if depth >= 5 && !in_check && beta.abs() < 29000 {
             let probcut_beta = beta + 200;
-            let probcut_depth = depth / 4 * 3;
+            let probcut_see_threshold = probcut_beta - static_eval;
 
-            if probcut_depth >= 1 {
-                let probcut_score = negamax(
-                    board,
-                    probcut_depth,
-                    probcut_beta - 1,
-                    probcut_beta,
+            // TT early exit: if we have a cached shallow result already proving
+            if let Some(tt_val) = tt.get(board_hash, depth - 3, probcut_beta - 1, probcut_beta) {
+                if tt_val >= probcut_beta {
+                    return tt_val;
+                }
+            }
+
+            // Collect only captures/promotions whose SEE clears the threshold.
+            let mut probcut_moves: Vec<ChessMove> = MoveGen::new_legal(board)
+                .filter(|mv| {
+                    (board.piece_on(mv.get_dest()).is_some()
+                        || mv.get_promotion().is_some())
+                        && see_capture(board, *mv, probcut_see_threshold)
+                })
+                .collect();
+
+            // MVV-LVA ordering: try most promising captures first to get
+            // a cutoff as early as possible.
+            probcut_moves.sort_by(|a, b| {
+                mvv_lva_score(board, *b).cmp(&mvv_lva_score(board, *a))
+            });
+
+            'probcut: for mv in probcut_moves {
+                if *timeout_occurred {
+                    break 'probcut;
+                }
+
+                let new_board = board.make_move_new(mv);
+                let new_position_hash = compute_zobrist_hash(&new_board);
+                update_repetition_table(new_position_hash);
+
+                let score = -negamax(
+                    &new_board,
+                    depth - 4,
+                    -probcut_beta,
+                    -probcut_beta + 1,
                     start_time,
-                    ply,
+                    ply + 1,
                     stats,
                     root_color,
                     tt,
                     max_time,
                     timeout_occurred,
-                    previous_move,
+                    Some(mv),
                     contempt,
                 );
 
+                REPETITION_TABLE.with(|rep_table| {
+                    let mut rep_table = rep_table.borrow_mut();
+                    if let Some(count) = rep_table.get_mut(&new_position_hash) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            rep_table.remove(&new_position_hash);
+                        }
+                    }
+                });
+
                 if *timeout_occurred {
-                    return evaluate(board, 0, None);
+                    break 'probcut;
                 }
 
-                if probcut_score >= probcut_beta {
-                    return probcut_score;
+                if score >= probcut_beta {
+                    // Cache result so future shallower searches skip this work.
+                    tt.store(board_hash, depth - 3, score, TTFlag::Lower, Some(mv));
+                    return score;
                 }
+            }
+
+            if *timeout_occurred {
+                return evaluate(board, 0, None);
             }
         }
     }
@@ -514,11 +560,6 @@ fn negamax(
     let mut moves_searched = 0;
     let mut quiet_moves_searched = 0;
 
-    // Multi-Cut
-    let mut cut_count = 0;
-    let cut_threshold = 3 + (depth / 4);
-    let multi_cut_depth = 3;
-
     let mut killer_moves = [None, None];
     if ply < 64 {
         KILLER_MOVES.with(|k| {
@@ -666,55 +707,6 @@ fn negamax(
             r = r.min(depth.saturating_sub(1));
             new_depth = new_depth.saturating_sub(r);
             do_full_search = false;
-        }
-
-        // Multi-Cut
-        if !is_pv && depth >= multi_cut_depth && i >= cut_threshold && !is_capture && cut_count > 0
-        {
-            let multi_cut_score = -negamax(
-                &new_board,
-                depth / 2,
-                -beta,
-                -beta + 1,
-                start_time,
-                ply + 1,
-                stats,
-                root_color,
-                tt,
-                max_time,
-                timeout_occurred,
-                Some(*mv),
-                contempt,
-            );
-
-            if *timeout_occurred {
-                REPETITION_TABLE.with(|rep_table| {
-                    let mut rep_table = rep_table.borrow_mut();
-                    if let Some(count) = rep_table.get_mut(&new_position_hash) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            rep_table.remove(&new_position_hash);
-                        }
-                    }
-                });
-                break;
-            }
-
-            if multi_cut_score >= beta {
-                cut_count += 1;
-                if cut_count >= cut_threshold {
-                    REPETITION_TABLE.with(|rep_table| {
-                        let mut rep_table = rep_table.borrow_mut();
-                        if let Some(count) = rep_table.get_mut(&new_position_hash) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                rep_table.remove(&new_position_hash);
-                            }
-                        }
-                    });
-                    return beta;
-                }
-            }
         }
 
         // PVS
@@ -865,7 +857,7 @@ fn negamax(
                     
                     // Gravity formula: 
                     // approach the target (bonus) while decaying the current value
-                    // 10000 is your arbitrary clamp, used here as the scaling divisor
+                    // 10000 is the arbitrary clamp, used here as the scaling divisor
                     history[from_sq][to_sq] = current + bonus - (current * bonus.abs()) / 10000;
                 });
 
