@@ -1,9 +1,9 @@
 use crate::engine::constants::*;
 use crate::engine::evaluation::evaluate;
-use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, PIECE_VALUES, update_counter_move, update_capture_history, penalize_capture_history};
+use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, PIECE_VALUES, update_counter_move, update_capture_history, penalize_capture_history, ScoredMove};
 use crate::engine::transposition_table::{TranspositionTable, TTFlag};
 use crate::engine::zobrist::compute_zobrist_hash;
-use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
+use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
 use std::collections::HashMap;
 use std::cell::RefCell;
 use std::time::Instant;
@@ -78,19 +78,23 @@ fn quiesce(
         return alpha;
     }
 
-    let mut captures = Vec::with_capacity(32);
+    let mut captures = [ScoredMove::new(ChessMove::new(unsafe { Square::new(0) }, unsafe { Square::new(0) }, None), 0); 256];
+    let mut count = 0;
     let movegen = MoveGen::new_legal(board);
 
     for mv in movegen {
         if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
             let mvv_lva = mvv_lva_score(board, mv);
-            captures.push((mv, mvv_lva));
+            captures[count] = ScoredMove::new(mv, mvv_lva);
+            count += 1;
         }
     }
 
-    captures.sort_by(|a, b| b.1.cmp(&a.1));
+    let captures_slice = &mut captures[..count];
+    captures_slice.sort_by(|a, b| b.score.cmp(&a.score));
 
-    for (mv, _) in captures {
+    for scored_mv in captures_slice {
+        let mv = scored_mv.mv;
         if *timeout_occurred {
             break;
         }
@@ -338,21 +342,24 @@ fn negamax(
             }
 
             // Collect only captures/promotions whose SEE clears the threshold.
-            let mut probcut_moves: Vec<ChessMove> = MoveGen::new_legal(board)
-                .filter(|mv| {
-                    (board.piece_on(mv.get_dest()).is_some()
-                        || mv.get_promotion().is_some())
-                        && see_capture(board, *mv, probcut_see_threshold)
-                })
-                .collect();
+            let mut probcut_moves = [ScoredMove::new(ChessMove::new(unsafe { Square::new(0) }, unsafe { Square::new(0) }, None), 0); 256];
+            let mut probcut_count = 0;
+            for mv in MoveGen::new_legal(board) {
+                if (board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some())
+                    && see_capture(board, mv, probcut_see_threshold)
+                {
+                    probcut_moves[probcut_count] = ScoredMove::new(mv, mvv_lva_score(board, mv));
+                    probcut_count += 1;
+                }
+            }
 
             // MVV-LVA ordering: try most promising captures first to get
             // a cutoff as early as possible.
-            probcut_moves.sort_by(|a, b| {
-                mvv_lva_score(board, *b).cmp(&mvv_lva_score(board, *a))
-            });
+            let probcut_moves_slice = &mut probcut_moves[..probcut_count];
+            probcut_moves_slice.sort_by(|a, b| b.score.cmp(&a.score));
 
-            'probcut: for mv in probcut_moves {
+            'probcut: for scored_mv in probcut_moves_slice {
+                let mv = scored_mv.mv;
                 if *timeout_occurred {
                     break 'probcut;
                 }
@@ -547,13 +554,19 @@ fn negamax(
         }
     }
 
-    let mut moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
+    let mut move_list = [ScoredMove::new(ChessMove::new(unsafe { Square::new(0) }, unsafe { Square::new(0) }, None), 0); 256];
+    let mut move_count = 0;
+    for mv in MoveGen::new_legal(board) {
+        move_list[move_count] = ScoredMove::new(mv, 0);
+        move_count += 1;
+    }
 
-    if moves.is_empty() {
+    if move_count == 0 {
         return if in_check { -30000 + ply as i32 } else { 0 };
     }
 
-    moves = order_moves(board, moves, hash_move, ply, previous_move);
+    let ordered_moves = &mut move_list[..move_count];
+    order_moves(board, ordered_moves, hash_move, ply, previous_move);
 
     let mut best_value = -31000;
     let mut best_move = None;
@@ -571,7 +584,8 @@ fn negamax(
         });
     }
 
-    for (i, mv) in moves.iter().enumerate() {
+    for (i, scored_mv) in ordered_moves.iter().enumerate() {
+        let mv = scored_mv.mv;
         if *timeout_occurred {
             break;
         }
@@ -579,7 +593,7 @@ fn negamax(
         let is_capture = board.piece_on(mv.get_dest()).is_some();
         let is_promotion = mv.get_promotion().is_some();
         let is_quiet = !is_capture && !is_promotion;
-        let is_hash_move = hash_move.is_some() && *mv == hash_move.unwrap();
+        let is_hash_move = hash_move.is_some() && mv == hash_move.unwrap();
 
         // Late move pruning
         if !is_pv && !in_check && is_quiet && depth <= LMP_DEPTH {
@@ -640,7 +654,7 @@ fn negamax(
             }
         }
 
-        let new_board = board.make_move_new(*mv);
+        let new_board = board.make_move_new(mv);
         let new_position_hash = compute_zobrist_hash(&new_board);
         update_repetition_table(new_position_hash);
 
@@ -651,7 +665,7 @@ fn negamax(
         
         if is_hash_move && singular_extension > 0 {
             extension = extension.max(singular_extension);
-        } else if gives_check && see_capture(board, *mv, 0) {
+        } else if gives_check && see_capture(board, mv, 0) {
             extension += 1;
         } else if let Some(piece) = board.piece_on(mv.get_source()) {
             if piece == chess::Piece::Pawn {
@@ -668,7 +682,7 @@ fn negamax(
         let mut do_full_search = true;
 
         // LMR
-        let is_killer = Some(*mv) == killer_moves[0] || Some(*mv) == killer_moves[1];
+        let is_killer = Some(mv) == killer_moves[0] || Some(mv) == killer_moves[1];
 
         if depth >= 3 
             && i >= LMR_FULL_DEPTH_MOVES 
@@ -723,7 +737,7 @@ fn negamax(
                 tt,
                 max_time,
                 timeout_occurred,
-                Some(*mv),
+                Some(mv),
                 contempt,
             )
         } else {
@@ -739,7 +753,7 @@ fn negamax(
                 tt,
                 max_time,
                 timeout_occurred,
-                Some(*mv),
+                Some(mv),
                 contempt,
             );
 
@@ -761,7 +775,7 @@ fn negamax(
                         tt,
                         max_time,
                         timeout_occurred,
-                        Some(*mv),
+                        Some(mv),
                         contempt,
                     );
                 }
@@ -783,7 +797,7 @@ fn negamax(
                             tt,
                             max_time,
                             timeout_occurred,
-                            Some(*mv),
+                            Some(mv),
                             contempt,
                         )
                     } else {
@@ -816,7 +830,7 @@ fn negamax(
 
         if score > best_value {
             best_value = score;
-            best_move = Some(*mv);
+            best_move = Some(mv);
         }
 
         if score > alpha {
@@ -827,7 +841,7 @@ fn negamax(
                 KILLER_MOVES.with(|killers| {
                     let mut killers = killers.borrow_mut();
                     if ply < 64 && killers.len() > ply {
-                        if killers[ply].is_empty() || killers[ply][0] != *mv {
+                        if killers[ply].is_empty() || killers[ply][0] != mv {
                             if killers[ply].len() >= 2 {
                                 killers[ply][1] = killers[ply][0];
                             } else if killers[ply].len() == 1 {
@@ -835,9 +849,9 @@ fn negamax(
                                 killers[ply].push(first_killer);
                             }
                             if killers[ply].is_empty() {
-                                killers[ply].push(*mv);
+                                killers[ply].push(mv);
                             } else {
-                                killers[ply][0] = *mv;
+                                killers[ply][0] = mv;
                             }
                         }
                     }
@@ -862,7 +876,8 @@ fn negamax(
                 });
 
                 // Reduce history for failed moves
-                for prev_mv in &moves[0..i] {
+                for prev_scored_mv in &ordered_moves[0..i] {
+                    let prev_mv = prev_scored_mv.mv;
                     if board.piece_on(prev_mv.get_dest()).is_none()
                         && prev_mv.get_promotion().is_none()
                     {
@@ -882,12 +897,13 @@ fn negamax(
             }
             else {
                 // Capture succeeded - update capture history
-                update_capture_history(*mv, board, depth, i > 0);
+                update_capture_history(mv, board, depth, i > 0);
                 
                 // Penalize failed captures
-                for prev_mv in &moves[0..i] {
+                for prev_scored_mv in &ordered_moves[0..i] {
+                    let prev_mv = prev_scored_mv.mv;
                     if board.piece_on(prev_mv.get_dest()).is_some() || prev_mv.get_promotion().is_some() {
-                        penalize_capture_history(*prev_mv, board, depth);
+                        penalize_capture_history(prev_mv, board, depth);
                     }
                 }
             }
@@ -895,7 +911,7 @@ fn negamax(
 
         if alpha >= beta {
             if is_quiet {
-                update_counter_move(previous_move, *mv);
+                update_counter_move(previous_move, mv);
             }
             break;
         }

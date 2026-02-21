@@ -384,67 +384,77 @@ pub fn mvv_lva_score(board: &Board, mv: ChessMove) -> i32 {
         0
     }
 }
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ScoredMove {
+    pub mv: ChessMove,
+    pub score: i32,
+}
+
+impl ScoredMove {
+    pub fn new(mv: ChessMove, score: i32) -> Self {
+        Self { mv, score }
+    }
+}
+
 pub fn order_moves(
     board: &Board,
-    moves: Vec<ChessMove>,
+    moves: &mut [ScoredMove],
     hash_move: Option<ChessMove>,
     depth: usize,
     previous_move: Option<ChessMove>, 
-) -> Vec<ChessMove> {
+) {
     let counter_move = previous_move.and_then(|prev_mv| get_counter_move(prev_mv));
     
-    let mut scored_moves: Vec<(ChessMove, i32)> = moves
-        .into_iter()
-        .map(|mv| {
-            let score = if Some(mv) == hash_move {
-                10000000
-            } else if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
-                let base_mvv_lva = mvv_lva_score(board, mv);
-                let capture_hist = get_capture_history_score(mv, board);
-                
-                if see_capture(board, mv, 300) {
-                    9500000 + base_mvv_lva + capture_hist
-                } else if see_capture(board, mv, -50) {
-                    7500000 + base_mvv_lva + capture_hist
-                } else {
-                    // Bad capture - use capture history to differentiate
-                    500000 + capture_hist
-                }
+    for scored_move in moves.iter_mut() {
+        let mv = scored_move.mv;
+        let score = if Some(mv) == hash_move {
+            10000000
+        } else if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
+            let base_mvv_lva = mvv_lva_score(board, mv);
+            let capture_hist = get_capture_history_score(mv, board);
+            
+            if see_capture(board, mv, 300) {
+                9500000 + base_mvv_lva + capture_hist
+            } else if see_capture(board, mv, -50) {
+                7500000 + base_mvv_lva + capture_hist
             } else {
-                let new_board = board.make_move_new(mv);
-                if *new_board.checkers() != BitBoard(0) {
-                    8000000
-                } else {
-                    HISTORY_HEURISTIC.with(|history| {
-                        let history = history.borrow();
-                        if Some(mv) == counter_move {
-                            6500000
-                        } else if depth < 64 {
-                            KILLER_MOVES.with(|killers| {
-                                let killers = killers.borrow();
-                                if killers.len() > depth {
-                                    if killers[depth].len() > 0 && killers[depth][0] == mv {
-                                        7000000
-                                    } else if killers[depth].len() > 1 && killers[depth][1] == mv {
-                                        6000000
-                                    } else {
-                                        history[mv.get_source().to_index()][mv.get_dest().to_index()]
-                                    }
+                // Bad capture - use capture history to differentiate
+                500000 + capture_hist
+            }
+        } else {
+            let new_board = board.make_move_new(mv);
+            if *new_board.checkers() != BitBoard(0) {
+                8000000
+            } else {
+                HISTORY_HEURISTIC.with(|history| {
+                    let history = history.borrow();
+                    if Some(mv) == counter_move {
+                        6500000
+                    } else if depth < 64 {
+                        KILLER_MOVES.with(|killers| {
+                            let killers = killers.borrow();
+                            if killers.len() > depth {
+                                if killers[depth].len() > 0 && killers[depth][0] == mv {
+                                    7000000
+                                } else if killers[depth].len() > 1 && killers[depth][1] == mv {
+                                    6000000
                                 } else {
                                     history[mv.get_source().to_index()][mv.get_dest().to_index()]
                                 }
-                            })
-                        } else {
-                            history[mv.get_source().to_index()][mv.get_dest().to_index()]
-                        }
-                    })
-                }
-            };
-            (mv, score)
-        })
-        .collect();
-    scored_moves.sort_by(|a, b| b.1.cmp(&a.1));
-    scored_moves.into_iter().map(|(mv, _)| mv).collect()
+                            } else {
+                                history[mv.get_source().to_index()][mv.get_dest().to_index()]
+                            }
+                        })
+                    } else {
+                        history[mv.get_source().to_index()][mv.get_dest().to_index()]
+                    }
+                })
+            }
+        };
+        scored_move.score = score;
+    }
+    
+    moves.sort_by(|a, b| b.score.cmp(&a.score));
 }
 /// Update counter-move heuristic when a move causes a beta cutoff
 pub fn update_counter_move(previous_move: Option<ChessMove>, refutation: ChessMove) {
