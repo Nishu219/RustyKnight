@@ -53,7 +53,9 @@ fn quiesce(
     stats.nodes += 1;
     stats.qnodes += 1;
     stats.seldepth = stats.seldepth.max(ply);
-    if start_time.elapsed().as_secs_f64() > max_time {
+    
+    // Timeout check - only every N nodes to reduce overhead
+    if stats.nodes % TIME_CHECK_INTERVAL == 0 && start_time.elapsed().as_secs_f64() > max_time {
         *timeout_occurred = true;
         return evaluate(board, 0, None);
     }
@@ -171,8 +173,8 @@ fn negamax(
     stats.nodes += 1;
     stats.seldepth = stats.seldepth.max(ply);
 
-    // Timeout check
-    if start_time.elapsed().as_secs_f64() > max_time {
+    // Timeout check 
+    if stats.nodes % TIME_CHECK_INTERVAL == 0 && start_time.elapsed().as_secs_f64() > max_time {
         *timeout_occurred = true;
         return if ply > 0 { evaluate(board, 0, None) } else { 0 };
     }
@@ -210,20 +212,16 @@ fn negamax(
     }
 
     let board_hash = position_hash;
-    let mut hash_move = None;
-    let mut tt_value = None;
-
     // TT probe
-    if let Some(stored_value) = tt.get(board_hash, depth, alpha, beta) {
+    let (tt_score, tt_move) = tt.get_with_move(board_hash, depth, alpha, beta);
+    let mut hash_move = tt_move;
+    let mut tt_value = None;
+    if let Some(stored_value) = tt_score {
         stats.tt_hits += 1;
         if !is_pv || !is_root {
             return stored_value;
         }
         tt_value = Some(stored_value);
-    }
-
-    if hash_move.is_none() {
-        hash_move = tt.get_move(board_hash);
     }
     
     let in_check = *board.checkers() != BitBoard(0);

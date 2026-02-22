@@ -45,3 +45,4 @@ pub const WHITE_PHALANX_BONUS: [i32; 8] = [0, 3, 5, 8, 12, 18, 25, 0,];
 pub const BLACK_PHALANX_BONUS: [i32; 8] = [0, 25, 18, 12, 8, 5, 3, 0,];
 pub const LAZY_EVAL_MARGIN: i32 = 200; 
 pub const PAWN_ATTACK_THREAT: [(i32, i32); 4] = [(50, 40), (50, 40), (60, 50), (75, 65)];
+pub const TIME_CHECK_INTERVAL: usize = 4096;

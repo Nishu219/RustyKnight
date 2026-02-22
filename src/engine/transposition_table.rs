@@ -193,6 +193,44 @@ impl TranspositionTable {
         None
     }
 
+    /// Combined probe: returns (Option<score>, Option<best_move>)
+    #[inline(always)]
+    pub fn get_with_move(&mut self, key: u64, depth: usize, alpha: i32, beta: i32) -> (Option<i32>, Option<ChessMove>) {
+        let index = (key as usize) % self.size;
+        let key32 = (key >> 32) as u32;
+        let bucket = &self.table[index];
+
+        let mut score: Option<i32> = None;
+        let mut best_move: Option<ChessMove> = None;
+        let mut best_move_depth: u8 = 0;
+
+        for entry in &bucket.entries {
+            if entry.key() != key32 || entry.flag() == TTFlag::None {
+                continue;
+            }
+
+            // Always track the deepest stored move regardless of depth cutoff
+            if entry.move_ != 0 && entry.depth() >= best_move_depth {
+                best_move_depth = entry.depth();
+                best_move = Some(unpack_move(entry.move_));
+            }
+
+            // Only use the score if the stored depth is sufficient
+            if score.is_none() && entry.depth() as usize >= depth {
+                self.hits += 1;
+                let val = entry.value as i32;
+                match entry.flag() {
+                    TTFlag::Exact => score = Some(val),
+                    TTFlag::Lower if val >= beta => score = Some(val),
+                    TTFlag::Upper if val <= alpha => score = Some(val),
+                    _ => {}
+                }
+            }
+        }
+
+        (score, best_move)
+    }
+
     // Store position evaluation and best move
     #[inline(always)]
     pub fn store(
