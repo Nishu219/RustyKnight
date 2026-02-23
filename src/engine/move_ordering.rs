@@ -413,10 +413,8 @@ pub fn order_moves(
             let base_mvv_lva = mvv_lva_score(board, mv);
             let capture_hist = get_capture_history_score(mv, board);
             
-            if see_capture(board, mv, 300) {
+            if see_capture(board, mv, -50) {
                 9500000 + base_mvv_lva + capture_hist
-            } else if see_capture(board, mv, -50) {
-                7500000 + base_mvv_lva + capture_hist
             } else {
                 // Bad capture - use capture history to differentiate
                 500000 + capture_hist
