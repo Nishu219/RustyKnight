@@ -86,6 +86,11 @@ fn quiesce(
 
     for mv in movegen {
         if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
+            // SEE Pruning - filter out obviously bad captures
+            if !see_capture(board, mv, -50) {
+                continue;
+            }
+
             let mvv_lva = mvv_lva_score(board, mv);
             captures[count] = ScoredMove::new(mv, mvv_lva);
             count += 1;
@@ -117,11 +122,6 @@ fn quiesce(
             continue;
         }
         
-        // SEE pruning - skip obviously bad captures
-        if !see_capture(board, mv, -50) {
-            continue;
-        }
-
         let new_board = board.make_move_new(mv);
         let score = -quiesce(
             &new_board,
