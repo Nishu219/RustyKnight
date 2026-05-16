@@ -4,7 +4,6 @@ use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILL
 use crate::engine::transposition_table::{TranspositionTable, TTFlag};
 use crate::engine::zobrist::compute_zobrist_hash;
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
-use std::collections::HashMap;
 use std::cell::RefCell;
 use std::time::Instant;
 
@@ -17,26 +16,39 @@ pub struct SearchStats {
 }
 
 thread_local! {
-    pub static REPETITION_TABLE: RefCell<HashMap<u64, usize>> = RefCell::new(HashMap::new());
+    // OPTIMIZATION: Flat array stack instead of HashMap avoids severe hashing and allocation overhead
+    pub static REPETITION_TABLE: RefCell<Vec<u64>> = RefCell::new(Vec::with_capacity(1024));
     pub static TRANSPOSITION_TABLE: RefCell<TranspositionTable> = RefCell::new(TranspositionTable::new(256));
 }
 
 fn is_repetition(position_hash: u64) -> bool {
     REPETITION_TABLE.with(|table| {
-        *table.borrow().get(&position_hash).unwrap_or(&0) >= 2
+        let table = table.borrow();
+        let mut count = 0;
+        // Iterate backward for cache locality and fast early exits on recent repetitions
+        for &hash in table.iter().rev() {
+            if hash == position_hash {
+                count += 1;
+                if count >= 2 {
+                    return true;
+                }
+            }
+        }
+        false
     })
 }
 
 pub fn update_repetition_table(position_hash: u64) {
-    REPETITION_TABLE.with(|table| {
-        *table.borrow_mut().entry(position_hash).or_insert(0) += 1;
-    });
+    REPETITION_TABLE.with(|table| table.borrow_mut().push(position_hash));
 }
 
 pub fn clear_repetition_table() {
-    REPETITION_TABLE.with(|table| {
-        table.borrow_mut().clear();
-    });
+    REPETITION_TABLE.with(|table| table.borrow_mut().clear());
+}
+
+// Helper to instantly pop the move state off the path stack
+pub fn pop_repetition_table() {
+    REPETITION_TABLE.with(|table| table.borrow_mut().pop());
 }
 
 fn quiesce(
@@ -382,15 +394,7 @@ fn negamax(
                     contempt,
                 );
 
-                REPETITION_TABLE.with(|rep_table| {
-                    let mut rep_table = rep_table.borrow_mut();
-                    if let Some(count) = rep_table.get_mut(&new_position_hash) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            rep_table.remove(&new_position_hash);
-                        }
-                    }
-                });
+                pop_repetition_table();
 
                 if *timeout_occurred {
                     break 'probcut;
@@ -485,15 +489,7 @@ fn negamax(
                         contempt,
                     );
                     
-                    REPETITION_TABLE.with(|rep_table| {
-                        let mut rep_table = rep_table.borrow_mut();
-                        if let Some(count) = rep_table.get_mut(&new_position_hash) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                rep_table.remove(&new_position_hash);
-                            }
-                        }
-                    });
+                    pop_repetition_table();
                     
                     if *timeout_occurred {
                         is_singular = false;
@@ -807,15 +803,7 @@ fn negamax(
             }
         };
 
-        REPETITION_TABLE.with(|rep_table| {
-            let mut rep_table = rep_table.borrow_mut();
-            if let Some(count) = rep_table.get_mut(&new_position_hash) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    rep_table.remove(&new_position_hash);
-                }
-            }
-        });
+        pop_repetition_table();
 
         if *timeout_occurred {
             break;
@@ -1057,9 +1045,23 @@ pub fn iterative_deepening(
                                 // Extract PV
                                 let mut pv = Vec::new();
                                 let mut temp_board = *board;
+                                let mut pv_hashes = Vec::with_capacity(depth.min(20));
 
                                 for _ in 0..depth.min(20) {
                                     let h = compute_zobrist_hash(&temp_board);
+                                    
+                                    // Count occurrences in global history + current PV line
+                                    let history_count = REPETITION_TABLE.with(|table| {
+                                        table.borrow().iter().filter(|&&x| x == h).count()
+                                    });
+                                    let pv_count = pv_hashes.iter().filter(|&&x| x == h).count();
+                                    
+                                    // Truncate PV immediately to prevent threefold printing loop
+                                    if history_count + pv_count >= 2 {
+                                        break; 
+                                    }
+                                    pv_hashes.push(h);
+
                                     if let Some(pv_move) = tt_guard.get_move(h) {
                                         let movegen = MoveGen::new_legal(&temp_board);
                                         if movegen.into_iter().any(|legal_move| legal_move == pv_move) {
