@@ -918,18 +918,19 @@ fn evaluate_mobility(board: &Board, phase: i32, white_pawn_attacks: BitBoard, bl
     let white_knights = board.pieces(Piece::Knight) & white_pieces;
     let black_knights = board.pieces(Piece::Knight) & black_pieces;
     
-    // Safe mobility for white knights (exclude squares attacked by black pawns)
-    let wn_mob = (white_knights.into_iter()
-        .map(|sq| (chess::get_knight_moves(sq) & !white_pieces & !black_pawn_attacks).popcnt())
-        .sum::<u32>() as usize).min(8);
-    
-    // Safe mobility for black knights (exclude squares attacked by white pawns)
-    let bn_mob = (black_knights.into_iter()
-        .map(|sq| (chess::get_knight_moves(sq) & !black_pieces & !white_pawn_attacks).popcnt())
-        .sum::<u32>() as usize).min(8);
-    
-    score_mg += KNIGHT_MOBILITY_MG[wn_mob] - KNIGHT_MOBILITY_MG[bn_mob];
-    score_eg += KNIGHT_MOBILITY_EG[wn_mob] - KNIGHT_MOBILITY_EG[bn_mob];
+    // Safe mobility for White Knights (exclude squares attacked by black pawns)
+    for sq in white_knights {
+        let mobility = (chess::get_knight_moves(sq) & !white_pieces & !black_pawn_attacks).popcnt() as usize;
+        score_mg += KNIGHT_MOBILITY_MG[mobility];
+        score_eg += KNIGHT_MOBILITY_EG[mobility];
+    }
+
+    // Safe mobility for Black Knights (exclude squares attacked by white pawns)
+    for sq in black_knights {
+        let mobility = (chess::get_knight_moves(sq) & !black_pieces & !white_pawn_attacks).popcnt() as usize;
+        score_mg -= KNIGHT_MOBILITY_MG[mobility];
+        score_eg -= KNIGHT_MOBILITY_EG[mobility];
+    }
     
     // Bishops
     let white_bishops = board.pieces(Piece::Bishop) & white_pieces;
