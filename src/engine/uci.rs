@@ -14,6 +14,7 @@ pub struct UCIEngine {
     position_history: Vec<u64>,
     hash_size: usize,
     contempt: i32,
+    halfmove_clock: u16,
 }
 
 impl UCIEngine {
@@ -24,6 +25,7 @@ impl UCIEngine {
             position_history: Vec::new(),
             hash_size: 256,
             contempt: 0,
+            halfmove_clock: 0,
         }
     }
 
@@ -70,12 +72,21 @@ impl UCIEngine {
         match tokens[1] {
             "startpos" => {
                 self.board = Board::default();
+                self.halfmove_clock = 0;
                 self.position_history
                     .push(compute_zobrist_hash(&self.board));
 
                 if tokens.len() > 2 && tokens[2] == "moves" {
                     for move_str in &tokens[3..] {
                         if let Ok(chess_move) = ChessMove::from_str(move_str) {
+                            let is_capture = self.board.piece_on(chess_move.get_dest()).is_some();
+                            let is_pawn = self.board.piece_on(chess_move.get_source()) == Some(chess::Piece::Pawn);
+                            if is_capture || is_pawn {
+                                self.halfmove_clock = 0;
+                            } else {
+                                self.halfmove_clock += 1;
+                            }
+                            
                             self.board = self.board.make_move_new(chess_move);
                             self.position_history
                                 .push(compute_zobrist_hash(&self.board));
@@ -90,6 +101,9 @@ impl UCIEngine {
                 let fen = tokens[2..8].join(" ");
                 if let Ok(board) = Board::from_str(&fen) {
                     self.board = board;
+                    
+                    self.halfmove_clock = tokens.get(6).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                    
                     self.position_history
                         .push(compute_zobrist_hash(&self.board));
 
@@ -104,6 +118,14 @@ impl UCIEngine {
                     if let Some(start) = moves_start {
                         for move_str in &tokens[start..] {
                             if let Ok(chess_move) = ChessMove::from_str(move_str) {
+                                let is_capture = self.board.piece_on(chess_move.get_dest()).is_some();
+                                let is_pawn = self.board.piece_on(chess_move.get_source()) == Some(chess::Piece::Pawn);
+                                if is_capture || is_pawn {
+                                    self.halfmove_clock = 0;
+                                } else {
+                                    self.halfmove_clock += 1;
+                                }
+                                
                                 self.board = self.board.make_move_new(chess_move);
                                 self.position_history
                                     .push(compute_zobrist_hash(&self.board));
@@ -228,7 +250,7 @@ impl UCIEngine {
         let is_movetime = movetime.is_some();
 
         if let Some(best_move) =
-            iterative_deepening(&self.board, max_time, self.contempt, is_movetime, depth)
+            iterative_deepening(&self.board, max_time, self.contempt, is_movetime, depth, self.halfmove_clock)
         {
             println!("bestmove {}", best_move);
         } else {
@@ -263,6 +285,7 @@ impl UCIEngine {
                 "register" => {}
                 "ucinewgame" => {
                     self.board = Board::default();
+                    self.halfmove_clock = 0;
                     self.position_history.clear();
                     self.position_history
                         .push(compute_zobrist_hash(&self.board));

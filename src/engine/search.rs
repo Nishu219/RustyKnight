@@ -16,7 +16,6 @@ pub struct SearchStats {
 }
 
 thread_local! {
-    // OPTIMIZATION: Flat array stack instead of HashMap avoids severe hashing and allocation overhead
     pub static REPETITION_TABLE: RefCell<Vec<u64>> = RefCell::new(Vec::with_capacity(1024));
     pub static TRANSPOSITION_TABLE: RefCell<TranspositionTable> = RefCell::new(TranspositionTable::new(256));
 }
@@ -177,6 +176,7 @@ fn negamax(
     timeout_occurred: &mut bool,
     previous_move: Option<ChessMove>,
     contempt: i32,
+    halfmove_clock: u16,
 ) -> i32 {
     let is_pv = beta - alpha > 1;
     let is_root = ply == 0;
@@ -195,24 +195,21 @@ fn negamax(
 
     // Draw detection and mate distance pruning
     if ply > 0 {
-        if is_repetition(position_hash) {
-            return if board.side_to_move() == root_color {
-                -contempt
-            } else {
-                contempt
-            };
-        }
-
+        // 1. TERMINAL STATES: The game is over immediately.
+        // Checkmate MUST be checked first! If a move delivers mate, the game ends 
+        // before the 50-move rule can trigger.
         if board.status() == BoardStatus::Checkmate {
             return -30000 + ply as i32;
         }
 
-        if board.status() == BoardStatus::Stalemate {
-            return if board.side_to_move() == root_color {
-                -contempt
-            } else {
-                contempt
-            };
+        // 2. TERMINAL DRAWS: The game is over in a draw.
+        // Stalemate, 50-move rule, and Repetition are all terminal states. 
+        // They MUST return exactly 0 to prevent Transposition Table corruption.
+        if board.status() == BoardStatus::Stalemate 
+            || halfmove_clock >= 100 
+            || is_repetition(position_hash) 
+        {
+            return 0; 
         }
 
         // Mate distance pruning
@@ -326,6 +323,7 @@ fn negamax(
                         timeout_occurred,
                         None,
                         contempt,
+                        halfmove_clock + 1,
                     );
 
                     if *timeout_occurred {
@@ -392,6 +390,7 @@ fn negamax(
                     timeout_occurred,
                     Some(mv),
                     contempt,
+                    0,
                 );
 
                 pop_repetition_table();
@@ -430,6 +429,7 @@ fn negamax(
             timeout_occurred,
             previous_move,
             contempt,
+            halfmove_clock,
         );
         if !*timeout_occurred {
             hash_move = tt.get_move(board_hash);
@@ -487,6 +487,11 @@ fn negamax(
                         timeout_occurred,
                         None,
                         contempt,
+                        {
+                            let is_capture = board.piece_on(mv.get_dest()).is_some();
+                            let is_pawn = board.piece_on(mv.get_source()) == Some(chess::Piece::Pawn);
+                            if is_capture || is_pawn { 0 } else { halfmove_clock + 1 }
+                        },
                     );
                     
                     pop_repetition_table();
@@ -540,6 +545,7 @@ fn negamax(
                 timeout_occurred,
                 None,
                 contempt,
+                halfmove_clock + 1,
             );
             
             if !*timeout_occurred && threat_score >= beta && threat_score.abs() > 29000 {
@@ -588,6 +594,13 @@ fn negamax(
         let is_promotion = mv.get_promotion().is_some();
         let is_quiet = !is_capture && !is_promotion;
         let is_hash_move = hash_move.is_some() && mv == hash_move.unwrap();
+
+        // <-- ADD THIS: Calculate next halfmove clock
+        let next_halfmove_clock = if is_capture || board.piece_on(mv.get_source()) == Some(chess::Piece::Pawn) {
+            0
+        } else {
+            halfmove_clock + 1
+        };
 
         // Late move pruning
         if !is_pv && !in_check && is_quiet && depth <= LMP_DEPTH {
@@ -733,6 +746,7 @@ fn negamax(
                 timeout_occurred,
                 Some(mv),
                 contempt,
+                next_halfmove_clock,
             )
         } else {
             let mut search_score = -negamax(
@@ -749,6 +763,7 @@ fn negamax(
                 timeout_occurred,
                 Some(mv),
                 contempt,
+                next_halfmove_clock,
             );
 
             if *timeout_occurred {
@@ -771,6 +786,7 @@ fn negamax(
                         timeout_occurred,
                         Some(mv),
                         contempt,
+                        next_halfmove_clock,
                     );
                 }
 
@@ -793,6 +809,7 @@ fn negamax(
                             timeout_occurred,
                             Some(mv),
                             contempt,
+                            next_halfmove_clock,
                         )
                     } else {
                         search_score
@@ -925,6 +942,7 @@ pub fn iterative_deepening(
     contempt: i32,
     is_movetime: bool,
     max_depth: Option<usize>,
+    halfmove_clock: u16,
 ) -> Option<ChessMove> {
     let start_time = Instant::now();
     let mut best_move = None;
@@ -982,6 +1000,7 @@ pub fn iterative_deepening(
                     &mut timeout_occurred,
                     None,
                     contempt,
+                    halfmove_clock,
                 );
 
                 if timeout_occurred {
@@ -1046,8 +1065,13 @@ pub fn iterative_deepening(
                                 let mut pv = Vec::new();
                                 let mut temp_board = *board;
                                 let mut pv_hashes = Vec::with_capacity(depth.min(20));
+                                let mut temp_clock = halfmove_clock;
 
                                 for _ in 0..depth.min(20) {
+                                    if temp_clock >= 100 {
+                                        break; 
+                                    }
+
                                     let h = compute_zobrist_hash(&temp_board);
                                     
                                     // Count occurrences in global history + current PV line
@@ -1066,6 +1090,15 @@ pub fn iterative_deepening(
                                         let movegen = MoveGen::new_legal(&temp_board);
                                         if movegen.into_iter().any(|legal_move| legal_move == pv_move) {
                                             pv.push(pv_move);
+                                            
+                                            let is_capture = temp_board.piece_on(pv_move.get_dest()).is_some();
+                                            let is_pawn = temp_board.piece_on(pv_move.get_source()) == Some(chess::Piece::Pawn);
+                                            if is_capture || is_pawn {
+                                                temp_clock = 0;
+                                            } else {
+                                                temp_clock += 1;
+                                            }
+
                                             temp_board = temp_board.make_move_new(pv_move);
                                         } else {
                                             break;
