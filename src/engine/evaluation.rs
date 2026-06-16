@@ -613,8 +613,6 @@ fn evaluate_pawns(board: &Board, white_pawn_attacks: BitBoard, black_pawn_attack
 
     let mut score = 0;
     
-    // Use pre-computed pawn attacks passed as parameters
-    // Compute pawn support bitboards (these are different from attacks)
     let not_a_file = BitBoard::new(0xFEFEFEFEFEFEFEFE);
     let not_h_file = BitBoard::new(0x7F7F7F7F7F7F7F7F);
     
@@ -623,7 +621,6 @@ fn evaluate_pawns(board: &Board, white_pawn_attacks: BitBoard, black_pawn_attack
     let black_pawn_support = BitBoard::new(((black_pawns & not_a_file).0 << 7) | 
                                            ((black_pawns & not_h_file).0 << 9));
 
-    // Build file count arrays
     let mut white_file_counts = [0u8; 8];
     let mut black_file_counts = [0u8; 8];
 
@@ -634,12 +631,11 @@ fn evaluate_pawns(board: &Board, white_pawn_attacks: BitBoard, black_pawn_attack
         black_file_counts[square.get_file().to_index()] += 1;
     }
 
-    // Process file-based penalties (doubled + isolated)
+    // Doubled and isolated pawn penalties
     for file_idx in 0..8 {
         let w_count = white_file_counts[file_idx];
         let b_count = black_file_counts[file_idx];
         
-        // Doubled pawns
         if w_count >= 2 {
             score -= 15 * (w_count - 1) as i32;
         }
@@ -647,61 +643,52 @@ fn evaluate_pawns(board: &Board, white_pawn_attacks: BitBoard, black_pawn_attack
             score += 15 * (b_count - 1) as i32;
         }
         
-        // Isolated pawns
         if w_count > 0 {
             let has_adjacent = (file_idx > 0 && white_file_counts[file_idx - 1] > 0) ||
-                              (file_idx < 7 && white_file_counts[file_idx + 1] > 0);
+                               (file_idx < 7 && white_file_counts[file_idx + 1] > 0);
             if !has_adjacent {
                 score -= 12;
             }
         }
         if b_count > 0 {
             let has_adjacent = (file_idx > 0 && black_file_counts[file_idx - 1] > 0) ||
-                              (file_idx < 7 && black_file_counts[file_idx + 1] > 0);
+                               (file_idx < 7 && black_file_counts[file_idx + 1] > 0);
             if !has_adjacent {
                 score += 12;
             }
         }
     }
 
-    // Evaluate white pawns
+    // White pawns
     for square in white_pawns {
         let sq_idx = square.to_index();
         let rank = square.get_rank().to_index();
         let sq_bb = BitBoard::from_square(square);
 
-        // Passed pawns (already optimized with lookup)
+        // Passed pawn
         if (WHITE_PASSED_MASKS[sq_idx] & black_pawns).0 == 0 {
             score += [0, 5, 10, 20, 35, 55, 80, 0][rank];
             
-            // King proximity bonus for endgames
             let friendly_dist = CHEBYSHEV_DISTANCE[white_king_idx][sq_idx];
             let enemy_dist = CHEBYSHEV_DISTANCE[black_king_idx][sq_idx];
-            
-            // Rank factor: more advanced = more important
             let rank_factor = [0, 1, 2, 3, 4, 5, 6, 0][rank];
             
-            // Enemy king far = good, friendly king close = good
             score += (enemy_dist - 2) * rank_factor;
             score -= (friendly_dist - 1) * rank_factor;
         }
         
-        // Phalanx pawns (side-by-side)
+        // Phalanx pawn
         if (PHALANX_SQUARES[sq_idx] & white_pawns).0 != 0 {
             score += WHITE_PHALANX_BONUS[rank];
         }
         
-        // Connected pawns (supported by friendly pawn)
+        // Connected / Backward pawn
         if (WHITE_PAWN_SUPPORT_SQUARES[sq_idx] & white_pawns).0 != 0 {
             score += 3;
         } else {
-            // Backward pawns (no support AND can't advance safely)
-            // Check if this pawn is NOT supported
             if (sq_bb & white_pawn_support).0 == 0 {
                 let push_sq = WHITE_PAWN_PUSHES[sq_idx];
-                // Only check if push square exists
                 if push_sq.0 != 0 {
-                    // Check if push is blocked or attacked
                     if (push_sq & (black_pawns | black_pawn_attacks)).0 != 0 {
                         score -= 8;
                     }
@@ -710,38 +697,33 @@ fn evaluate_pawns(board: &Board, white_pawn_attacks: BitBoard, black_pawn_attack
         }
     }
 
-    // Evaluate black pawns
+    // Black pawns
     for square in black_pawns {
         let sq_idx = square.to_index();
         let rank = square.get_rank().to_index();
         let sq_bb = BitBoard::from_square(square);
 
-        // Passed pawns
+        // Passed pawn
         if (BLACK_PASSED_MASKS[sq_idx] & white_pawns).0 == 0 {
             score -= [0, 80, 55, 35, 20, 10, 5, 0][rank];
             
-            // King proximity bonus for endgames
             let friendly_dist = CHEBYSHEV_DISTANCE[black_king_idx][sq_idx];
             let enemy_dist = CHEBYSHEV_DISTANCE[white_king_idx][sq_idx];
-            
-            // Rank factor: for black, lower rank = more advanced
             let rank_factor = [0, 6, 5, 4, 3, 2, 1, 0][rank];
             
-            // Enemy king far = good, friendly king close = good
             score -= (enemy_dist - 2) * rank_factor;
             score += (friendly_dist - 1) * rank_factor;
         }
         
-        // Phalanx pawns
+        // Phalanx pawn
         if (PHALANX_SQUARES[sq_idx] & black_pawns).0 != 0 {
             score -= BLACK_PHALANX_BONUS[rank];
         }
         
-        // Connected pawns
+        // Connected / Backward pawn
         if (BLACK_PAWN_SUPPORT_SQUARES[sq_idx] & black_pawns).0 != 0 {
             score -= 3;
         } else {
-            // Backward pawns
             if (sq_bb & black_pawn_support).0 == 0 {
                 let push_sq = BLACK_PAWN_PUSHES[sq_idx];
                 if push_sq.0 != 0 {
@@ -836,152 +818,134 @@ fn get_king_ring(king_sq: Square) -> BitBoard {
     KING_RING[king_sq.to_index()]
 }
 
-fn count_piece_attacks(
-    pieces: BitBoard,
-    target_ring: BitBoard,
-    piece_type: Piece,
+fn evaluate_pieces_and_king_safety(
     board: &Board,
+    phase: i32,
+    white_pawn_attacks: BitBoard,
+    black_pawn_attacks: BitBoard
 ) -> i32 {
-    let mut attacks = 0;
+    let mut score_mg = 0;
+    let mut score_eg = 0;
 
-    for square in pieces {
-        let attack_bb = match piece_type {
-            Piece::Queen => {
-                let occupied = *board.combined();
-                let rook_attacks = chess::get_rook_moves(square, occupied);
-                let bishop_attacks = chess::get_bishop_moves(square, occupied);
-                rook_attacks | bishop_attacks
-            }
-            Piece::Rook => chess::get_rook_moves(square, *board.combined()),
-            Piece::Bishop => chess::get_bishop_moves(square, *board.combined()),
-            Piece::Knight => chess::get_knight_moves(square),
-            Piece::Pawn => {
-                let color = if (board.color_combined(Color::White) & BitBoard::from_square(square))
-                    != BitBoard::new(0)
-                {
-                    Color::White
-                } else {
-                    Color::Black
-                };
-                chess::get_pawn_attacks(square, color, *board.combined())
-            }
-            _ => BitBoard::new(0),
-        };
+    let white_pieces = board.color_combined(Color::White);
+    let black_pieces = board.color_combined(Color::Black);
+    let occupied = *board.combined();
 
-        attacks += (attack_bb & target_ring).popcnt() as i32;
-    }
-
-    attacks
-}
-
-fn evaluate_king_ring_attacks(board: &Board, phase: i32) -> i32 {
-    let white_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::White))
-        .into_iter()
-        .next()
-        .unwrap();
-    let black_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::Black))
-        .into_iter()
-        .next()
-        .unwrap();
-
+    let white_king_sq = (board.pieces(Piece::King) & white_pieces).into_iter().next().unwrap();
+    let black_king_sq = (board.pieces(Piece::King) & black_pieces).into_iter().next().unwrap();
+    
     let white_king_ring = get_king_ring(white_king_sq);
     let black_king_ring = get_king_ring(black_king_sq);
 
-    let mut mg_score = 0;
-    let mut eg_score = 0;
-
-    for (i, &piece_type) in PIECE_ORDER.iter().enumerate() {
-        let white_pieces = board.pieces(piece_type) & board.color_combined(Color::White);
-        let black_pieces = board.pieces(piece_type) & board.color_combined(Color::Black);
-
-        let white_attacks = count_piece_attacks(white_pieces, black_king_ring, piece_type, board);
-        let black_attacks = count_piece_attacks(black_pieces, white_king_ring, piece_type, board);
-
-        let (mg_weight, eg_weight) = ATTACK_WEIGHTS[i];
-
-        mg_score += white_attacks * mg_weight;
-        mg_score -= black_attacks * mg_weight;
-        eg_score += white_attacks * eg_weight;
-        eg_score -= black_attacks * eg_weight;
+    // White and Black Knights
+    let (k_atk_mg, k_atk_eg) = ATTACK_WEIGHTS[3];
+    for sq in board.pieces(Piece::Knight) & white_pieces {
+        let attacks = chess::get_knight_moves(sq);
+        let safe = attacks & !white_pieces & !black_pawn_attacks;
+        let mob = safe.popcnt() as usize;
+        score_mg += KNIGHT_MOBILITY_MG[mob.min(8)];
+        score_eg += KNIGHT_MOBILITY_EG[mob.min(8)];
+        let ring_hits = (attacks & black_king_ring).popcnt() as i32;
+        score_mg += ring_hits * k_atk_mg;
+        score_eg += ring_hits * k_atk_eg;
+    }
+    for sq in board.pieces(Piece::Knight) & black_pieces {
+        let attacks = chess::get_knight_moves(sq);
+        let safe = attacks & !black_pieces & !white_pawn_attacks;
+        let mob = safe.popcnt() as usize;
+        score_mg -= KNIGHT_MOBILITY_MG[mob.min(8)];
+        score_eg -= KNIGHT_MOBILITY_EG[mob.min(8)];
+        let ring_hits = (attacks & white_king_ring).popcnt() as i32;
+        score_mg -= ring_hits * k_atk_mg;
+        score_eg -= ring_hits * k_atk_eg;
     }
 
-    ((mg_score * phase) + (eg_score * (24 - phase))) / 24
-}
-fn evaluate_mobility(board: &Board, phase: i32, white_pawn_attacks: BitBoard, black_pawn_attacks: BitBoard) -> i32 {
-    let mut score_mg = 0;
-    let mut score_eg = 0;
-    let white_pieces = board.color_combined(Color::White);
-    let black_pieces = board.color_combined(Color::Black);
-    let occupied = board.combined();
-    
-    // Knights 
-    let white_knights = board.pieces(Piece::Knight) & white_pieces;
-    let black_knights = board.pieces(Piece::Knight) & black_pieces;
-    
-    // Safe mobility for White Knights (exclude squares attacked by black pawns)
-    for sq in white_knights {
-        let mobility = (chess::get_knight_moves(sq) & !white_pieces & !black_pawn_attacks).popcnt() as usize;
-        score_mg += KNIGHT_MOBILITY_MG[mobility];
-        score_eg += KNIGHT_MOBILITY_EG[mobility];
+    // White and Black Bishops
+    let (b_atk_mg, b_atk_eg) = ATTACK_WEIGHTS[2];
+    for sq in board.pieces(Piece::Bishop) & white_pieces {
+        let attacks = chess::get_bishop_moves(sq, occupied);
+        let safe = attacks & !white_pieces & !black_pawn_attacks;
+        let mob = safe.popcnt() as usize;
+        score_mg += BISHOP_MOBILITY_MG[mob.min(13)];
+        score_eg += BISHOP_MOBILITY_EG[mob.min(13)];
+        
+        let ring_hits = (attacks & black_king_ring).popcnt() as i32;
+        score_mg += ring_hits * b_atk_mg;
+        score_eg += ring_hits * b_atk_eg;
+    }
+    for sq in board.pieces(Piece::Bishop) & black_pieces {
+        let attacks = chess::get_bishop_moves(sq, occupied);
+        let safe = attacks & !black_pieces & !white_pawn_attacks;
+        let mob = safe.popcnt() as usize;
+        score_mg -= BISHOP_MOBILITY_MG[mob.min(13)];
+        score_eg -= BISHOP_MOBILITY_EG[mob.min(13)];
+        
+        let ring_hits = (attacks & white_king_ring).popcnt() as i32;
+        score_mg -= ring_hits * b_atk_mg;
+        score_eg -= ring_hits * b_atk_eg;
     }
 
-    // Safe mobility for Black Knights (exclude squares attacked by white pawns)
-    for sq in black_knights {
-        let mobility = (chess::get_knight_moves(sq) & !black_pieces & !white_pawn_attacks).popcnt() as usize;
-        score_mg -= KNIGHT_MOBILITY_MG[mobility];
-        score_eg -= KNIGHT_MOBILITY_EG[mobility];
+    // White and Black Rooks
+    let (r_atk_mg, r_atk_eg) = ATTACK_WEIGHTS[1];
+    for sq in board.pieces(Piece::Rook) & white_pieces {
+        let attacks = chess::get_rook_moves(sq, occupied);
+        let safe = attacks & !white_pieces & !black_pawn_attacks;
+        let mob = safe.popcnt() as usize;
+        score_mg += ROOK_MOBILITY_MG[mob.min(14)];
+        score_eg += ROOK_MOBILITY_EG[mob.min(14)];
+        
+        let ring_hits = (attacks & black_king_ring).popcnt() as i32;
+        score_mg += ring_hits * r_atk_mg;
+        score_eg += ring_hits * r_atk_eg;
     }
-    
-    // Bishops
-    let white_bishops = board.pieces(Piece::Bishop) & white_pieces;
-    let black_bishops = board.pieces(Piece::Bishop) & black_pieces;
-    
-    for sq in white_bishops {
-        let mobility = (chess::get_bishop_moves(sq, *occupied) & !white_pieces & !black_pawn_attacks).popcnt().min(13) as usize;
-        score_mg += BISHOP_MOBILITY_MG[mobility];
-        score_eg += BISHOP_MOBILITY_EG[mobility];
+    for sq in board.pieces(Piece::Rook) & black_pieces {
+        let attacks = chess::get_rook_moves(sq, occupied);
+        let safe = attacks & !black_pieces & !white_pawn_attacks;
+        let mob = safe.popcnt() as usize;
+        score_mg -= ROOK_MOBILITY_MG[mob.min(14)];
+        score_eg -= ROOK_MOBILITY_EG[mob.min(14)];
+        
+        let ring_hits = (attacks & white_king_ring).popcnt() as i32;
+        score_mg -= ring_hits * r_atk_mg;
+        score_eg -= ring_hits * r_atk_eg;
     }
-    
-    for sq in black_bishops {
-        let mobility = (chess::get_bishop_moves(sq, *occupied) & !black_pieces & !white_pawn_attacks).popcnt().min(13) as usize;
-        score_mg -= BISHOP_MOBILITY_MG[mobility];
-        score_eg -= BISHOP_MOBILITY_EG[mobility];
+
+    // White and Black Queens
+    let (q_atk_mg, q_atk_eg) = ATTACK_WEIGHTS[0];
+    for sq in board.pieces(Piece::Queen) & white_pieces {
+        let attacks = chess::get_bishop_moves(sq, occupied) | chess::get_rook_moves(sq, occupied);
+        let safe = attacks & !white_pieces & !black_pawn_attacks;
+        let mob = safe.popcnt() as usize;
+        score_mg += QUEEN_MOBILITY_MG[mob.min(27)];
+        score_eg += QUEEN_MOBILITY_EG[mob.min(27)];
+        
+        let ring_hits = (attacks & black_king_ring).popcnt() as i32;
+        score_mg += ring_hits * q_atk_mg;
+        score_eg += ring_hits * q_atk_eg;
     }
-    
-    // Rooks
-    let white_rooks = board.pieces(Piece::Rook) & white_pieces;
-    let black_rooks = board.pieces(Piece::Rook) & black_pieces;
-    
-    for sq in white_rooks {
-        let mobility = (chess::get_rook_moves(sq, *occupied) & !white_pieces & !black_pawn_attacks).popcnt().min(14) as usize;
-        score_mg += ROOK_MOBILITY_MG[mobility];
-        score_eg += ROOK_MOBILITY_EG[mobility];
+    for sq in board.pieces(Piece::Queen) & black_pieces {
+        let attacks = chess::get_bishop_moves(sq, occupied) | chess::get_rook_moves(sq, occupied);
+        let safe = attacks & !black_pieces & !white_pawn_attacks;
+        let mob = safe.popcnt() as usize;
+        score_mg -= QUEEN_MOBILITY_MG[mob.min(27)];
+        score_eg -= QUEEN_MOBILITY_EG[mob.min(27)];
+        
+        let ring_hits = (attacks & white_king_ring).popcnt() as i32;
+        score_mg -= ring_hits * q_atk_mg;
+        score_eg -= ring_hits * q_atk_eg;
     }
+
+    // Pawn attacks on the King Ring
+    let (p_atk_mg, p_atk_eg) = ATTACK_WEIGHTS[4];
     
-    for sq in black_rooks {
-        let mobility = (chess::get_rook_moves(sq, *occupied) & !black_pieces & !white_pawn_attacks).popcnt().min(14) as usize;
-        score_mg -= ROOK_MOBILITY_MG[mobility];
-        score_eg -= ROOK_MOBILITY_EG[mobility];
-    }
+    let white_pawn_ring_hits = (white_pawn_attacks & black_king_ring).popcnt() as i32;
+    score_mg += white_pawn_ring_hits * p_atk_mg;
+    score_eg += white_pawn_ring_hits * p_atk_eg;
     
-    // Queens (combine rook + bishop moves)
-    let white_queens = board.pieces(Piece::Queen) & white_pieces;
-    let black_queens = board.pieces(Piece::Queen) & black_pieces;
-    
-    for sq in white_queens {
-        let mobility = ((chess::get_rook_moves(sq, *occupied) | chess::get_bishop_moves(sq, *occupied)) & !white_pieces & !black_pawn_attacks)
-            .popcnt().min(27) as usize;
-        score_mg += QUEEN_MOBILITY_MG[mobility];
-        score_eg += QUEEN_MOBILITY_EG[mobility];
-    }
-    
-    for sq in black_queens {
-        let mobility = ((chess::get_rook_moves(sq, *occupied) | chess::get_bishop_moves(sq, *occupied)) & !black_pieces & !white_pawn_attacks)
-            .popcnt().min(27) as usize;
-        score_mg -= QUEEN_MOBILITY_MG[mobility];
-        score_eg -= QUEEN_MOBILITY_EG[mobility];
-    }
-    
+    let black_pawn_ring_hits = (black_pawn_attacks & white_king_ring).popcnt() as i32;
+    score_mg -= black_pawn_ring_hits * p_atk_mg;
+    score_eg -= black_pawn_ring_hits * p_atk_eg;
+
     ((score_mg * phase) + (score_eg * (24 - phase))) / 24
 }
 fn evaluate_space(board: &Board, phase: i32) -> i32 {
@@ -1068,7 +1032,7 @@ fn evaluate_king_pawn_shield(board: &Board, phase: i32) -> i32 {
     score += get_king_shield_score(white_king_sq, white_pawns, Color::White);
     score -= get_king_shield_score(black_king_sq, black_pawns, Color::Black);
 
-    (score * phase) / 24 // Taper score based on phase
+    (score * phase) / 24
 }
 
 fn get_king_shield_score(king_sq: Square, friendly_pawns: BitBoard, color: Color) -> i32 {
@@ -1077,33 +1041,29 @@ fn get_king_shield_score(king_sq: Square, friendly_pawns: BitBoard, color: Color
     let king_rank = king_sq.get_rank().to_index();
 
     let (expected_king_rank, shield_rank) = if color == Color::White {
-        (0, 1) // King on rank 1, shield on rank 2
+        (0, 1)
     } else {
-        (7, 6) // King on rank 8, shield on rank 7
+        (7, 6)
     };
 
-    // Only evaluate kings on their home/castling rank
     if king_rank != expected_king_rank {
         return 0;
     }
 
-    // Determine which files to check.
     let shield_files: &[usize] = if king_file <= 2 {
-        &[0, 1, 2] // Queenside (a, b, c)
+        &[0, 1, 2]
     } else if king_file >= 5 {
-        &[5, 6, 7] // Kingside (f, g, h)
+        &[5, 6, 7]
     } else {
-
         return 0;
     };
-
 
     for &file in shield_files {
         let file_mask = FILE_MASKS[file];
         let pawns_on_file = friendly_pawns & file_mask;
 
         if pawns_on_file == BitBoard::new(0) {
-            score -= 30; // Missing pawn
+            score -= 30;
         } else {
             let pawn_rank = if color == Color::White {
                 pawns_on_file
@@ -1121,10 +1081,10 @@ fn get_king_shield_score(king_sq: Square, friendly_pawns: BitBoard, color: Color
 
             let rank_diff = (pawn_rank as i32 - shield_rank as i32).abs();
             if rank_diff > 0 {
-                score -= 15 * rank_diff; // Pawn pushed
+                score -= 15 * rank_diff;
             }
             if pawns_on_file.popcnt() > 1 {
-                score -= 20; // Doubled pawns
+                score -= 20;
             }
         }
     }
@@ -1138,7 +1098,6 @@ fn evaluate_bad_bishops(board: &Board, phase: i32) -> i32 {
 
     let mut score = 0;
 
-    // White's bad bishops
     let white_bishops = board.pieces(Piece::Bishop) & board.color_combined(Color::White);
     if white_bishops != BitBoard::new(0) {
         let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
@@ -1147,12 +1106,10 @@ fn evaluate_bad_bishops(board: &Board, phase: i32) -> i32 {
 
         for bishop_sq in white_bishops {
             if (BitBoard::from_square(bishop_sq) & DARK_SQUARES) != BitBoard::new(0) {
-                // Bishop on dark square
                 if white_pawns_on_dark > 3 {
                     score -= 10;
                 }
             } else {
-                // Bishop on light square
                 if white_pawns_on_light > 3 {
                     score -= 10;
                 }
@@ -1160,7 +1117,6 @@ fn evaluate_bad_bishops(board: &Board, phase: i32) -> i32 {
         }
     }
 
-    // Black's bad bishops
     let black_bishops = board.pieces(Piece::Bishop) & board.color_combined(Color::Black);
     if black_bishops != BitBoard::new(0) {
         let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
@@ -1169,12 +1125,10 @@ fn evaluate_bad_bishops(board: &Board, phase: i32) -> i32 {
 
         for bishop_sq in black_bishops {
             if (BitBoard::from_square(bishop_sq) & DARK_SQUARES) != BitBoard::new(0) {
-                // Bishop on dark square
                 if black_pawns_on_dark > 3 {
                     score += 10;
                 }
             } else {
-                // Bishop on light square
                 if black_pawns_on_light > 3 {
                     score += 10;
                 }
@@ -1306,7 +1260,6 @@ pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
             let eg_pst = PST[piece_idx][1][pst_index];
             score -= ((mg_pst * phase) + (eg_pst * (24 - phase))) / 24;
 
-            // Bonus for minor pieces with a pawn directly in front and penalty for undefended knight
             if (piece == Piece::Knight || piece == Piece::Bishop) && square.get_rank().to_index() > 0 {
                 let ahead_sq = unsafe { Square::new((sq_idx - 8) as u8) };
                 if (black_pawns & BitBoard::from_square(ahead_sq)) != BitBoard::new(0) {
@@ -1320,7 +1273,6 @@ pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
         }
     }
 
-    // LAZY EVALUATION CHECK 
     let current_lazy_score = if board.side_to_move() == Color::White { score } else { -score };
     
     if let Some(beta_val) = beta {
@@ -1329,7 +1281,6 @@ pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
         }
     }
     
-    // Pre-compute pawn attack maps for safe mobility
     let not_a_file = BitBoard::new(0xFEFEFEFEFEFEFEFE);
     let not_h_file = BitBoard::new(0x7F7F7F7F7F7F7F7F);
     let white_pawn_attacks = BitBoard::new(((white_pawns & not_a_file).0 << 7) | 
@@ -1340,9 +1291,8 @@ pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
     score += evaluate_rooks(board);
     score += evaluate_pawns(board, white_pawn_attacks, black_pawn_attacks);
     score += evaluate_king_tropism(board, phase);
-    score += evaluate_king_ring_attacks(board, phase);
     score += evaluate_king_pawn_shield(board, phase);
-    score += evaluate_mobility(board, phase, white_pawn_attacks, black_pawn_attacks);
+    score += evaluate_pieces_and_king_safety(board, phase, white_pawn_attacks, black_pawn_attacks);
     score += evaluate_space(board, phase);
     score += evaluate_bad_bishops(board, phase);
     score += evaluate_pawn_threats(board, white_pawn_attacks, black_pawn_attacks, phase);   

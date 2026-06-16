@@ -29,7 +29,6 @@ lazy_static! {
 pub fn compute_zobrist_hash(board: &Board) -> u64 {
     let mut h = 0;
     
-    // Iterate over occupied squares 
     let occupied_squares = board.color_combined(Color::White) | board.color_combined(Color::Black);
     for square in occupied_squares {
         let piece = board.piece_on(square).unwrap();
@@ -41,7 +40,6 @@ pub fn compute_zobrist_hash(board: &Board) -> u64 {
         h ^= ZOBRIST_PIECES[piece.to_index()][piece_color.to_index()][square.to_index()];
     }
     
-    // Castling rights calculation
     let white_castle = board.castle_rights(Color::White);
     let black_castle = board.castle_rights(Color::Black);
     let castling_rights = (white_castle.has_kingside() as u8) 

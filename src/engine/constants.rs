@@ -46,3 +46,19 @@ pub const BLACK_PHALANX_BONUS: [i32; 8] = [0, 25, 18, 12, 8, 5, 3, 0,];
 pub const LAZY_EVAL_MARGIN: i32 = 200; 
 pub const PAWN_ATTACK_THREAT: [(i32, i32); 4] = [(50, 40), (50, 40), (60, 50), (75, 65)];
 pub const TIME_CHECK_INTERVAL: usize = 4096;
+
+pub const LMR_SCALE: i32 = 1024;
+pub static mut LMR_TABLE: [[i32; 256]; 64] = [[0; 256]; 64];
+
+/// Initializes the LMR reduction factor table.
+pub fn init_lmr_table() {
+    unsafe {
+        for d in 1..64 {
+            for i in 1..256 {
+                let val = 0.55 + (d as f64).ln() * (i as f64).ln() / 1.85;
+                LMR_TABLE[d][i] = (val * LMR_SCALE as f64) as i32;
+            }
+        }
+    }
+}
+

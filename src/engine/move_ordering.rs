@@ -22,16 +22,14 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
     let to_square = mv.get_dest();
     let from_square = mv.get_source();
 
-    // Get initial capture value
     let captured_piece = match board.piece_on(to_square) {
         Some(p) => p,
         None => {
-            // Handle en passant
             if mv.get_promotion().is_some() {
                 return PIECE_VALUES[Piece::Queen.to_index()] - PIECE_VALUES[Piece::Pawn.to_index()]
                     >= threshold;
             }
-            return false; // Not a capture
+            return false;
         }
     };
 
@@ -43,17 +41,14 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
     let mut see_value = PIECE_VALUES[captured_piece.to_index()];
     let mut trophy_value = PIECE_VALUES[moving_piece.to_index()];
 
-    // Quick exit: obviously winning capture (e.g., PxQ)
     if see_value - trophy_value >= threshold {
         return true;
     }
 
-    // Quick exit: captured piece value alone doesn't meet threshold
     if see_value < threshold {
         return false;
     }
 
-    // Determine sides
     let to_move_mask = board.color_combined(board.side_to_move());
     let to_move = if (BitBoard::from_square(from_square) & to_move_mask) != BitBoard::new(0) {
         board.side_to_move()
@@ -62,33 +57,27 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
     };
     let opponent = !to_move;
 
-    // Generate all attackers for both sides
     let mut attacks_to_move = BitBoard::new(0);
     let mut attacks_opponent = BitBoard::new(0);
 
-    // Pawns
     attacks_to_move |= get_pawn_attackers(to_square, to_move, board);
     attacks_opponent |= get_pawn_attackers(to_square, opponent, board);
 
-    // Early cutoff: can opponent's pawn capture and cause immediate fail?
     if attacks_opponent != BitBoard::new(0)
         && see_value - trophy_value + PIECE_VALUES[Piece::Pawn.to_index()] < threshold
     {
         return false;
     }
 
-    // Knights
     let knight_attacks = chess::get_knight_moves(to_square);
     attacks_to_move |= knight_attacks & board.pieces(Piece::Knight) & board.color_combined(to_move);
     attacks_opponent |=
         knight_attacks & board.pieces(Piece::Knight) & board.color_combined(opponent);
 
-    // Kings
     let king_attacks = get_king_attacks(to_square);
     attacks_to_move |= king_attacks & board.pieces(Piece::King) & board.color_combined(to_move);
     attacks_opponent |= king_attacks & board.pieces(Piece::King) & board.color_combined(opponent);
 
-    // Bishops and Queens (diagonal)
     let bishop_rays = chess::get_bishop_rays(to_square);
     attacks_to_move |= bishop_rays
         & (board.pieces(Piece::Bishop) | board.pieces(Piece::Queen))
@@ -97,7 +86,6 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
         & (board.pieces(Piece::Bishop) | board.pieces(Piece::Queen))
         & board.color_combined(opponent);
 
-    // Rooks and Queens (straight)
     let rook_rays = chess::get_rook_rays(to_square);
     attacks_to_move |= rook_rays
         & (board.pieces(Piece::Rook) | board.pieces(Piece::Queen))
@@ -106,20 +94,14 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
         & (board.pieces(Piece::Rook) | board.pieces(Piece::Queen))
         & board.color_combined(opponent);
 
-    // Track occupied squares (remove initial attacker)
     let mut all_pieces = *board.combined();
     let from_bb = BitBoard::from_square(from_square);
     attacks_to_move ^= from_bb;
     all_pieces ^= from_bb;
 
-    // Main exchange loop
     loop {
-        // ===== OPPONENT'S TURN TO CAPTURE =====
-
-        // Check if opponent has any attackers
         if attacks_opponent == BitBoard::new(0) {
             trophy_value = 0;
-        // Jump to opponent cut test
         } else if let Some((attacker_sq, attacker_piece)) =
             find_least_valuable_attacker_threshold(
                 board,
@@ -129,11 +111,9 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
                 to_square,
             )
         {
-            // Opponent captures
             see_value -= trophy_value;
             trophy_value = PIECE_VALUES[attacker_piece.to_index()];
 
-            // Remove attacker from board
             let attacker_bb = BitBoard::from_square(attacker_sq);
             attacks_opponent ^= attacker_bb;
             all_pieces ^= attacker_bb;
@@ -141,24 +121,16 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
             trophy_value = 0;
         }
 
-        // Opponent cut test: Can we prune here?
-
-        // Upper bound test: side-to-move can stand pat and still win
         if see_value >= threshold {
             return true;
         }
 
-        // Lower bound test: even if side-to-move captures, still loses
         if see_value + trophy_value < threshold {
             return false;
         }
 
-        // ===== SIDE-TO-MOVE'S TURN TO RECAPTURE =====
-
-        // Check if side-to-move has any attackers
         if attacks_to_move == BitBoard::new(0) {
             trophy_value = 0;
-        // Jump to to_move cut test
         } else if let Some((attacker_sq, attacker_piece)) = find_least_valuable_attacker_threshold(
             board,
             to_move,
@@ -166,11 +138,9 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
             all_pieces,
             to_square,
         ) {
-            // Side-to-move recaptures
             see_value += trophy_value;
             trophy_value = PIECE_VALUES[attacker_piece.to_index()];
 
-            // Remove attacker from board
             let attacker_bb = BitBoard::from_square(attacker_sq);
             attacks_to_move ^= attacker_bb;
             all_pieces ^= attacker_bb;
@@ -178,19 +148,13 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
             trophy_value = 0;
         }
 
-        // To-move cut test
-
-        // Upper bound test: even if opponent captures, side-to-move still wins
         if see_value - trophy_value >= threshold {
             return true;
         }
 
-        // Lower bound test: opponent can stand pat and win
         if see_value < threshold {
             return false;
         }
-
-        // Continue exchange loop
     }
 }
 
@@ -233,8 +197,6 @@ fn get_pawn_attackers(square: Square, color: Color, board: &Board) -> BitBoard {
     attackers & board.pieces(Piece::Pawn) & board.color_combined(color)
 }
 
-/// Find least valuable attacker considering blockers
-/// Returns (Square, Piece) of the attacker, or None if no unblocked attacker exists
 fn find_least_valuable_attacker_threshold(
     board: &Board,
     color: Color,
@@ -242,9 +204,6 @@ fn find_least_valuable_attacker_threshold(
     all_pieces: BitBoard,
     target_square: Square,
 ) -> Option<(Square, Piece)> {
-    // Check pieces in order of value: Pawn, Knight, Bishop, Rook, Queen, King
-
-    // Pawns (no blocking check needed)
     let pawns = attackers & board.pieces(Piece::Pawn) & board.color_combined(color);
     if pawns != BitBoard::new(0) {
         for sq in pawns {
@@ -252,7 +211,6 @@ fn find_least_valuable_attacker_threshold(
         }
     }
 
-    // Knights (no blocking check needed)
     let knights = attackers & board.pieces(Piece::Knight) & board.color_combined(color);
     if knights != BitBoard::new(0) {
         for sq in knights {
@@ -260,7 +218,6 @@ fn find_least_valuable_attacker_threshold(
         }
     }
 
-    // Bishops (must check for blockers)
     let bishops = attackers & board.pieces(Piece::Bishop) & board.color_combined(color);
     if bishops != BitBoard::new(0) {
         for sq in bishops {
@@ -270,7 +227,6 @@ fn find_least_valuable_attacker_threshold(
         }
     }
 
-    // Rooks (must check for blockers)
     let rooks = attackers & board.pieces(Piece::Rook) & board.color_combined(color);
     if rooks != BitBoard::new(0) {
         for sq in rooks {
@@ -280,7 +236,6 @@ fn find_least_valuable_attacker_threshold(
         }
     }
 
-    // Queens (must check for blockers)
     let queens = attackers & board.pieces(Piece::Queen) & board.color_combined(color);
     if queens != BitBoard::new(0) {
         for sq in queens {
@@ -290,7 +245,6 @@ fn find_least_valuable_attacker_threshold(
         }
     }
 
-    // King (no blocking check needed)
     let kings = attackers & board.pieces(Piece::King) & board.color_combined(color);
     if kings != BitBoard::new(0) {
         for sq in kings {
@@ -301,7 +255,6 @@ fn find_least_valuable_attacker_threshold(
     None
 }
 
-/// Check if path between two squares is blocked
 fn is_path_blocked(from: Square, to: Square, occupied: BitBoard) -> bool {
     let from_file = from.get_file().to_index() as i32;
     let from_rank = from.get_rank().to_index() as i32;
@@ -311,7 +264,6 @@ fn is_path_blocked(from: Square, to: Square, occupied: BitBoard) -> bool {
     let file_diff = to_file - from_file;
     let rank_diff = to_rank - from_rank;
 
-    // Determine direction
     let file_step = if file_diff > 0 {
         1
     } else if file_diff < 0 {
@@ -327,20 +279,19 @@ fn is_path_blocked(from: Square, to: Square, occupied: BitBoard) -> bool {
         0
     };
 
-    // Check squares between from and to
     let mut current_file = from_file + file_step;
     let mut current_rank = from_rank + rank_step;
 
     while current_file != to_file || current_rank != to_rank {
         let sq = unsafe { Square::new((current_rank * 8 + current_file) as u8) };
         if (occupied & BitBoard::from_square(sq)) != BitBoard::new(0) {
-            return true; // Blocked
+            return true;
         }
         current_file += file_step;
         current_rank += rank_step;
     }
 
-    false // Not blocked
+    false
 }
 fn get_king_attacks(square: Square) -> BitBoard {
     let file = square.get_file().to_index() as i32;
@@ -416,7 +367,6 @@ pub fn order_moves(
             if see_capture(board, mv, -50) {
                 9500000 + base_mvv_lva + capture_hist
             } else {
-                // Bad capture - use capture history to differentiate
                 500000 + capture_hist
             }
         } else {
@@ -454,7 +404,7 @@ pub fn order_moves(
     
     moves.sort_by(|a, b| b.score.cmp(&a.score));
 }
-/// Update counter-move heuristic when a move causes a beta cutoff
+
 pub fn update_counter_move(previous_move: Option<ChessMove>, refutation: ChessMove) {
     if let Some(prev_mv) = previous_move {
         let from_sq = prev_mv.get_source().to_index();
@@ -466,7 +416,6 @@ pub fn update_counter_move(previous_move: Option<ChessMove>, refutation: ChessMo
     }
 }
 
-/// Get counter-move for a given move
 pub fn get_counter_move(mv: ChessMove) -> Option<ChessMove> {
     let from_sq = mv.get_source().to_index();
     let to_sq = mv.get_dest().to_index();
@@ -476,14 +425,12 @@ pub fn get_counter_move(mv: ChessMove) -> Option<ChessMove> {
     })
 }
 
-/// Clear counter-moves table
 pub fn clear_counter_moves() {
     COUNTER_MOVES.with(|counter_moves| {
         *counter_moves.borrow_mut() = [[None; 64]; 64];
     });
 }
 
-/// Update capture history when a capture causes a beta cutoff
 pub fn update_capture_history(mv: ChessMove, board: &Board, depth: usize, failed_quiets: bool) {
     if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
         if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
@@ -492,10 +439,8 @@ pub fn update_capture_history(mv: ChessMove, board: &Board, depth: usize, failed
             let to_sq = mv.get_dest().to_index();
             
             let bonus = if failed_quiets {
-                // Bonus when capture succeeds after quiets failed
                 (depth * depth + depth * 2) as i32
             } else {
-                // Standard bonus
                 (depth * depth) as i32
             };
             
@@ -503,7 +448,6 @@ pub fn update_capture_history(mv: ChessMove, board: &Board, depth: usize, failed
                 let mut ch = ch.borrow_mut();
                 ch[attacker_idx][victim_idx][to_sq] += bonus;
                 
-                // Cap the value to prevent overflow
                 if ch[attacker_idx][victim_idx][to_sq] > 16000 {
                     ch[attacker_idx][victim_idx][to_sq] = 16000;
                 }
@@ -512,7 +456,6 @@ pub fn update_capture_history(mv: ChessMove, board: &Board, depth: usize, failed
     }
 }
 
-/// Penalize capture history for failed captures
 pub fn penalize_capture_history(mv: ChessMove, board: &Board, depth: usize) {
     if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
         if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
@@ -526,7 +469,6 @@ pub fn penalize_capture_history(mv: ChessMove, board: &Board, depth: usize) {
                 let mut ch = ch.borrow_mut();
                 ch[attacker_idx][victim_idx][to_sq] -= penalty;
                 
-                // Floor the value
                 if ch[attacker_idx][victim_idx][to_sq] < -4000 {
                     ch[attacker_idx][victim_idx][to_sq] = -4000;
                 }
@@ -535,7 +477,6 @@ pub fn penalize_capture_history(mv: ChessMove, board: &Board, depth: usize) {
     }
 }
 
-/// Get capture history score for move ordering
 pub fn get_capture_history_score(mv: ChessMove, board: &Board) -> i32 {
     if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
         if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
@@ -551,7 +492,6 @@ pub fn get_capture_history_score(mv: ChessMove, board: &Board) -> i32 {
     0
 }
 
-/// Clear capture history table
 pub fn clear_capture_history() {
     CAPTURE_HISTORY.with(|ch| {
         *ch.borrow_mut() = [[[0; 64]; 6]; 6];

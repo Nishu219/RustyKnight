@@ -45,7 +45,6 @@ pub fn clear_repetition_table() {
     REPETITION_TABLE.with(|table| table.borrow_mut().clear());
 }
 
-// Helper to instantly pop the move state off the path stack
 pub fn pop_repetition_table() {
     REPETITION_TABLE.with(|table| table.borrow_mut().pop());
 }
@@ -65,13 +64,11 @@ fn quiesce(
     stats.qnodes += 1;
     stats.seldepth = stats.seldepth.max(ply);
     
-    // Timeout check - only every N nodes to reduce overhead
     if stats.nodes % TIME_CHECK_INTERVAL == 0 && start_time.elapsed().as_secs_f64() > max_time {
         *timeout_occurred = true;
         return evaluate(board, 0, None);
     }
 
-    // Pass beta for lazy eval optimization
     let stand_pat = evaluate(board, 0, Some(beta));
 
     if stand_pat >= beta {
@@ -82,11 +79,9 @@ fn quiesce(
         alpha = stand_pat;
     }
 
-    // Delta pruning: calculate the maximum possible gain
-    // We use queen value (900) as the base delta, plus a margin for promotions
+    // Delta pruning
     let big_delta = PIECE_VALUES[Piece::Queen.to_index()] + DELTA_MARGIN;
 
-    // If even capturing the opponent's queen cannot raise alpha, prune all moves
     if stand_pat + big_delta < alpha {
         return alpha;
     }
@@ -97,7 +92,6 @@ fn quiesce(
 
     for mv in movegen {
         if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
-            // SEE Pruning - filter out obviously bad captures
             if !see_capture(board, mv, -50) {
                 continue;
             }
@@ -117,18 +111,14 @@ fn quiesce(
             break;
         }
         
-        // Delta pruning for individual moves
-        // Calculate the value of the captured piece
         let captured_value = if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
             PIECE_VALUES[captured_piece.to_index()]
         } else if mv.get_promotion().is_some() {
-            // Promotion - assume queen for simplicity
             PIECE_VALUES[Piece::Queen.to_index()] - PIECE_VALUES[Piece::Pawn.to_index()]
         } else {
             0
         };
         
-        // If the material gain plus the stand_pat score and margin cannot raise alpha, skip this move
         if stand_pat + captured_value + DELTA_MARGIN < alpha {
             continue;
         }
@@ -185,7 +175,6 @@ fn negamax(
     stats.nodes += 1;
     stats.seldepth = stats.seldepth.max(ply);
 
-    // Timeout check 
     if stats.nodes % TIME_CHECK_INTERVAL == 0 && start_time.elapsed().as_secs_f64() > max_time {
         *timeout_occurred = true;
         return if ply > 0 { evaluate(board, 0, None) } else { 0 };
@@ -193,18 +182,12 @@ fn negamax(
 
     let position_hash = compute_zobrist_hash(board);
 
-    // Draw detection and mate distance pruning
+    // Draw and mate distance pruning
     if ply > 0 {
-        // 1. TERMINAL STATES: The game is over immediately.
-        // Checkmate MUST be checked first! If a move delivers mate, the game ends 
-        // before the 50-move rule can trigger.
         if board.status() == BoardStatus::Checkmate {
             return -30000 + ply as i32;
         }
 
-        // 2. TERMINAL DRAWS: The game is over in a draw.
-        // Stalemate, 50-move rule, and Repetition are all terminal states. 
-        // They MUST return exactly 0 to prevent Transposition Table corruption.
         if board.status() == BoardStatus::Stalemate 
             || halfmove_clock >= 100 
             || is_repetition(position_hash) 
@@ -212,7 +195,6 @@ fn negamax(
             return 0; 
         }
 
-        // Mate distance pruning
         alpha = alpha.max(-30000 + ply as i32);
         beta = beta.min(30000 - ply as i32);
         if alpha >= beta {
@@ -221,7 +203,6 @@ fn negamax(
     }
 
     let board_hash = position_hash;
-    // TT probe
     let (tt_score, tt_move) = tt.get_with_move(board_hash, depth, alpha, beta);
     let mut hash_move = tt_move;
     let mut tt_value = None;
@@ -237,12 +218,9 @@ fn negamax(
     let static_eval = if in_check {
         -30000 + ply as i32
     } else {
-        // Pass beta to trigger lazy eval
         evaluate(board, contempt, Some(beta))
     };
 
-
-    // Quiescence at leaf
     if depth == 0 {
         return quiesce(
             board,
@@ -283,7 +261,7 @@ fn negamax(
             }
         }
 
-        // Reverse futility pruning
+        // RFP
         if depth <= REVERSE_FUTILITY_DEPTH {
             let rfp_margin = REVERSE_FUTILITY_MARGIN * depth as i32;
             
@@ -292,7 +270,7 @@ fn negamax(
             }
         }
 
-        // Null move pruning
+        // Null Move Pruning
         if depth >= NULL_MOVE_DEPTH && static_eval >= beta {
             let has_non_pawn_pieces = (board.combined() & board.color_combined(board.side_to_move())).0
                     != ((board.pieces(chess::Piece::King) | board.pieces(chess::Piece::Pawn))
@@ -342,14 +320,12 @@ fn negamax(
             let probcut_beta = beta + 200;
             let probcut_see_threshold = probcut_beta - static_eval;
 
-            // TT early exit: if we have a cached shallow result already proving
             if let Some(tt_val) = tt.get(board_hash, depth - 3, probcut_beta - 1, probcut_beta) {
                 if tt_val >= probcut_beta {
                     return tt_val;
                 }
             }
 
-            // Collect only captures/promotions whose SEE clears the threshold.
             let mut probcut_moves = [ScoredMove::new(ChessMove::new(unsafe { Square::new(0) }, unsafe { Square::new(0) }, None), 0); 256];
             let mut probcut_count = 0;
             for mv in MoveGen::new_legal(board) {
@@ -361,8 +337,6 @@ fn negamax(
                 }
             }
 
-            // MVV-LVA ordering: try most promising captures first to get
-            // a cutoff as early as possible.
             let probcut_moves_slice = &mut probcut_moves[..probcut_count];
             probcut_moves_slice.sort_by(|a, b| b.score.cmp(&a.score));
 
@@ -400,7 +374,6 @@ fn negamax(
                 }
 
                 if score >= probcut_beta {
-                    // Cache result so future shallower searches skip this work.
                     tt.store(board_hash, depth - 3, score, TTFlag::Lower, Some(mv));
                     return score;
                 }
@@ -436,7 +409,7 @@ fn negamax(
         }
     }
 
-    // Singular extensions 
+    // Singular Extensions
     let mut singular_extension = 0;
     if !is_root 
         && depth >= SINGULAR_DEPTH 
@@ -512,7 +485,6 @@ fn negamax(
                 if !*timeout_occurred && is_singular {
                     singular_extension = 1;
                     
-                    // Double extensions
                     if depth >= DOUBLE_EXTENSION_DEPTH 
                         && best_singular_score < singular_beta - DOUBLE_EXTENSION_MARGIN
                     {
@@ -523,7 +495,7 @@ fn negamax(
         }
     }
 
-    // Mate threat extension
+    // Mate Threat Extension
     let mut mate_threat_extension = 0;
     if !is_pv 
         && !in_check 
@@ -595,7 +567,6 @@ fn negamax(
         let is_quiet = !is_capture && !is_promotion;
         let is_hash_move = hash_move.is_some() && mv == hash_move.unwrap();
 
-        // <-- ADD THIS: Calculate next halfmove clock
         let next_halfmove_clock = if is_capture || board.piece_on(mv.get_source()) == Some(chess::Piece::Pawn) {
             0
         } else {
@@ -697,33 +668,35 @@ fn negamax(
             && !gives_check 
             && !is_killer
         {
-            // Base formula
-            let mut r_f = 0.55 + (depth as f32).ln() * (i as f32).ln() / 1.85;
+            let depth_idx = depth.min(63);
+            let move_idx = i.min(255);
+            
+            let mut r_scaled = unsafe { crate::engine::constants::LMR_TABLE[depth_idx][move_idx] };
 
-            // PV nodes need less reduction
             if !is_pv {
-                r_f += 0.70;
+                r_scaled += 716;
             } else {
-                r_f -= 0.20;
+                r_scaled -= 204;
             }
 
-            // History-based adjustments with better scaling
-            let history_bonus = HISTORY_HEURISTIC.with(|history| {
-                let history_score = history.borrow()[mv.get_source().to_index()][mv.get_dest().to_index()];
-                (history_score as f32 / 7000.0).clamp(-1.25, 1.25)
+            let history_score = HISTORY_HEURISTIC.with(|history| {
+                history.borrow()[mv.get_source().to_index()][mv.get_dest().to_index()]
             });
-            r_f -= history_bonus;
+            
+            let history_bonus = (history_score * LMR_SCALE) / 7000;
+            let clamped_bonus = history_bonus.clamp(-1280, 1280);
+            
+            r_scaled -= clamped_bonus;
 
             if (static_eval - alpha).abs() > 150 {
-                r_f -= 0.25;
+                r_scaled -= 256;
             }
 
-            // Reduce more for very late moves
             if i > 15 {
-                r_f += 0.5;
+                r_scaled += 512;
             }
 
-            let mut r = r_f.max(0.0) as usize;
+            let mut r = (r_scaled / LMR_SCALE).max(0) as usize;
 
             r = r.min(depth.saturating_sub(1));
             new_depth = new_depth.saturating_sub(r);
@@ -860,25 +833,18 @@ fn negamax(
                     }
                 });
 
-                // History heuristic
                 HISTORY_HEURISTIC.with(|history| {
                     let mut history = history.borrow_mut();
-                    
-                    // Standard bonus scaled by depth
                     let bonus = (depth * depth).min(400) as i32; 
                     
                     let from_sq = mv.get_source().to_index();
                     let to_sq = mv.get_dest().to_index();
                     
                     let current = history[from_sq][to_sq];
-                    
-                    // Gravity formula: 
-                    // approach the target (bonus) while decaying the current value
-                    // 10000 is the arbitrary clamp, used here as the scaling divisor
                     history[from_sq][to_sq] = current + bonus - (current * bonus.abs()) / 10000;
                 });
 
-                // Reduce history for failed moves
+                // Penalize history for failed quiet moves
                 for prev_scored_mv in &ordered_moves[0..i] {
                     let prev_mv = prev_scored_mv.mv;
                     if board.piece_on(prev_mv.get_dest()).is_none()
@@ -891,18 +857,14 @@ fn negamax(
                             
                             let penalty = -((depth * depth).min(400) as i32);
                             let current = history[prev_from][prev_to];
-                            
-                            // Same gravity formula for penalty
                             history[prev_from][prev_to] = current + penalty - (current * penalty.abs()) / 10000;
                         });
                     }
                 }
             }
             else {
-                // Capture succeeded - update capture history
                 update_capture_history(mv, board, depth, i > 0);
                 
-                // Penalize failed captures
                 for prev_scored_mv in &ordered_moves[0..i] {
                     let prev_mv = prev_scored_mv.mv;
                     if board.piece_on(prev_mv.get_dest()).is_some() || prev_mv.get_promotion().is_some() {
@@ -920,7 +882,6 @@ fn negamax(
         }
     }
 
-    // TT store
     if !*timeout_occurred && moves_searched > 0 {
         let flag = if best_value <= original_alpha {
             TTFlag::Upper
@@ -972,7 +933,7 @@ pub fn iterative_deepening(
 
             // Aspiration window setup
             let (initial_alpha, initial_beta) = if depth <= 4 || best_move.is_none() {
-                (-31000, 31000)  // Full window for early depths
+                (-31000, 31000)
             } else {
                 (best_score - INITIAL_WINDOW, best_score + INITIAL_WINDOW)
             };
@@ -982,7 +943,6 @@ pub fn iterative_deepening(
             let mut window_size = INITIAL_WINDOW;
             let mut search_iterations = 0;
 
-            // Aspiration window re-search loop
             loop {
                 search_iterations += 1;
 
@@ -1007,51 +967,29 @@ pub fn iterative_deepening(
                     break;
                 }
 
-                // Check if we failed low or high
                 if score <= alpha {
-                    // FAIL LOW: True score is <= alpha
-                    // Widen window exponentially
+                    // Fail low: widen window
                     window_size = (window_size * 2).min(MAX_WINDOW);
 
                     if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
-                        // Give up, use full window
                         alpha = -31000;
                         beta = 31000;
-                        if STATS {
-                            println!("info string Giving up on aspiration, using full window");
-                        }
                     } else {
-                        // Adjust window symmetrically around best score
                         alpha = (best_score - window_size).max(-31000);
                         beta = (best_score + window_size).min(31000);
-
-                        if STATS {
-                            println!("info string Re-searching with window [{}, {}]", alpha, beta);
-                        }
                     }
                 } else if score >= beta {
-                    // FAIL HIGH: True score is >= beta
-                    // Widen window exponentially
+                    // Fail high: widen window
                     window_size = (window_size * 2).min(MAX_WINDOW);
 
                     if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
-                        // Give up, use full window
                         alpha = -31000;
                         beta = 31000;
-                        if STATS {
-                            println!("info string Giving up on aspiration, using full window");
-                        }
                     } else {
-                        // Adjust window symmetrically around best score
                         alpha = (best_score - window_size).max(-31000);
                         beta = (best_score + window_size).min(31000);
-
-                        if STATS {
-                            println!("info string Re-searching with window [{}, {}]", alpha, beta);
-                        }
                     }
                 } else {
-                    // SUCCESS: Score is within [alpha, beta]
                     best_score = score;
 
                     let board_hash = compute_zobrist_hash(board);
@@ -1073,14 +1011,11 @@ pub fn iterative_deepening(
                                     }
 
                                     let h = compute_zobrist_hash(&temp_board);
-                                    
-                                    // Count occurrences in global history + current PV line
                                     let history_count = REPETITION_TABLE.with(|table| {
                                         table.borrow().iter().filter(|&&x| x == h).count()
                                     });
                                     let pv_count = pv_hashes.iter().filter(|&&x| x == h).count();
                                     
-                                    // Truncate PV immediately to prevent threefold printing loop
                                     if history_count + pv_count >= 2 {
                                         break; 
                                     }
@@ -1135,23 +1070,15 @@ pub fn iterative_deepening(
                                 );
                             }
 
-                            // Early exit if mate found
                             if best_score.abs() > 29000 {
                                 break;
                             }
                         }
                     }
-                    break; // Exit aspiration loop on success
+                    break;
                 }
 
-                // Safety check
                 if timeout_occurred || search_iterations >= MAX_ASPIRATION_ITERATIONS * 2 {
-                    if STATS && search_iterations >= MAX_ASPIRATION_ITERATIONS * 2 {
-                        println!(
-                            "info string Aspiration window abandoned after {} iterations",
-                            search_iterations
-                        );
-                    }
                     break;
                 }
             }
