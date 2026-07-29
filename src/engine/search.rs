@@ -994,8 +994,7 @@ pub fn iterative_deepening(
 
                     let board_hash = compute_zobrist_hash(board);
                     if let Some(mv) = tt_guard.get_move(board_hash) {
-                        let movegen = MoveGen::new_legal(board);
-                        if movegen.into_iter().any(|legal_move| legal_move == mv) {
+                        if board.legal(mv) {
                             best_move = Some(mv);
 
                             if STATS {
@@ -1022,8 +1021,7 @@ pub fn iterative_deepening(
                                     pv_hashes.push(h);
 
                                     if let Some(pv_move) = tt_guard.get_move(h) {
-                                        let movegen = MoveGen::new_legal(&temp_board);
-                                        if movegen.into_iter().any(|legal_move| legal_move == pv_move) {
+                                        if temp_board.legal(pv_move) {
                                             pv.push(pv_move);
                                             
                                             let is_capture = temp_board.piece_on(pv_move.get_dest()).is_some();
