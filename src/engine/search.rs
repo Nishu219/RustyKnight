@@ -1,11 +1,89 @@
 use crate::engine::constants::*;
-use crate::engine::evaluation::evaluate;
+use crate::engine::evaluation::{evaluate, compute_material_eval};
 use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, PIECE_VALUES, update_counter_move, update_capture_history, penalize_capture_history, ScoredMove};
 use crate::engine::transposition_table::{TranspositionTable, TTFlag};
-use crate::engine::zobrist::compute_zobrist_hash;
+use crate::engine::zobrist::{compute_zobrist_hash, compute_pawn_zobrist_hash, ZOBRIST_PIECES};
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
 use std::cell::RefCell;
 use std::time::Instant;
+
+#[inline]
+fn other_color(c: Color) -> Color {
+    if c == Color::White { Color::Black } else { Color::White }
+}
+
+#[inline]
+fn color_sign(c: Color) -> i32 {
+    if c == Color::White { 1 } else { -1 }
+}
+
+#[derive(Clone, Copy)]
+pub struct SearchState {
+    pub board: Board,
+    pub material: i32,
+    pub pawn_hash: u64,
+}
+
+impl SearchState {
+    pub fn new(board: Board) -> Self {
+        let material = compute_material_eval(&board);
+        let pawn_hash = compute_pawn_zobrist_hash(&board);
+        SearchState { board, material, pawn_hash }
+    }
+
+    pub fn make_move(&self, mv: ChessMove) -> Self {
+        let board = &self.board;
+        let moving_color = board.side_to_move();
+        let moving_piece = board.piece_on(mv.get_source()).unwrap();
+        let pawn_idx = Piece::Pawn.to_index();
+
+        let mut material = self.material;
+        let mut pawn_hash = self.pawn_hash;
+
+        let is_en_passant = moving_piece == Piece::Pawn
+            && board.piece_on(mv.get_dest()).is_none()
+            && mv.get_source().get_file() != mv.get_dest().get_file();
+
+        if is_en_passant {
+            let captured_sq = Square::make_square(mv.get_source().get_rank(), mv.get_dest().get_file());
+            let captured_color = other_color(moving_color);
+            material -= color_sign(captured_color) * PIECE_VALUES[pawn_idx];
+            pawn_hash ^= ZOBRIST_PIECES[pawn_idx][captured_color.to_index()][captured_sq.to_index()];
+        } else if let Some(captured) = board.piece_on(mv.get_dest()) {
+            let captured_color = other_color(moving_color);
+            material -= color_sign(captured_color) * PIECE_VALUES[captured.to_index()];
+            if captured == Piece::Pawn {
+                pawn_hash ^= ZOBRIST_PIECES[pawn_idx][captured_color.to_index()][mv.get_dest().to_index()];
+            }
+        }
+
+        if moving_piece == Piece::Pawn {
+            pawn_hash ^= ZOBRIST_PIECES[pawn_idx][moving_color.to_index()][mv.get_source().to_index()];
+            if let Some(promotion) = mv.get_promotion() {
+                material += color_sign(moving_color) * (PIECE_VALUES[promotion.to_index()] - PIECE_VALUES[pawn_idx]);
+                // promoted piece isn't a pawn anymore, so no XOR-in on dest
+            } else {
+                pawn_hash ^= ZOBRIST_PIECES[pawn_idx][moving_color.to_index()][mv.get_dest().to_index()];
+            }
+        }
+
+        SearchState {
+            board: board.make_move_new(mv),
+            material,
+            pawn_hash,
+        }
+    }
+
+    /// Null move changes side to move only — material and pawn structure
+    /// are untouched, so both carry over unchanged.
+    pub fn null_move(&self) -> Option<Self> {
+        self.board.null_move().map(|b| SearchState {
+            board: b,
+            material: self.material,
+            pawn_hash: self.pawn_hash,
+        })
+    }
+}
 
 #[derive(Default, Clone)]
 pub struct SearchStats {
@@ -50,7 +128,7 @@ pub fn pop_repetition_table() {
 }
 
 fn quiesce(
-    board: &Board,
+    state: &SearchState,
     mut alpha: i32,
     beta: i32,
     start_time: Instant,
@@ -60,16 +138,17 @@ fn quiesce(
     timeout_occurred: &mut bool,
     ply: usize,
 ) -> i32 {
+    let board = &state.board;
     stats.nodes += 1;
     stats.qnodes += 1;
     stats.seldepth = stats.seldepth.max(ply);
     
     if stats.nodes % TIME_CHECK_INTERVAL == 0 && start_time.elapsed().as_secs_f64() > max_time {
         *timeout_occurred = true;
-        return evaluate(board, 0, None);
+        return evaluate(board, state.material, state.pawn_hash, 0, None);
     }
 
-    let stand_pat = evaluate(board, 0, Some(beta));
+    let stand_pat = evaluate(board, state.material, state.pawn_hash, 0, Some(beta));
 
     if stand_pat >= beta {
         return beta;
@@ -123,9 +202,9 @@ fn quiesce(
             continue;
         }
         
-        let new_board = board.make_move_new(mv);
+        let new_state = state.make_move(mv);
         let score = -quiesce(
-            &new_board,
+            &new_state,
             -beta,
             -alpha,
             start_time,
@@ -153,7 +232,7 @@ fn quiesce(
 }
 
 fn negamax(
-    board: &Board,
+    state: &SearchState,
     depth: usize,
     mut alpha: i32,
     mut beta: i32,
@@ -168,6 +247,7 @@ fn negamax(
     contempt: i32,
     halfmove_clock: u16,
 ) -> i32 {
+    let board = &state.board;
     let is_pv = beta - alpha > 1;
     let is_root = ply == 0;
     let original_alpha = alpha;
@@ -177,7 +257,7 @@ fn negamax(
 
     if stats.nodes % TIME_CHECK_INTERVAL == 0 && start_time.elapsed().as_secs_f64() > max_time {
         *timeout_occurred = true;
-        return if ply > 0 { evaluate(board, 0, None) } else { 0 };
+        return if ply > 0 { evaluate(board, state.material, state.pawn_hash, 0, None) } else { 0 };
     }
 
     let position_hash = compute_zobrist_hash(board);
@@ -218,12 +298,12 @@ fn negamax(
     let static_eval = if in_check {
         -30000 + ply as i32
     } else {
-        evaluate(board, contempt, Some(beta))
+        evaluate(board, state.material, state.pawn_hash, contempt, Some(beta))
     };
 
     if depth == 0 {
         return quiesce(
-            board,
+            state,
             alpha,
             beta,
             start_time,
@@ -242,7 +322,7 @@ fn negamax(
             if static_eval + razor_margin < alpha {
                 let razor_alpha = alpha - razor_margin;
                 let razor_score = quiesce(
-                    board,
+                    state,
                     razor_alpha,
                     razor_alpha + 1,
                     start_time,
@@ -253,7 +333,7 @@ fn negamax(
                     ply,
                 );
                 if *timeout_occurred {
-                    return evaluate(board, 0, None);
+                    return evaluate(board, state.material, state.pawn_hash, 0, None);
                 }
                 if razor_score <= razor_alpha {
                     return razor_score;
@@ -286,9 +366,9 @@ fn negamax(
                 }
                 r = r.min(depth - 1);
 
-                if let Some(null_board) = board.null_move() {
+                if let Some(null_state) = state.null_move() {
                     let null_score = -negamax(
-                        &null_board,
+                        &null_state,
                         depth.saturating_sub(r),
                         -beta,
                         -beta + 1,
@@ -305,7 +385,7 @@ fn negamax(
                     );
 
                     if *timeout_occurred {
-                        return evaluate(board, 0, None);
+                        return evaluate(board, state.material, state.pawn_hash, 0, None);
                     }
 
                     if null_score >= beta {
@@ -346,12 +426,12 @@ fn negamax(
                     break 'probcut;
                 }
 
-                let new_board = board.make_move_new(mv);
-                let new_position_hash = compute_zobrist_hash(&new_board);
+                let new_state = state.make_move(mv);
+                let new_position_hash = compute_zobrist_hash(&new_state.board);
                 update_repetition_table(new_position_hash);
 
                 let score = -negamax(
-                    &new_board,
+                    &new_state,
                     depth - 4,
                     -probcut_beta,
                     -probcut_beta + 1,
@@ -380,7 +460,7 @@ fn negamax(
             }
 
             if *timeout_occurred {
-                return evaluate(board, 0, None);
+                return evaluate(board, state.material, state.pawn_hash, 0, None);
             }
         }
     }
@@ -389,7 +469,7 @@ fn negamax(
     if is_pv && depth >= IID_DEPTH && hash_move.is_none() {
         let iid_depth = depth - 2 - if is_pv { 0 } else { 1 };
         negamax(
-            board,
+            state,
             iid_depth,
             alpha,
             beta,
@@ -442,12 +522,12 @@ fn negamax(
                         break;
                     }
                     
-                    let new_board = board.make_move_new(mv);
-                    let new_position_hash = compute_zobrist_hash(&new_board);
+                    let new_state = state.make_move(mv);
+                    let new_position_hash = compute_zobrist_hash(&new_state.board);
                     update_repetition_table(new_position_hash);
                     
                     let score = -negamax(
-                        &new_board,
+                        &new_state,
                         singular_depth,
                         -singular_beta - 1,
                         -singular_beta,
@@ -502,9 +582,9 @@ fn negamax(
         && depth >= MATE_THREAT_DEPTH 
         && static_eval < beta - 300
     {
-        if let Some(null_board) = board.null_move() {
+        if let Some(null_state) = state.null_move() {
             let threat_score = -negamax(
-                &null_board,
+                &null_state,
                 depth.saturating_sub(3),
                 -beta,
                 -beta + 1,
@@ -632,11 +712,11 @@ fn negamax(
             }
         }
 
-        let new_board = board.make_move_new(mv);
-        let new_position_hash = compute_zobrist_hash(&new_board);
+        let new_state = state.make_move(mv);
+        let new_position_hash = compute_zobrist_hash(&new_state.board);
         update_repetition_table(new_position_hash);
 
-        let gives_check = *new_board.checkers() != BitBoard(0);
+        let gives_check = *new_state.board.checkers() != BitBoard(0);
 
         // Extensions
         let mut extension = mate_threat_extension;
@@ -706,7 +786,7 @@ fn negamax(
         // PVS
         let score = if i == 0 {
             -negamax(
-                &new_board,
+                &new_state,
                 new_depth,
                 -beta,
                 -alpha,
@@ -723,7 +803,7 @@ fn negamax(
             )
         } else {
             let mut search_score = -negamax(
-                &new_board,
+                &new_state,
                 new_depth,
                 -alpha - 1,
                 -alpha,
@@ -740,13 +820,13 @@ fn negamax(
             );
 
             if *timeout_occurred {
-                evaluate(board, 0, None)
+                evaluate(board, state.material, state.pawn_hash, 0, None)
             } else {
                 // Re-search at full depth if reduced
                 if !do_full_search && search_score > alpha {
                     new_depth = depth - 1 + extension;
                     search_score = -negamax(
-                        &new_board,
+                        &new_state,
                         new_depth,
                         -alpha - 1,
                         -alpha,
@@ -765,11 +845,11 @@ fn negamax(
 
                 // PV re-search
                 if *timeout_occurred {
-                    evaluate(board, 0, None)
+                    evaluate(board, state.material, state.pawn_hash, 0, None)
                 } else if search_score > alpha {
                     if is_pv || (search_score < beta) {
                         -negamax(
-                            &new_board,
+                            &new_state,
                             new_depth,
                             -beta,
                             -alpha,
@@ -909,6 +989,7 @@ pub fn iterative_deepening(
     let mut best_move = None;
     let mut best_score = 0;
     let root_color = board.side_to_move();
+    let root_state = SearchState::new(*board);
 
     TRANSPOSITION_TABLE.with(|tt| {
         let mut tt_guard = tt.borrow_mut();
@@ -947,7 +1028,7 @@ pub fn iterative_deepening(
                 search_iterations += 1;
 
                 let score = negamax(
-                    board,
+                    &root_state,
                     depth,
                     alpha,
                     beta,

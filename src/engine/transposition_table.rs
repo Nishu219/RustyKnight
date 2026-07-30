@@ -145,12 +145,13 @@ impl TranspositionTable {
 
     pub fn new(size_mb: usize) -> Self {
         let num_buckets = (size_mb * 1024 * 1024) / std::mem::size_of::<TTBucket>();
+        let size = 1 << (63 - (num_buckets as u64).leading_zeros());
         
         Self {
-            table: vec![TTBucket::default(); num_buckets],
+            table: vec![TTBucket::default(); size],
             hits: 0,
             age: 0,
-            size: num_buckets,
+            size,
         }
     }
 
@@ -162,7 +163,7 @@ impl TranspositionTable {
 
     #[inline(always)]
     pub fn get(&mut self, key: u64, depth: usize, alpha: i32, beta: i32) -> Option<i32> {
-        let index = (key as usize) % self.size;
+        let index = (key as usize) & (self.size - 1);
         let key32 = (key >> 32) as u32;
         let bucket = &self.table[index];
         
@@ -187,7 +188,7 @@ impl TranspositionTable {
     /// Combined probe: returns (Option<score>, Option<best_move>)
     #[inline(always)]
     pub fn get_with_move(&mut self, key: u64, depth: usize, alpha: i32, beta: i32) -> (Option<i32>, Option<ChessMove>) {
-        let index = (key as usize) % self.size;
+        let index = (key as usize) & (self.size - 1);
         let key32 = (key >> 32) as u32;
         let bucket = &self.table[index];
 
@@ -229,7 +230,7 @@ impl TranspositionTable {
         flag: TTFlag,
         move_: Option<ChessMove>,
     ) {
-        let index = (key as usize) % self.size;
+        let index = (key as usize) & (self.size - 1);
         let key32 = (key >> 32) as u32;
         let bucket = &mut self.table[index];
         
@@ -285,7 +286,7 @@ impl TranspositionTable {
 
     #[inline(always)]
     pub fn get_move(&self, key: u64) -> Option<ChessMove> {
-        let index = (key as usize) % self.size;
+        let index = (key as usize) & (self.size - 1);
         let key32 = (key >> 32) as u32;
         let bucket = &self.table[index];
         let mut best_move = None;
@@ -320,7 +321,7 @@ impl TranspositionTable {
 
     #[inline(always)]
     pub fn get_depth(&self, key: u64) -> Option<usize> {
-        let index = (key as usize) % self.size;
+        let index = (key as usize) & (self.size - 1);
         let key32 = (key >> 32) as u32;
         let bucket = &self.table[index];
         

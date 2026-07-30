@@ -1,4 +1,4 @@
-use chess::{BitBoard, Board, Color};
+use chess::{BitBoard, Board, Color, Piece};
 use lazy_static::lazy_static;
 use rand::Rng;
 
@@ -58,3 +58,21 @@ pub fn compute_zobrist_hash(board: &Board) -> u64 {
     
     h
 }
+
+pub fn compute_pawn_zobrist_hash(board: &Board) -> u64 {
+    let mut h = 0u64;
+    let pawn_idx = Piece::Pawn.to_index();
+
+    let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+    for square in white_pawns {
+        h ^= ZOBRIST_PIECES[pawn_idx][Color::White.to_index()][square.to_index()];
+    }
+
+    let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+    for square in black_pawns {
+        h ^= ZOBRIST_PIECES[pawn_idx][Color::Black.to_index()][square.to_index()];
+    }
+
+    h
+}
+

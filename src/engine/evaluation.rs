@@ -5,7 +5,6 @@ use lazy_static::lazy_static;
 use std::cell::RefCell;
 
 thread_local! {
-    pub static MATERIAL_HASH_TABLE: RefCell<MaterialHashTable> = RefCell::new(MaterialHashTable::new(16));
     pub static PAWN_HASH_TABLE: RefCell<PawnHashTable> = RefCell::new(PawnHashTable::new(16));
 }
 
@@ -411,70 +410,26 @@ lazy_static! {
     };
 }
 
-pub struct MaterialHashTable {
-    table: Vec<[(u64, i32, usize); 2]>,
+pub struct CacheTable<T> {
+    table: Vec<[(u64, T, usize); 2]>,
     age: usize,
     size: usize,
 }
 
-impl MaterialHashTable {
+impl<T: Copy + Default> CacheTable<T> {
     pub fn new(size_mb: usize) -> Self {
-        let size = (size_mb * 1024 * 1024) / 48;
+        let entry_size = std::mem::size_of::<[(u64, T, usize); 2]>();
+        let mut size = (size_mb * 1024 * 1024) / entry_size;
+        size = 1 << (63 - (size as u64).leading_zeros());
         Self {
-            table: vec![[(0, 0, 0); 2]; size],
-            age: 0,
-            size,
-        }
-    }
-    pub fn lookup(&self, key: u64) -> Option<i32> {
-        let idx = (key as usize) % self.size;
-        let bucket = &self.table[idx];
-        if bucket[0].0 == key {
-            return Some(bucket[0].1);
-        }
-        if bucket[1].0 == key {
-            return Some(bucket[1].1);
-        }
-        None
-    }
-    pub fn store(&mut self, key: u64, value: i32) {
-        self.age += 1;
-        let idx = (key as usize) % self.size;
-        let bucket = &mut self.table[idx];
-        if bucket[0].0 == key {
-            bucket[0] = (key, value, self.age);
-            return;
-        }
-        if bucket[1].0 == key {
-            bucket[1] = (key, value, self.age);
-            return;
-        }
-        if bucket[0].2 < bucket[1].2 {
-            bucket[0] = (key, value, self.age);
-        } else {
-            bucket[1] = (key, value, self.age);
-        }
-    }
-}
-
-pub struct PawnHashTable {
-    table: Vec<[(u64, i32, usize); 2]>,
-    age: usize,
-    size: usize,
-}
-
-impl PawnHashTable {
-    pub fn new(size_mb: usize) -> Self {
-        let size = (size_mb * 1024 * 1024) / 48;
-        Self {
-            table: vec![[(0, 0, 0); 2]; size],
+            table: vec![[(0, T::default(), 0); 2]; size],
             age: 0,
             size,
         }
     }
     
-    pub fn lookup(&self, key: u64) -> Option<i32> {
-        let idx = (key as usize) % self.size;
+    pub fn lookup(&self, key: u64) -> Option<T> {
+        let idx = key as usize & (self.size - 1);
         let bucket = &self.table[idx];
         if bucket[0].0 == key {
             return Some(bucket[0].1);
@@ -485,9 +440,9 @@ impl PawnHashTable {
         None
     }
     
-    pub fn store(&mut self, key: u64, value: i32) {
+    pub fn store(&mut self, key: u64, value: T) {
         self.age += 1;
-        let idx = (key as usize) % self.size;
+        let idx = key as usize & (self.size - 1);
         let bucket = &mut self.table[idx];
         if bucket[0].0 == key {
             bucket[0] = (key, value, self.age);
@@ -505,28 +460,14 @@ impl PawnHashTable {
     }
     
     pub fn clear(&mut self) {
-        self.table.fill([(0, 0, 0); 2]);
+        self.table.fill([(0, T::default(), 0); 2]);
         self.age = 0;
     }
 }
 
-fn compute_pawn_hash(board: &Board) -> u64 {
-    let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
-    let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
-    white_pawns.0 ^ (black_pawns.0 << 1)
-}
+pub type PawnHashTable = CacheTable<i32>;
 
-fn compute_material_key(board: &Board) -> u64 {
-    let mut key = 0u64;
-    for &piece in &[Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen] {
-        let white_count = (board.pieces(piece) & board.color_combined(Color::White)).popcnt();
-        let black_count = (board.pieces(piece) & board.color_combined(Color::Black)).popcnt();
-        key = (key << 4) | (white_count as u64);
-        key = (key << 4) | (black_count as u64);
-    }
-    key
-}
-fn compute_material_eval(board: &Board) -> i32 {
+pub fn compute_material_eval(board: &Board) -> i32 {
     let mut material = 0;
     for piece in chess::ALL_PIECES {
         let value = PIECE_VALUES[piece.to_index()];
@@ -586,9 +527,7 @@ fn evaluate_rooks(board: &Board) -> i32 {
 
     score
 }
-fn evaluate_pawns(board: &Board, white_pawn_attacks: BitBoard, black_pawn_attacks: BitBoard) -> i32 {
-    let pawn_hash = compute_pawn_hash(board);
-
+fn evaluate_pawns(board: &Board, pawn_hash: u64, white_pawn_attacks: BitBoard, black_pawn_attacks: BitBoard) -> i32 {
     let cached_score = PAWN_HASH_TABLE.with(|cache| {
         cache.borrow().lookup(pawn_hash)
     });
@@ -1189,7 +1128,7 @@ fn evaluate_pawn_threats(
     
     score
 }
-pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
+pub fn evaluate(board: &Board, material: i32, pawn_hash: u64, contempt: i32, beta: Option<i32>) -> i32 {
     let in_check = *board.checkers() != BitBoard(0);
     let has_legal_moves = MoveGen::new_legal(board).next().is_some();
 
@@ -1200,20 +1139,6 @@ pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
             if board.side_to_move() == Color::White { contempt } else { -contempt }
         };
     }
-    let material_key = compute_material_key(board);
-    let material = MATERIAL_HASH_TABLE.with(|table| {
-        table.borrow().lookup(material_key)
-    });
-    let material = match material {
-        Some(m) => m,
-        None => {
-            let m = compute_material_eval(board);
-            MATERIAL_HASH_TABLE.with(|table| {
-                table.borrow_mut().store(material_key, m);
-            });
-            m
-        }
-    };
     let mut score = material;
     let mut phase = 0;
     phase += (board.pieces(Piece::Knight).popcnt() + board.pieces(Piece::Bishop).popcnt()) as i32;
@@ -1289,7 +1214,7 @@ pub fn evaluate(board: &Board, contempt: i32, beta: Option<i32>) -> i32 {
                                            ((black_pawns & not_h_file).0 >> 7));
     
     score += evaluate_rooks(board);
-    score += evaluate_pawns(board, white_pawn_attacks, black_pawn_attacks);
+    score += evaluate_pawns(board, pawn_hash, white_pawn_attacks, black_pawn_attacks);
     score += evaluate_king_tropism(board, phase);
     score += evaluate_king_pawn_shield(board, phase);
     score += evaluate_pieces_and_king_safety(board, phase, white_pawn_attacks, black_pawn_attacks);

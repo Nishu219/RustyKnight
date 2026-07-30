@@ -3,7 +3,7 @@ use crate::engine::search::{iterative_deepening, clear_repetition_table, update_
 use crate::engine::zobrist::compute_zobrist_hash;
 use crate::engine::transposition_table::TranspositionTable;
 use crate::engine::move_ordering::{KILLER_MOVES, HISTORY_HEURISTIC, clear_counter_moves, clear_capture_history};
-use crate::engine::evaluation::{MATERIAL_HASH_TABLE, PAWN_HASH_TABLE, MaterialHashTable};
+use crate::engine::evaluation::PAWN_HASH_TABLE;
 use chess::{Board, ChessMove, Color};
 use std::io::{self, BufRead};
 use std::str::FromStr;
@@ -301,9 +301,6 @@ impl UCIEngine {
                     });
                     HISTORY_HEURISTIC.with(|history| {
                         *history.borrow_mut() = [[0; 64]; 64];
-                    });
-                    MATERIAL_HASH_TABLE.with(|material_table| {
-                        *material_table.borrow_mut() = MaterialHashTable::new(16);
                     });
                     PAWN_HASH_TABLE.with(|pawn_table| {
                         pawn_table.borrow_mut().clear();
