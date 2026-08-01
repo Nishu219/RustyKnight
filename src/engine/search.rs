@@ -2,7 +2,7 @@ use crate::engine::constants::*;
 use crate::engine::evaluation::{evaluate, compute_material_eval};
 use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, PIECE_VALUES, update_counter_move, update_capture_history, penalize_capture_history, ScoredMove};
 use crate::engine::transposition_table::{TranspositionTable, TTFlag};
-use crate::engine::zobrist::{compute_zobrist_hash, compute_pawn_zobrist_hash, ZOBRIST_PIECES};
+use crate::engine::zobrist::{compute_zobrist_hash, compute_pawn_zobrist_hash, update_zobrist_hash, update_zobrist_hash_null_move, ZOBRIST_PIECES};
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
 use std::cell::RefCell;
 use std::time::Instant;
@@ -22,13 +22,17 @@ pub struct SearchState {
     pub board: Board,
     pub material: i32,
     pub pawn_hash: u64,
+    pub position_hash: u64,
 }
 
 impl SearchState {
     pub fn new(board: Board) -> Self {
         let material = compute_material_eval(&board);
         let pawn_hash = compute_pawn_zobrist_hash(&board);
-        SearchState { board, material, pawn_hash }
+        // Computed from scratch only once, when a fresh search root is set up.
+        // Every descendant state derives its hash incrementally from this one.
+        let position_hash = compute_zobrist_hash(&board);
+        SearchState { board, material, pawn_hash, position_hash }
     }
 
     pub fn make_move(&self, mv: ChessMove) -> Self {
@@ -67,20 +71,27 @@ impl SearchState {
             }
         }
 
+        let new_board = board.make_move_new(mv);
+        let position_hash = update_zobrist_hash(board, &new_board, self.position_hash);
+
         SearchState {
-            board: board.make_move_new(mv),
+            board: new_board,
             material,
             pawn_hash,
+            position_hash,
         }
     }
 
     /// Null move changes side to move only — material and pawn structure
-    /// are untouched, so both carry over unchanged.
+    /// are untouched, so both carry over unchanged. The full position hash still
+    /// needs the side-to-move flip and en-passant clear applied incrementally.
     pub fn null_move(&self) -> Option<Self> {
+        let position_hash = update_zobrist_hash_null_move(&self.board, self.position_hash);
         self.board.null_move().map(|b| SearchState {
             board: b,
             material: self.material,
             pawn_hash: self.pawn_hash,
+            position_hash,
         })
     }
 }
@@ -260,7 +271,7 @@ fn negamax(
         return if ply > 0 { evaluate(board, state.material, state.pawn_hash, 0, None) } else { 0 };
     }
 
-    let position_hash = compute_zobrist_hash(board);
+    let position_hash = state.position_hash;
 
     // Draw and mate distance pruning
     if ply > 0 {
@@ -427,7 +438,7 @@ fn negamax(
                 }
 
                 let new_state = state.make_move(mv);
-                let new_position_hash = compute_zobrist_hash(&new_state.board);
+                let new_position_hash = new_state.position_hash;
                 update_repetition_table(new_position_hash);
 
                 let score = -negamax(
@@ -523,7 +534,7 @@ fn negamax(
                     }
                     
                     let new_state = state.make_move(mv);
-                    let new_position_hash = compute_zobrist_hash(&new_state.board);
+                    let new_position_hash = new_state.position_hash;
                     update_repetition_table(new_position_hash);
                     
                     let score = -negamax(
@@ -713,7 +724,7 @@ fn negamax(
         }
 
         let new_state = state.make_move(mv);
-        let new_position_hash = compute_zobrist_hash(&new_state.board);
+        let new_position_hash = new_state.position_hash;
         update_repetition_table(new_position_hash);
 
         let gives_check = *new_state.board.checkers() != BitBoard(0);
@@ -1073,7 +1084,7 @@ pub fn iterative_deepening(
                 } else {
                     best_score = score;
 
-                    let board_hash = compute_zobrist_hash(board);
+                    let board_hash = root_state.position_hash;
                     if let Some(mv) = tt_guard.get_move(board_hash) {
                         if board.legal(mv) {
                             best_move = Some(mv);
@@ -1082,6 +1093,7 @@ pub fn iterative_deepening(
                                 // Extract PV
                                 let mut pv = Vec::new();
                                 let mut temp_board = *board;
+                                let mut temp_hash = board_hash;
                                 let mut pv_hashes = Vec::with_capacity(depth.min(20));
                                 let mut temp_clock = halfmove_clock;
 
@@ -1090,7 +1102,7 @@ pub fn iterative_deepening(
                                         break; 
                                     }
 
-                                    let h = compute_zobrist_hash(&temp_board);
+                                    let h = temp_hash;
                                     let history_count = REPETITION_TABLE.with(|table| {
                                         table.borrow().iter().filter(|&&x| x == h).count()
                                     });
@@ -1113,7 +1125,9 @@ pub fn iterative_deepening(
                                                 temp_clock += 1;
                                             }
 
-                                            temp_board = temp_board.make_move_new(pv_move);
+                                            let next_board = temp_board.make_move_new(pv_move);
+                                            temp_hash = update_zobrist_hash(&temp_board, &next_board, temp_hash);
+                                            temp_board = next_board;
                                         } else {
                                             break;
                                         }

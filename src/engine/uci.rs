@@ -1,6 +1,6 @@
 use crate::engine::constants::*;
 use crate::engine::search::{iterative_deepening, clear_repetition_table, update_repetition_table, TRANSPOSITION_TABLE};
-use crate::engine::zobrist::compute_zobrist_hash;
+use crate::engine::zobrist::{compute_zobrist_hash, update_zobrist_hash};
 use crate::engine::transposition_table::TranspositionTable;
 use crate::engine::move_ordering::{KILLER_MOVES, HISTORY_HEURISTIC, clear_counter_moves, clear_capture_history};
 use crate::engine::evaluation::PAWN_HASH_TABLE;
@@ -73,8 +73,8 @@ impl UCIEngine {
             "startpos" => {
                 self.board = Board::default();
                 self.halfmove_clock = 0;
-                self.position_history
-                    .push(compute_zobrist_hash(&self.board));
+                let mut current_hash = compute_zobrist_hash(&self.board);
+                self.position_history.push(current_hash);
 
                 if tokens.len() > 2 && tokens[2] == "moves" {
                     for move_str in &tokens[3..] {
@@ -87,9 +87,10 @@ impl UCIEngine {
                                 self.halfmove_clock += 1;
                             }
                             
-                            self.board = self.board.make_move_new(chess_move);
-                            self.position_history
-                                .push(compute_zobrist_hash(&self.board));
+                            let new_board = self.board.make_move_new(chess_move);
+                            current_hash = update_zobrist_hash(&self.board, &new_board, current_hash);
+                            self.board = new_board;
+                            self.position_history.push(current_hash);
                         }
                     }
                 }
@@ -104,8 +105,8 @@ impl UCIEngine {
                     
                     self.halfmove_clock = tokens.get(6).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
                     
-                    self.position_history
-                        .push(compute_zobrist_hash(&self.board));
+                    let mut current_hash = compute_zobrist_hash(&self.board);
+                    self.position_history.push(current_hash);
 
                     let mut moves_start = None;
                     for (i, &token) in tokens.iter().enumerate() {
@@ -126,9 +127,10 @@ impl UCIEngine {
                                     self.halfmove_clock += 1;
                                 }
                                 
-                                self.board = self.board.make_move_new(chess_move);
-                                self.position_history
-                                    .push(compute_zobrist_hash(&self.board));
+                                let new_board = self.board.make_move_new(chess_move);
+                                current_hash = update_zobrist_hash(&self.board, &new_board, current_hash);
+                                self.board = new_board;
+                                self.position_history.push(current_hash);
                             }
                         }
                     }
