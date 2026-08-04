@@ -468,15 +468,16 @@ impl<T: Copy + Default> CacheTable<T> {
 pub type PawnHashTable = CacheTable<i32>;
 
 pub fn compute_material_eval(board: &Board) -> i32 {
+    let white = board.color_combined(Color::White);
+    let black = board.color_combined(Color::Black);
+
     let mut material = 0;
-    for piece in chess::ALL_PIECES {
-        let value = PIECE_VALUES[piece.to_index()];
-        let white_count =
-            (board.pieces(piece) & board.color_combined(Color::White)).popcnt() as i32;
-        let black_count =
-            (board.pieces(piece) & board.color_combined(Color::Black)).popcnt() as i32;
-        material += (white_count - black_count) * value;
-    }
+    material += ((board.pieces(Piece::Pawn) & white).popcnt() as i32 - (board.pieces(Piece::Pawn) & black).popcnt() as i32) * PIECE_VALUES[0];
+    material += ((board.pieces(Piece::Knight) & white).popcnt() as i32 - (board.pieces(Piece::Knight) & black).popcnt() as i32) * PIECE_VALUES[1];
+    material += ((board.pieces(Piece::Bishop) & white).popcnt() as i32 - (board.pieces(Piece::Bishop) & black).popcnt() as i32) * PIECE_VALUES[2];
+    material += ((board.pieces(Piece::Rook) & white).popcnt() as i32 - (board.pieces(Piece::Rook) & black).popcnt() as i32) * PIECE_VALUES[3];
+    material += ((board.pieces(Piece::Queen) & white).popcnt() as i32 - (board.pieces(Piece::Queen) & black).popcnt() as i32) * PIECE_VALUES[4];
+    material += ((board.pieces(Piece::King) & white).popcnt() as i32 - (board.pieces(Piece::King) & black).popcnt() as i32) * PIECE_VALUES[5];
     material
 }
 

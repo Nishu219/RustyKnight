@@ -268,11 +268,14 @@ impl UCIEngine {
 
     pub fn run(&mut self) {
         let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(line) => line,
-                Err(_) => break,
-            };
+        let mut line = String::new();
+        let mut reader = stdin.lock();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
 
             let tokens: Vec<&str> = line.split_whitespace().collect();
             if tokens.is_empty() {

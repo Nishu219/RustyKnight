@@ -1182,8 +1182,7 @@ pub fn iterative_deepening(
         }
 
         best_move.or_else(|| {
-            let moves: Vec<ChessMove> = MoveGen::new_legal(board).collect();
-            moves.first().copied()
+            MoveGen::new_legal(board).next()
         })
     })
 }
