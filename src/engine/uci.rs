@@ -30,7 +30,7 @@ impl UCIEngine {
     }
 
     fn handle_uci(&self) {
-        println!("id name RustKnightv2.3");
+        println!("id name RustyKnightv2.3");
         println!("id author Anish");
         println!("option name Hash type spin default 256 min 1 max 4096");
         println!("option name Contempt type spin default 0 min -100 max 100");
