@@ -1,89 +1,99 @@
 # RustyKnight Chess Engine
 
-RustyKnight is a Rust-based chess engine designed for speed and clarity, implementing solid evaluation heuristics and advanced search techniques. This README provides a comprehensive list of all evaluation terms and search methods used in the engine.
+![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
+![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)
+![Version](https://img.shields.io/badge/version-0.1.3-orange.svg)
 
----
-
-## Evaluation Terms
-
-The evaluation function determines the quality of a position using the following terms and heuristics:
-
-### 1. Material Evaluation
-- Calculates the value of all pieces for both sides.
-- Uses a material hash table to cache computed material values.
-- Special score for bishop pairs (+30 for two bishops).
-
-### 2. Piece-Square Tables (PST)
-- Evaluates piece activity and placement using middle-game and end-game tables.
-- The final piece square value is a blend based on the phase of the game.
-
-### 3. Special Position Detection
-- **Checkmate:** Assigns a large positive/negative score depending on the side to move.
-- **Stalemate:** Assigns a contempt value (draw score).
-
-### 4. Rook Evaluation
-The engine assesses rook positioning and activity with the following heuristics:
-- **Rooks on Open Files:** A rook on a file with no pawns is valued highly (+25 for each side).
-- **Rooks on Semi-Open Files:** A rook on a file with only friendly pawns is valuable (+15 for each side).
-- **Rooks on the Seventh Rank:** A rook on the opponent's second to last rank is a powerful piece, often controlling key squares and attacking pawns (+20 for white on the 7th rank, +20 for black on the 2nd rank).
-
-### 5. Pawn Evaluation
-Analyzes pawn structure to detect weaknesses and strengths:
-- **Doubled Pawns:** Penalized by -20 per extra pawn on the same file.
-- **Isolated Pawns:** Penalized by -15 if there are no adjacent pawns on neighboring files.
-- **Connected Pawns:** Bonus of +3 for pawns supporting each other diagonally.
-- **Passed Pawns:** Bonuses increase with rank advancement:
-   Ranks 2–6: +5 to +80 (based on proximity to promotion)
-- **Pawn Chains:** Additional +5 bonus for pawns protected from behind by another pawn.
-- **Backward Pawns:** Appropiate penalty is given for backward pawns.
-## Search Methods
-
-RustyKnight implements several search algorithms and pruning techniques:
-
-### 1. Negamax Search
-- Main recursive search algorithm using the negamax variant of minimax.
-- Integrates alpha-beta pruning for efficiency.
-- Supports Principal Variation (PV) search.
-
-### 2. Quiescence Search
-- Extends search at leaf nodes by examining only tactical moves (captures, promotions) to avoid the horizon effect.
-
-### 3. Iterative Deepening
-- Searches incrementally deeper, using results from shallower searches to improve move ordering.
-
-### 4. Move Ordering
-- **Hash Move:** Move recommended by the transposition table.
-- **Killer Moves:** Quiet moves causing cutoffs in previous searches at the same depth.
-- **History Heuristic:** Tracks which moves historically perform well.
-
-### 5. MVV-LVA
-- Used to sort captures using the most valuable victim and least valuable attacker.
-
-### 6. Transposition Table
-- Memoizes positions already evaluated to prevent redundant computation and speed up search.
-
-### 7. Advanced Pruning and Extensions
-- **Futility Pruning:** Skips moves unlikely to improve alpha.
-- **Late Move Pruning (LMP):** Prunes quiet moves deeper into the move list.
-- **Late Move Reductions (LMR):** Reduces search depth for less promising moves.
-- **Null Move Pruning:** Searches positions where the side to move passes (makes a "null" move) to detect threats.
-- **Internal Iterative Deepening (IID):** Used to find a good move when hash move is unavailable.
----
+RustyKnight is a fast and efficient UCI (Universal Chess Interface) chess engine written in Rust. It focuses on speed and clarity, implementing solid evaluation heuristics and advanced search techniques to provide strong gameplay.
 
 ## Features
 
-- **UCI Protocol Support:** Communicates with chess GUIs via the Universal Chess Interface.
+- **UCI Protocol Support:** Fully compatible with standard chess GUIs via the Universal Chess Interface.
 - **Zobrist Hashing:** Efficient position hashing for transposition tables and caching.
-
+- **Advanced Search Algorithms:** Implements Negamax with alpha-beta pruning, Iterative Deepening, Quiescence Search, and various pruning techniques (Null Move Pruning, Late Move Reductions, Late Move Pruning, Futility Pruning, Internal Iterative Deepening).
+- **Evaluation Function:** Includes heuristics for material, piece-square tables, pawn structure, rook positioning, and special positions (checkmate/stalemate).
 
 ---
 
 ## Code Structure
 
-All main logic is implemented in [`src/main.rs`](src/main.rs).  
-For details, refer to function definitions such as `evaluate`, `negamax`, `order_moves`, `quiesce`,  `evaluate_pawn_structure`, and `iterative_deepening`.
+All main logic is implemented in `src/main.rs`.
+For details, refer to function definitions such as `evaluate`, `negamax`, `order_moves`, `quiesce`, `evaluate_pawn_structure`, and `iterative_deepening`.
 
 ---
+
+## Installation and Usage
+
+### Prerequisites
+
+To build RustyKnight, you need to have Rust and Cargo installed. If you don't have them, you can install them from [rustup.rs](https://rustup.rs/).
+
+### Building
+
+Clone the repository and build the engine using Cargo:
+
+```bash
+git clone https://github.com/yourusername/RustyKnight.git
+cd RustyKnight
+cargo build --release
+```
+
+The compiled executable will be located in `target/release/RustKnight`.
+
+### Running with a GUI
+
+RustyKnight is a command-line application that communicates via the UCI protocol. To play against it or have it analyze games, you need to load it into a chess GUI that supports UCI.
+
+1. Open your preferred chess GUI (e.g., Arena, Cute Chess, Lucas Chess).
+2. Add a new UCI engine and select the compiled `RustKnight` executable from the `target/release/` directory.
+
+### Running from the Command Line
+
+You can also run RustyKnight directly from the terminal to interact with it using UCI commands manually:
+
+```bash
+cargo run --release
+```
+
+**Basic UCI Commands:**
+- `uci`: Initialize the engine and list supported options.
+- `isready`: Check if the engine is ready.
+- `position startpos`: Set the board to the starting position.
+- `go depth 10`: Tell the engine to search up to depth 10 and return the best move.
+- `quit`: Exit the engine.
+
+---
+
+## Evaluation Details
+
+The evaluation function determines the quality of a position using the following terms:
+
+- **Material Evaluation:** Total value of pieces for both sides, with a special score for the bishop pair.
+- **Piece-Square Tables (PST):** Evaluates piece activity based on their location on the board, smoothly transitioning from middle-game to end-game weights.
+- **Special Position Detection:** Assigns scores for Checkmate and Stalemate.
+- **Rook Evaluation:** Bonuses for rooks on open files, semi-open files, and the 7th rank.
+- **Pawn Evaluation:** Analyzes pawns for weaknesses (doubled, isolated, backward) and strengths (passed, connected, chains).
+
+## Search Details
+
+The engine uses several search algorithms and pruning techniques:
+
+- **Iterative Deepening:** Searches incrementally deeper to improve move ordering.
+- **Negamax Search:** The core recursive search algorithm with alpha-beta pruning.
+- **Quiescence Search:** Extends the search at leaf nodes by examining tactical moves.
+- **Transposition Table:** Memoizes previously evaluated positions.
+- **Pruning and Reductions:**
+  - Null Move Pruning
+  - Late Move Reductions (LMR)
+  - Late Move Pruning (LMP)
+  - Futility Pruning
+  - Internal Iterative Deepening (IID)
+- **Move Ordering:**
+  - Hash Move (from Transposition Table)
+  - MVV-LVA (Most Valuable Victim - Least Valuable Attacker) for captures
+  - Killer Moves
+  - History Heuristic
+
 
 ## Contributing
 
