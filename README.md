@@ -2,7 +2,7 @@
 
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)
-![Version](https://img.shields.io/badge/version-0.1.3-orange.svg)
+![Version](https://img.shields.io/badge/version-2.3-orange.svg)
 
 RustyKnight is a fast and efficient UCI (Universal Chess Interface) chess engine written in Rust. It focuses on speed and clarity, implementing solid evaluation heuristics and advanced search techniques to provide strong gameplay.
 

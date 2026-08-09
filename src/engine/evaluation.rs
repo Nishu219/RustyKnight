@@ -1006,17 +1006,9 @@ fn get_king_shield_score(king_sq: Square, friendly_pawns: BitBoard, color: Color
             score -= 30;
         } else {
             let pawn_rank = if color == Color::White {
-                pawns_on_file
-                    .into_iter()
-                    .map(|s| s.get_rank().to_index())
-                    .min()
-                    .unwrap_or(7)
+                (pawns_on_file.0.trailing_zeros() / 8) as usize
             } else {
-                pawns_on_file
-                    .into_iter()
-                    .map(|s| s.get_rank().to_index())
-                    .max()
-                    .unwrap_or(0)
+                ((63 - pawns_on_file.0.leading_zeros()) / 8) as usize
             };
 
             let rank_diff = (pawn_rank as i32 - shield_rank as i32).abs();

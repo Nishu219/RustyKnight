@@ -1104,9 +1104,16 @@ pub fn iterative_deepening(
 
                                     let h = temp_hash;
                                     let history_count = REPETITION_TABLE.with(|table| {
-                                        table.borrow().iter().filter(|&&x| x == h).count()
+                                        let mut count = 0;
+                                        for &x in table.borrow().iter() {
+                                            if x == h { count += 1; }
+                                        }
+                                        count
                                     });
-                                    let pv_count = pv_hashes.iter().filter(|&&x| x == h).count();
+                                    let mut pv_count = 0;
+                                    for &x in pv_hashes.iter() {
+                                        if x == h { pv_count += 1; }
+                                    }
                                     
                                     if history_count + pv_count >= 2 {
                                         break; 
@@ -1142,11 +1149,14 @@ pub fn iterative_deepening(
                                 } else {
                                     0
                                 };
-                                let pv_string = pv
-                                    .iter()
-                                    .map(|m| format!("{}", m))
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
+                                use std::fmt::Write;
+                                let mut pv_string = String::new();
+                                for (i, m) in pv.iter().enumerate() {
+                                    if i > 0 {
+                                        pv_string.push(' ');
+                                    }
+                                    write!(&mut pv_string, "{}", m).unwrap();
+                                }
 
                                 let hashfull = tt_guard.hashfull();
 
