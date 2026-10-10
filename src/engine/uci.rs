@@ -2,7 +2,7 @@ use crate::engine::constants::*;
 use crate::engine::search::{iterative_deepening, clear_repetition_table, update_repetition_table, TRANSPOSITION_TABLE};
 use crate::engine::zobrist::{compute_zobrist_hash, update_zobrist_hash};
 use crate::engine::transposition_table::TranspositionTable;
-use crate::engine::move_ordering::{KILLER_MOVES, HISTORY_HEURISTIC, clear_counter_moves, clear_capture_history};
+use crate::engine::move_ordering::{KILLER_MOVES, HISTORY_HEURISTIC, clear_counter_moves, clear_capture_history, clear_cmh_table, clear_fmh_table};
 use crate::engine::evaluation::PAWN_HASH_TABLE;
 use chess::{Board, ChessMove, Color};
 use std::io::{self, BufRead};
@@ -312,6 +312,8 @@ impl UCIEngine {
                     });
                     clear_repetition_table();
                     clear_counter_moves();
+                    clear_cmh_table();
+                    clear_fmh_table();
                     clear_capture_history();
                 }
                 "position" => self.handle_position(&tokens),

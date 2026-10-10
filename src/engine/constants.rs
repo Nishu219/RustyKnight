@@ -47,6 +47,16 @@ pub const LAZY_EVAL_MARGIN: i32 = 200;
 pub const PAWN_ATTACK_THREAT: [(i32, i32); 4] = [(50, 40), (50, 40), (60, 50), (75, 65)];
 pub const TIME_CHECK_INTERVAL: usize = 4096;
 
+// Continuation History Constants (G = 10000 Scale)
+pub const CONTHIST_GRAVITY: i32 = 10000;
+pub const CONTHIST_BONUS_S: i32 = 10;
+pub const CONTHIST_BONUS_C: i32 = 80;
+pub const CONTHIST_MAX_BONUS: i32 = 800;
+
+pub const CMH_PRUNING_DEPTH: usize = 3;
+pub const CMH_PRUNING_THRESHOLD: i32 = -1000;
+pub const LMR_HIST_DIVISOR: i32 = 7000;
+
 pub const LMR_SCALE: i32 = 1024;
 pub static mut LMR_TABLE: [[i32; 256]; 64] = [[0; 256]; 64];
 

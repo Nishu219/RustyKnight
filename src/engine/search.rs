@@ -1,6 +1,13 @@
 use crate::engine::constants::*;
+use crate::engine::constants::{CMH_PRUNING_DEPTH, CMH_PRUNING_THRESHOLD, LMR_HIST_DIVISOR};
 use crate::engine::evaluation::{evaluate, compute_material_eval};
-use crate::engine::move_ordering::{order_moves, see_capture, mvv_lva_score, KILLER_MOVES, HISTORY_HEURISTIC, PIECE_VALUES, update_counter_move, update_capture_history, penalize_capture_history, ScoredMove};
+#[allow(unused_imports)]
+use crate::engine::move_ordering::{
+    continuation_bonus, get_counter_move, mvv_lva_score, order_moves, penalize_capture_history,
+    see_capture, update_capture_history, update_capture_history_batch, update_conthist_batch,
+    update_counter_move, ScoredMove, CAPTURE_HISTORY, CMH_TABLE, FMH_TABLE, HISTORY_HEURISTIC,
+    KILLER_MOVES, PIECE_VALUES,
+};
 use crate::engine::transposition_table::{TranspositionTable, TTFlag};
 use crate::engine::zobrist::{compute_zobrist_hash, compute_pawn_zobrist_hash, update_zobrist_hash, update_zobrist_hash_null_move, ZOBRIST_PIECES};
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
@@ -255,6 +262,7 @@ fn negamax(
     max_time: f64,
     timeout_occurred: &mut bool,
     previous_move: Option<ChessMove>,
+    previous_2_move: Option<ChessMove>,
     contempt: i32,
     halfmove_clock: u16,
 ) -> i32 {
@@ -391,6 +399,7 @@ fn negamax(
                         max_time,
                         timeout_occurred,
                         None,
+                        None,
                         contempt,
                         halfmove_clock + 1,
                     );
@@ -454,6 +463,7 @@ fn negamax(
                     max_time,
                     timeout_occurred,
                     Some(mv),
+                    previous_move,
                     contempt,
                     0,
                 );
@@ -492,6 +502,7 @@ fn negamax(
             max_time,
             timeout_occurred,
             previous_move,
+            previous_2_move,
             contempt,
             halfmove_clock,
         );
@@ -550,6 +561,7 @@ fn negamax(
                         max_time,
                         timeout_occurred,
                         None,
+                        None,
                         contempt,
                         {
                             let is_capture = board.piece_on(mv.get_dest()).is_some();
@@ -607,6 +619,7 @@ fn negamax(
                 max_time,
                 timeout_occurred,
                 None,
+                None,
                 contempt,
                 halfmove_clock + 1,
             );
@@ -629,7 +642,7 @@ fn negamax(
     }
 
     let ordered_moves = &mut move_list[..move_count];
-    order_moves(board, ordered_moves, hash_move, ply, previous_move);
+    order_moves(board, ordered_moves, hash_move, ply, previous_move, previous_2_move);
 
     let mut best_value = -31000;
     let mut best_move = None;
@@ -647,6 +660,18 @@ fn negamax(
         });
     }
 
+    let counter_move = previous_move.and_then(|prev_mv| get_counter_move(board, prev_mv));
+
+    let prev_info = previous_move.and_then(|prev_mv| {
+        board.piece_on(prev_mv.get_dest()).map(|p| (p.to_index(), prev_mv.get_dest().to_index()))
+    });
+
+    let prev_2_info = previous_2_move.and_then(|prev_mv| {
+        board.piece_on(prev_mv.get_dest()).map(|p| (p.to_index(), prev_mv.get_dest().to_index()))
+    });
+
+    let active_weight = 2 + if previous_move.is_some() { 2 } else { 0 } + if previous_2_move.is_some() { 1 } else { 0 };
+
     for (i, scored_mv) in ordered_moves.iter().enumerate() {
         let mv = scored_mv.mv;
         if *timeout_occurred {
@@ -657,11 +682,40 @@ fn negamax(
         let is_promotion = mv.get_promotion().is_some();
         let is_quiet = !is_capture && !is_promotion;
         let is_hash_move = hash_move.is_some() && mv == hash_move.unwrap();
+        let is_killer = Some(mv) == killer_moves[0] || Some(mv) == killer_moves[1];
+        let is_counter = Some(mv) == counter_move;
 
-        let next_halfmove_clock = if is_capture || board.piece_on(mv.get_source()) == Some(chess::Piece::Pawn) {
+        let moving_piece = board.piece_on(mv.get_source());
+        let next_halfmove_clock = if is_capture || moving_piece == Some(chess::Piece::Pawn) {
             0
         } else {
             halfmove_clock + 1
+        };
+
+        let (hist_score, cmh_score, _fmh_score, h_avg) = if is_quiet {
+            let curr_from = mv.get_source().to_index();
+            let curr_to = mv.get_dest().to_index();
+            let hist_score = HISTORY_HEURISTIC.with(|history| {
+                history.borrow()[curr_from][curr_to]
+            });
+            let curr_p = moving_piece.map(|p| p.to_index());
+            let cmh_score = match (prev_info, curr_p) {
+                (Some((prev_p, prev_t)), Some(cp)) => {
+                    CMH_TABLE.with(|cmh| cmh.borrow()[prev_p][prev_t][cp][curr_to] as i32)
+                }
+                _ => 0,
+            };
+            let fmh_score = match (prev_2_info, curr_p) {
+                (Some((p2_p, p2_t)), Some(cp)) => {
+                    FMH_TABLE.with(|fmh| fmh.borrow()[p2_p][p2_t][cp][curr_to] as i32)
+                }
+                _ => 0,
+            };
+
+            let h_avg = (2 * hist_score + 2 * cmh_score + fmh_score) / active_weight;
+            (hist_score, cmh_score, fmh_score, h_avg)
+        } else {
+            (0, 0, 0, 0)
         };
 
         // Late move pruning
@@ -680,17 +734,18 @@ fn negamax(
                 lmp_threshold = (lmp_threshold * 3) / 2;
             }
 
-            if quiet_moves_searched >= lmp_threshold {
+            if quiet_moves_searched >= lmp_threshold && !is_killer && !is_counter {
                 continue;
             }
         }
 
         // Futility pruning
         if !is_pv && !in_check && is_quiet && depth <= FUTILITY_DEPTH && i > 0 {
-            let futility_margin = FUTILITY_MARGINS[depth.min(4)];
+            let history_margin_adj = (h_avg / 50).clamp(-100, 50);
+            let futility_margin = FUTILITY_MARGINS[depth.min(4)] + history_margin_adj;
 
             let futility_value = static_eval + futility_margin;
-            if futility_value <= alpha {
+            if futility_value <= alpha && !is_killer && !is_counter {
                 continue;
             }
         }
@@ -698,11 +753,26 @@ fn negamax(
         // Futility move count pruning
         if !is_pv && !in_check && is_quiet && depth <= 4 && moves_searched > 0 {
             let futility_value = static_eval + FUTILITY_MARGINS[depth.min(4)];
-            if futility_value <= alpha {
+            if futility_value <= alpha && !is_killer && !is_counter {
                 let move_count_limit = FUTILITY_MOVE_COUNTS[depth.min(4)];
                 if quiet_moves_searched >= move_count_limit {
                     continue;
                 }
+            }
+        }
+
+        // CMH Pruning (Continuation History Leaf Pruning)
+        if !is_pv 
+            && !in_check 
+            && is_quiet 
+            && depth <= CMH_PRUNING_DEPTH 
+            && moves_searched > 0 
+            && !is_hash_move 
+            && !is_killer 
+            && !is_counter 
+        {
+            if cmh_score < CMH_PRUNING_THRESHOLD {
+                continue;
             }
         }
 
@@ -714,11 +784,9 @@ fn negamax(
             && moves_searched > 0 
             && !is_hash_move
         {
-            let history_score = HISTORY_HEURISTIC.with(|history| {
-                history.borrow()[mv.get_source().to_index()][mv.get_dest().to_index()]
-            });
+            let history_score = hist_score;
             
-            if history_score < HISTORY_PRUNING_THRESHOLD {
+            if history_score < HISTORY_PRUNING_THRESHOLD && !is_counter && cmh_score <= 0 {
                 continue;
             }
         }
@@ -736,7 +804,7 @@ fn negamax(
             extension = extension.max(singular_extension);
         } else if gives_check && see_capture(board, mv, 0) {
             extension += 1;
-        } else if let Some(piece) = board.piece_on(mv.get_source()) {
+        } else if let Some(piece) = moving_piece {
             if piece == chess::Piece::Pawn {
                 let dest_rank = mv.get_dest().get_rank();
                 if dest_rank == chess::Rank::Seventh || dest_rank == chess::Rank::Second {
@@ -751,13 +819,12 @@ fn negamax(
         let mut do_full_search = true;
 
         // LMR
-        let is_killer = Some(mv) == killer_moves[0] || Some(mv) == killer_moves[1];
-
         if depth >= 3 
             && i >= LMR_FULL_DEPTH_MOVES 
             && is_quiet 
             && !gives_check 
             && !is_killer
+            && !is_counter
         {
             let depth_idx = depth.min(63);
             let move_idx = i.min(255);
@@ -770,11 +837,7 @@ fn negamax(
                 r_scaled -= 204;
             }
 
-            let history_score = HISTORY_HEURISTIC.with(|history| {
-                history.borrow()[mv.get_source().to_index()][mv.get_dest().to_index()]
-            });
-            
-            let history_bonus = (history_score * LMR_SCALE) / 7000;
+            let history_bonus = (h_avg * LMR_SCALE) / LMR_HIST_DIVISOR;
             let clamped_bonus = history_bonus.clamp(-1280, 1280);
             
             r_scaled -= clamped_bonus;
@@ -809,6 +872,7 @@ fn negamax(
                 max_time,
                 timeout_occurred,
                 Some(mv),
+                previous_move,
                 contempt,
                 next_halfmove_clock,
             )
@@ -826,6 +890,7 @@ fn negamax(
                 max_time,
                 timeout_occurred,
                 Some(mv),
+                previous_move,
                 contempt,
                 next_halfmove_clock,
             );
@@ -849,6 +914,7 @@ fn negamax(
                         max_time,
                         timeout_occurred,
                         Some(mv),
+                        previous_move,
                         contempt,
                         next_halfmove_clock,
                     );
@@ -872,6 +938,7 @@ fn negamax(
                             max_time,
                             timeout_occurred,
                             Some(mv),
+                            previous_move,
                             contempt,
                             next_halfmove_clock,
                         )
@@ -933,41 +1000,59 @@ fn negamax(
                     
                     let current = history[from_sq][to_sq];
                     history[from_sq][to_sq] = current + bonus - (current * bonus.abs()) / 10000;
-                });
 
-                // Penalize history for failed quiet moves
-                for prev_scored_mv in &ordered_moves[0..i] {
-                    let prev_mv = prev_scored_mv.mv;
-                    if board.piece_on(prev_mv.get_dest()).is_none()
-                        && prev_mv.get_promotion().is_none()
-                    {
-                        HISTORY_HEURISTIC.with(|history| {
-                            let mut history = history.borrow_mut();
+                    // Penalize history for failed quiet moves
+                    let penalty = -bonus;
+                    for prev_scored_mv in &ordered_moves[0..i] {
+                        let prev_mv = prev_scored_mv.mv;
+                        if board.piece_on(prev_mv.get_dest()).is_none()
+                            && prev_mv.get_promotion().is_none()
+                        {
                             let prev_from = prev_mv.get_source().to_index();
                             let prev_to = prev_mv.get_dest().to_index();
-                            
-                            let penalty = -((depth * depth).min(400) as i32);
                             let current = history[prev_from][prev_to];
                             history[prev_from][prev_to] = current + penalty - (current * penalty.abs()) / 10000;
-                        });
+                        }
                     }
-                }
+                });
             }
             else {
-                update_capture_history(mv, board, depth, i > 0);
-                
-                for prev_scored_mv in &ordered_moves[0..i] {
-                    let prev_mv = prev_scored_mv.mv;
-                    if board.piece_on(prev_mv.get_dest()).is_some() || prev_mv.get_promotion().is_some() {
-                        penalize_capture_history(prev_mv, board, depth);
-                    }
-                }
+                update_capture_history_batch(board, mv, &ordered_moves[0..i], depth);
             }
         }
 
         if alpha >= beta {
             if is_quiet {
-                update_counter_move(previous_move, mv);
+                update_counter_move(board, previous_move, mv);
+
+                let conthist_bonus = continuation_bonus(depth);
+                let failed_quiets = &ordered_moves[0..i];
+
+                if previous_move.is_some() {
+                    CMH_TABLE.with(|cmh| {
+                        update_conthist_batch(
+                            &mut cmh.borrow_mut(),
+                            board,
+                            previous_move,
+                            mv,
+                            failed_quiets,
+                            conthist_bonus,
+                        );
+                    });
+                }
+
+                if previous_2_move.is_some() {
+                    FMH_TABLE.with(|fmh| {
+                        update_conthist_batch(
+                            &mut fmh.borrow_mut(),
+                            board,
+                            previous_2_move,
+                            mv,
+                            failed_quiets,
+                            conthist_bonus,
+                        );
+                    });
+                }
             }
             break;
         }
@@ -1050,6 +1135,7 @@ pub fn iterative_deepening(
                     &mut tt_guard,
                     max_time,
                     &mut timeout_occurred,
+                    None,
                     None,
                     contempt,
                     halfmove_clock,
