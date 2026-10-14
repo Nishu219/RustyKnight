@@ -1,17 +1,17 @@
 use crate::engine::constants::*;
 use crate::engine::constants::{CMH_PRUNING_DEPTH, CMH_PRUNING_THRESHOLD, LMR_HIST_DIVISOR};
-use crate::engine::evaluation::{evaluate, compute_material_eval};
-#[allow(unused_imports)]
+use crate::engine::evaluation::{
+    compute_psqt_and_phase, evaluate, piece_to_index, Score, KING_INDEX,
+    PAWN_INDEX, PHASE_VALUES, PSQT, ROOK_INDEX,
+};
 use crate::engine::move_ordering::{
-    continuation_bonus, get_counter_move, mvv_lva_score, order_moves, penalize_capture_history,
-    see_capture, update_capture_history, update_capture_history_batch, update_conthist_batch,
-    update_counter_move, ScoredMove, CAPTURE_HISTORY, CMH_TABLE, FMH_TABLE, HISTORY_HEURISTIC,
-    KILLER_MOVES, PIECE_VALUES,
+    continuation_bonus, mvv_lva_score, see_capture, MovePicker, ScoredMove, PIECE_VALUES,
 };
 use crate::engine::transposition_table::{TranspositionTable, TTFlag};
+use crate::engine::worker::{SearchStats, Worker};
 use crate::engine::zobrist::{compute_zobrist_hash, compute_pawn_zobrist_hash, update_zobrist_hash, update_zobrist_hash_null_move, ZOBRIST_PIECES};
-use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
-use std::cell::RefCell;
+use chess::{BitBoard, Board, ChessMove, Color, MoveGen, Piece, Square};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 #[inline]
@@ -19,130 +19,159 @@ fn other_color(c: Color) -> Color {
     if c == Color::White { Color::Black } else { Color::White }
 }
 
-#[inline]
-fn color_sign(c: Color) -> i32 {
-    if c == Color::White { 1 } else { -1 }
-}
-
 #[derive(Clone, Copy)]
 pub struct SearchState {
     pub board: Board,
-    pub material: i32,
+    pub psqt: Score,
+    pub phase: i32,
     pub pawn_hash: u64,
     pub position_hash: u64,
 }
 
 impl SearchState {
     pub fn new(board: Board) -> Self {
-        let material = compute_material_eval(&board);
+        let (psqt, phase) = compute_psqt_and_phase(&board);
         let pawn_hash = compute_pawn_zobrist_hash(&board);
-        // Computed from scratch only once, when a fresh search root is set up.
-        // Every descendant state derives its hash incrementally from this one.
         let position_hash = compute_zobrist_hash(&board);
-        SearchState { board, material, pawn_hash, position_hash }
+        SearchState { board, psqt, phase, pawn_hash, position_hash }
     }
 
     pub fn make_move(&self, mv: ChessMove) -> Self {
         let board = &self.board;
         let moving_color = board.side_to_move();
+        let moving_color_idx = moving_color.to_index();
         let moving_piece = board.piece_on(mv.get_source()).unwrap();
-        let pawn_idx = Piece::Pawn.to_index();
+        let moving_piece_idx = piece_to_index(moving_piece);
+        let from_sq = mv.get_source();
+        let to_sq = mv.get_dest();
+        let from_idx = from_sq.to_index();
+        let to_idx = to_sq.to_index();
 
-        let mut material = self.material;
+        let mut psqt = self.psqt;
+        let mut phase = self.phase;
         let mut pawn_hash = self.pawn_hash;
 
         let is_en_passant = moving_piece == Piece::Pawn
-            && board.piece_on(mv.get_dest()).is_none()
-            && mv.get_source().get_file() != mv.get_dest().get_file();
+            && board.piece_on(to_sq).is_none()
+            && from_sq.get_file() != to_sq.get_file();
 
         if is_en_passant {
-            let captured_sq = Square::make_square(mv.get_source().get_rank(), mv.get_dest().get_file());
+            let captured_sq = Square::make_square(from_sq.get_rank(), to_sq.get_file());
             let captured_color = other_color(moving_color);
-            material -= color_sign(captured_color) * PIECE_VALUES[pawn_idx];
-            pawn_hash ^= ZOBRIST_PIECES[pawn_idx][captured_color.to_index()][captured_sq.to_index()];
-        } else if let Some(captured) = board.piece_on(mv.get_dest()) {
+            let captured_color_idx = captured_color.to_index();
+            let cap_idx = captured_sq.to_index();
+
+            if captured_color == Color::White {
+                psqt -= PSQT[PAWN_INDEX][0][cap_idx];
+            } else {
+                psqt += PSQT[PAWN_INDEX][1][cap_idx];
+            }
+            pawn_hash ^= ZOBRIST_PIECES[PAWN_INDEX][captured_color_idx][cap_idx];
+        } else if let Some(captured) = board.piece_on(to_sq) {
             let captured_color = other_color(moving_color);
-            material -= color_sign(captured_color) * PIECE_VALUES[captured.to_index()];
+            let captured_color_idx = captured_color.to_index();
+            let cap_piece_idx = piece_to_index(captured);
+
+            if captured_color == Color::White {
+                psqt -= PSQT[cap_piece_idx][0][to_idx];
+            } else {
+                psqt += PSQT[cap_piece_idx][1][to_idx];
+            }
+            phase -= PHASE_VALUES[cap_piece_idx];
             if captured == Piece::Pawn {
-                pawn_hash ^= ZOBRIST_PIECES[pawn_idx][captured_color.to_index()][mv.get_dest().to_index()];
+                pawn_hash ^= ZOBRIST_PIECES[PAWN_INDEX][captured_color_idx][to_idx];
             }
         }
 
         if moving_piece == Piece::Pawn {
-            pawn_hash ^= ZOBRIST_PIECES[pawn_idx][moving_color.to_index()][mv.get_source().to_index()];
+            pawn_hash ^= ZOBRIST_PIECES[PAWN_INDEX][moving_color_idx][from_idx];
             if let Some(promotion) = mv.get_promotion() {
-                material += color_sign(moving_color) * (PIECE_VALUES[promotion.to_index()] - PIECE_VALUES[pawn_idx]);
-                // promoted piece isn't a pawn anymore, so no XOR-in on dest
+                let prom_idx = piece_to_index(promotion);
+                if moving_color == Color::White {
+                    psqt -= PSQT[PAWN_INDEX][0][from_idx];
+                    psqt += PSQT[prom_idx][0][to_idx];
+                } else {
+                    psqt += PSQT[PAWN_INDEX][1][from_idx];
+                    psqt -= PSQT[prom_idx][1][to_idx];
+                }
+                phase += PHASE_VALUES[prom_idx];
             } else {
-                pawn_hash ^= ZOBRIST_PIECES[pawn_idx][moving_color.to_index()][mv.get_dest().to_index()];
+                if moving_color == Color::White {
+                    psqt -= PSQT[PAWN_INDEX][0][from_idx];
+                    psqt += PSQT[PAWN_INDEX][0][to_idx];
+                } else {
+                    psqt += PSQT[PAWN_INDEX][1][from_idx];
+                    psqt -= PSQT[PAWN_INDEX][1][to_idx];
+                }
+                pawn_hash ^= ZOBRIST_PIECES[PAWN_INDEX][moving_color_idx][to_idx];
+            }
+        } else if moving_piece == Piece::King {
+            let file_diff = (from_sq.get_file().to_index() as i32 - to_sq.get_file().to_index() as i32).abs();
+            if file_diff == 2 {
+                if moving_color == Color::White {
+                    psqt -= PSQT[KING_INDEX][0][from_idx];
+                    psqt += PSQT[KING_INDEX][0][to_idx];
+                    if to_sq == Square::G1 {
+                        psqt -= PSQT[ROOK_INDEX][0][Square::H1.to_index()];
+                        psqt += PSQT[ROOK_INDEX][0][Square::F1.to_index()];
+                    } else if to_sq == Square::C1 {
+                        psqt -= PSQT[ROOK_INDEX][0][Square::A1.to_index()];
+                        psqt += PSQT[ROOK_INDEX][0][Square::D1.to_index()];
+                    }
+                } else {
+                    psqt += PSQT[KING_INDEX][1][from_idx];
+                    psqt -= PSQT[KING_INDEX][1][to_idx];
+                    if to_sq == Square::G8 {
+                        psqt += PSQT[ROOK_INDEX][1][Square::H8.to_index()];
+                        psqt -= PSQT[ROOK_INDEX][1][Square::F8.to_index()];
+                    } else if to_sq == Square::C8 {
+                        psqt += PSQT[ROOK_INDEX][1][Square::A8.to_index()];
+                        psqt -= PSQT[ROOK_INDEX][1][Square::D8.to_index()];
+                    }
+                }
+            } else {
+                if moving_color == Color::White {
+                    psqt -= PSQT[KING_INDEX][0][from_idx];
+                    psqt += PSQT[KING_INDEX][0][to_idx];
+                } else {
+                    psqt += PSQT[KING_INDEX][1][from_idx];
+                    psqt -= PSQT[KING_INDEX][1][to_idx];
+                }
+            }
+        } else {
+            if moving_color == Color::White {
+                psqt -= PSQT[moving_piece_idx][0][from_idx];
+                psqt += PSQT[moving_piece_idx][0][to_idx];
+            } else {
+                psqt += PSQT[moving_piece_idx][1][from_idx];
+                psqt -= PSQT[moving_piece_idx][1][to_idx];
             }
         }
+
+        phase = phase.clamp(0, 24);
 
         let new_board = board.make_move_new(mv);
         let position_hash = update_zobrist_hash(board, &new_board, self.position_hash);
 
         SearchState {
             board: new_board,
-            material,
+            psqt,
+            phase,
             pawn_hash,
             position_hash,
         }
     }
 
-    /// Null move changes side to move only — material and pawn structure
-    /// are untouched, so both carry over unchanged. The full position hash still
-    /// needs the side-to-move flip and en-passant clear applied incrementally.
     pub fn null_move(&self) -> Option<Self> {
         let position_hash = update_zobrist_hash_null_move(&self.board, self.position_hash);
         self.board.null_move().map(|b| SearchState {
             board: b,
-            material: self.material,
+            psqt: self.psqt,
+            phase: self.phase,
             pawn_hash: self.pawn_hash,
             position_hash,
         })
     }
-}
-
-#[derive(Default, Clone)]
-pub struct SearchStats {
-    pub nodes: usize,
-    pub qnodes: usize,
-    pub tt_hits: usize,
-    pub seldepth: usize,
-}
-
-thread_local! {
-    pub static REPETITION_TABLE: RefCell<Vec<u64>> = RefCell::new(Vec::with_capacity(1024));
-    pub static TRANSPOSITION_TABLE: RefCell<TranspositionTable> = RefCell::new(TranspositionTable::new(256));
-}
-
-fn is_repetition(position_hash: u64) -> bool {
-    REPETITION_TABLE.with(|table| {
-        let table = table.borrow();
-        let mut count = 0;
-        // Iterate backward for cache locality and fast early exits on recent repetitions
-        for &hash in table.iter().rev() {
-            if hash == position_hash {
-                count += 1;
-                if count >= 2 {
-                    return true;
-                }
-            }
-        }
-        false
-    })
-}
-
-pub fn update_repetition_table(position_hash: u64) {
-    REPETITION_TABLE.with(|table| table.borrow_mut().push(position_hash));
-}
-
-pub fn clear_repetition_table() {
-    REPETITION_TABLE.with(|table| table.borrow_mut().clear());
-}
-
-pub fn pop_repetition_table() {
-    REPETITION_TABLE.with(|table| table.borrow_mut().pop());
 }
 
 fn quiesce(
@@ -150,23 +179,24 @@ fn quiesce(
     mut alpha: i32,
     beta: i32,
     start_time: Instant,
-    stats: &mut SearchStats,
+    worker: &mut Worker,
     root_color: Color,
     max_time: f64,
     timeout_occurred: &mut bool,
     ply: usize,
+    stop_flag: &AtomicBool,
 ) -> i32 {
     let board = &state.board;
-    stats.nodes += 1;
-    stats.qnodes += 1;
-    stats.seldepth = stats.seldepth.max(ply);
+    worker.stats.nodes += 1;
+    worker.stats.qnodes += 1;
+    worker.stats.seldepth = worker.stats.seldepth.max(ply);
     
-    if stats.nodes % TIME_CHECK_INTERVAL == 0 && start_time.elapsed().as_secs_f64() > max_time {
+    if worker.stats.nodes % TIME_CHECK_INTERVAL == 0 && (stop_flag.load(Ordering::Relaxed) || start_time.elapsed().as_secs_f64() > max_time) {
         *timeout_occurred = true;
-        return evaluate(board, state.material, state.pawn_hash, 0, None);
+        return evaluate(board, state.psqt, state.phase, state.pawn_hash, 0, -30000, 30000, &mut worker.pawn_table);
     }
 
-    let stand_pat = evaluate(board, state.material, state.pawn_hash, 0, Some(beta));
+    let stand_pat = evaluate(board, state.psqt, state.phase, state.pawn_hash, 0, alpha, beta, &mut worker.pawn_table);
 
     if stand_pat >= beta {
         return beta;
@@ -183,27 +213,35 @@ fn quiesce(
         return alpha;
     }
 
-    let mut captures = [ScoredMove::new(ChessMove::new(unsafe { Square::new(0) }, unsafe { Square::new(0) }, None), 0); 256];
+    let mut captures = [ScoredMove::new(ChessMove::new(unsafe { Square::new(0) }, unsafe { Square::new(0) }, None), 0); 128];
     let mut count = 0;
-    let movegen = MoveGen::new_legal(board);
-
-    for mv in movegen {
-        if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() {
-            if !see_capture(board, mv, -50) {
-                continue;
-            }
-
+    for mv in MoveGen::new_legal(board) {
+        let is_en_passant = board.piece_on(mv.get_source()) == Some(Piece::Pawn) && board.en_passant() == Some(mv.get_dest());
+        if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() || is_en_passant {
             let mvv_lva = mvv_lva_score(board, mv);
-            captures[count] = ScoredMove::new(mv, mvv_lva);
-            count += 1;
+            if count < 128 {
+                captures[count] = ScoredMove::new(mv, mvv_lva);
+                count += 1;
+            }
         }
     }
 
-    let captures_slice = &mut captures[..count];
-    captures_slice.sort_by(|a, b| b.score.cmp(&a.score));
+    for current_idx in 0..count {
+        let mut best_score = captures[current_idx].score;
+        let mut best_idx = current_idx;
+        for j in (current_idx + 1)..count {
+            if captures[j].score > best_score {
+                best_score = captures[j].score;
+                best_idx = j;
+            }
+        }
+        captures.swap(current_idx, best_idx);
+        let mv = captures[current_idx].mv;
 
-    for scored_mv in captures_slice {
-        let mv = scored_mv.mv;
+        if !see_capture(board, mv, -50) {
+            continue;
+        }
+
         if *timeout_occurred {
             break;
         }
@@ -212,6 +250,8 @@ fn quiesce(
             PIECE_VALUES[captured_piece.to_index()]
         } else if mv.get_promotion().is_some() {
             PIECE_VALUES[Piece::Queen.to_index()] - PIECE_VALUES[Piece::Pawn.to_index()]
+        } else if board.piece_on(mv.get_source()) == Some(Piece::Pawn) && board.en_passant() == Some(mv.get_dest()) {
+            PIECE_VALUES[Piece::Pawn.to_index()]
         } else {
             0
         };
@@ -226,11 +266,12 @@ fn quiesce(
             -beta,
             -alpha,
             start_time,
-            stats,
+            worker,
             root_color,
             max_time,
             timeout_occurred,
             ply + 1,
+            stop_flag,
         );
 
         if *timeout_occurred {
@@ -256,41 +297,35 @@ fn negamax(
     mut beta: i32,
     start_time: Instant,
     ply: usize,
-    stats: &mut SearchStats,
+    worker: &mut Worker,
     root_color: Color,
-    tt: &mut TranspositionTable,
+    tt: &TranspositionTable,
     max_time: f64,
     timeout_occurred: &mut bool,
     previous_move: Option<ChessMove>,
     previous_2_move: Option<ChessMove>,
     contempt: i32,
     halfmove_clock: u16,
+    stop_flag: &AtomicBool,
 ) -> i32 {
     let board = &state.board;
     let is_pv = beta - alpha > 1;
     let is_root = ply == 0;
     let original_alpha = alpha;
 
-    stats.nodes += 1;
-    stats.seldepth = stats.seldepth.max(ply);
+    worker.stats.nodes += 1;
+    worker.stats.seldepth = worker.stats.seldepth.max(ply);
 
-    if stats.nodes % TIME_CHECK_INTERVAL == 0 && start_time.elapsed().as_secs_f64() > max_time {
+    if worker.stats.nodes % TIME_CHECK_INTERVAL == 0 && (stop_flag.load(Ordering::Relaxed) || start_time.elapsed().as_secs_f64() > max_time) {
         *timeout_occurred = true;
-        return if ply > 0 { evaluate(board, state.material, state.pawn_hash, 0, None) } else { 0 };
+        return if ply > 0 { evaluate(board, state.psqt, state.phase, state.pawn_hash, 0, -30000, 30000, &mut worker.pawn_table) } else { 0 };
     }
 
     let position_hash = state.position_hash;
 
     // Draw and mate distance pruning
     if ply > 0 {
-        if board.status() == BoardStatus::Checkmate {
-            return -30000 + ply as i32;
-        }
-
-        if board.status() == BoardStatus::Stalemate 
-            || halfmove_clock >= 100 
-            || is_repetition(position_hash) 
-        {
+        if halfmove_clock >= 100 || worker.is_repetition(position_hash) {
             return 0; 
         }
 
@@ -306,7 +341,7 @@ fn negamax(
     let mut hash_move = tt_move;
     let mut tt_value = None;
     if let Some(stored_value) = tt_score {
-        stats.tt_hits += 1;
+        worker.stats.tt_hits += 1;
         if !is_pv || !is_root {
             return stored_value;
         }
@@ -314,10 +349,15 @@ fn negamax(
     }
     
     let in_check = *board.checkers() != BitBoard(0);
+    let mut depth = depth;
+    if in_check {
+        depth += 1;
+    }
+
     let static_eval = if in_check {
         -30000 + ply as i32
     } else {
-        evaluate(board, state.material, state.pawn_hash, contempt, Some(beta))
+        evaluate(board, state.psqt, state.phase, state.pawn_hash, contempt, alpha, beta, &mut worker.pawn_table)
     };
 
     if depth == 0 {
@@ -326,11 +366,12 @@ fn negamax(
             alpha,
             beta,
             start_time,
-            stats,
+            worker,
             root_color,
             max_time,
             timeout_occurred,
             ply,
+            stop_flag,
         );
     }
 
@@ -345,14 +386,15 @@ fn negamax(
                     razor_alpha,
                     razor_alpha + 1,
                     start_time,
-                    stats,
+                    worker,
                     root_color,
                     max_time,
                     timeout_occurred,
                     ply,
+                    stop_flag,
                 );
                 if *timeout_occurred {
-                    return evaluate(board, state.material, state.pawn_hash, 0, None);
+                    return evaluate(board, state.psqt, state.phase, state.pawn_hash, 0, -30000, 30000, &mut worker.pawn_table);
                 }
                 if razor_score <= razor_alpha {
                     return razor_score;
@@ -393,7 +435,7 @@ fn negamax(
                         -beta + 1,
                         start_time,
                         ply + 1,
-                        stats,
+                        worker,
                         root_color,
                         tt,
                         max_time,
@@ -402,10 +444,11 @@ fn negamax(
                         None,
                         contempt,
                         halfmove_clock + 1,
+                        stop_flag,
                     );
 
                     if *timeout_occurred {
-                        return evaluate(board, state.material, state.pawn_hash, 0, None);
+                        return evaluate(board, state.psqt, state.phase, state.pawn_hash, 0, -30000, 30000, &mut worker.pawn_table);
                     }
 
                     if null_score >= beta {
@@ -448,7 +491,7 @@ fn negamax(
 
                 let new_state = state.make_move(mv);
                 let new_position_hash = new_state.position_hash;
-                update_repetition_table(new_position_hash);
+                worker.push_repetition(new_position_hash);
 
                 let score = -negamax(
                     &new_state,
@@ -457,7 +500,7 @@ fn negamax(
                     -probcut_beta + 1,
                     start_time,
                     ply + 1,
-                    stats,
+                    worker,
                     root_color,
                     tt,
                     max_time,
@@ -466,9 +509,10 @@ fn negamax(
                     previous_move,
                     contempt,
                     0,
+                    stop_flag,
                 );
 
-                pop_repetition_table();
+                worker.pop_repetition();
 
                 if *timeout_occurred {
                     break 'probcut;
@@ -481,7 +525,7 @@ fn negamax(
             }
 
             if *timeout_occurred {
-                return evaluate(board, state.material, state.pawn_hash, 0, None);
+                return evaluate(board, state.psqt, state.phase, state.pawn_hash, 0, -30000, 30000, &mut worker.pawn_table);
             }
         }
     }
@@ -496,7 +540,7 @@ fn negamax(
             beta,
             start_time,
             ply,
-            stats,
+            worker,
             root_color,
             tt,
             max_time,
@@ -505,6 +549,7 @@ fn negamax(
             previous_2_move,
             contempt,
             halfmove_clock,
+            stop_flag,
         );
         if !*timeout_occurred {
             hash_move = tt.get_move(board_hash);
@@ -532,9 +577,9 @@ fn negamax(
                 let mut best_singular_score = -32000;
                 let mut is_singular = true;
                 
-                let movegen = MoveGen::new_legal(board);
+                let mut picker = MovePicker::new(board, Some(hash_mv), singular_depth, None, None, worker);
                 
-                for mv in movegen {
+                while let Some(mv) = picker.next(board, worker) {
                     if mv == hash_mv {
                         continue;
                     }
@@ -546,7 +591,7 @@ fn negamax(
                     
                     let new_state = state.make_move(mv);
                     let new_position_hash = new_state.position_hash;
-                    update_repetition_table(new_position_hash);
+                    worker.push_repetition(new_position_hash);
                     
                     let score = -negamax(
                         &new_state,
@@ -555,7 +600,7 @@ fn negamax(
                         -singular_beta,
                         start_time,
                         ply + 1,
-                        stats,
+                        worker,
                         root_color,
                         tt,
                         max_time,
@@ -568,9 +613,10 @@ fn negamax(
                             let is_pawn = board.piece_on(mv.get_source()) == Some(chess::Piece::Pawn);
                             if is_capture || is_pawn { 0 } else { halfmove_clock + 1 }
                         },
+                        stop_flag,
                     );
                     
-                    pop_repetition_table();
+                    worker.pop_repetition();
                     
                     if *timeout_occurred {
                         is_singular = false;
@@ -613,7 +659,7 @@ fn negamax(
                 -beta + 1,
                 start_time,
                 ply + 1,
-                stats,
+                worker,
                 root_color,
                 tt,
                 max_time,
@@ -622,6 +668,7 @@ fn negamax(
                 None,
                 contempt,
                 halfmove_clock + 1,
+                stop_flag,
             );
             
             if !*timeout_occurred && threat_score >= beta && threat_score.abs() > 29000 {
@@ -630,37 +677,15 @@ fn negamax(
         }
     }
 
-    let mut move_list = [ScoredMove::new(ChessMove::new(unsafe { Square::new(0) }, unsafe { Square::new(0) }, None), 0); 256];
-    let mut move_count = 0;
-    for mv in MoveGen::new_legal(board) {
-        move_list[move_count] = ScoredMove::new(mv, 0);
-        move_count += 1;
-    }
-
-    if move_count == 0 {
-        return if in_check { -30000 + ply as i32 } else { 0 };
-    }
-
-    let ordered_moves = &mut move_list[..move_count];
-    order_moves(board, ordered_moves, hash_move, ply, previous_move, previous_2_move);
+    let mut picker = MovePicker::new(board, hash_move, ply, previous_move, previous_2_move, worker);
+    let killer_moves = [picker.killer_1, picker.killer_2];
+    let counter_move = picker.counter_move;
 
     let mut best_value = -31000;
     let mut best_move = None;
     let mut moves_searched = 0;
     let mut quiet_moves_searched = 0;
-
-    let mut killer_moves = [None, None];
-    if ply < 64 {
-        KILLER_MOVES.with(|k| {
-            let k = k.borrow();
-            if k.len() > ply {
-                if k[ply].len() > 0 { killer_moves[0] = Some(k[ply][0]); }
-                if k[ply].len() > 1 { killer_moves[1] = Some(k[ply][1]); }
-            }
-        });
-    }
-
-    let counter_move = previous_move.and_then(|prev_mv| get_counter_move(board, prev_mv));
+    let mut searched_moves = [ScoredMove::new(ChessMove::new(unsafe { Square::new(0) }, unsafe { Square::new(0) }, None), 0); 128];
 
     let prev_info = previous_move.and_then(|prev_mv| {
         board.piece_on(prev_mv.get_dest()).map(|p| (p.to_index(), prev_mv.get_dest().to_index()))
@@ -672,20 +697,24 @@ fn negamax(
 
     let active_weight = 2 + if previous_move.is_some() { 2 } else { 0 } + if previous_2_move.is_some() { 1 } else { 0 };
 
-    for (i, scored_mv) in ordered_moves.iter().enumerate() {
-        let mv = scored_mv.mv;
+    while let Some(mv) = picker.next(board, worker) {
+        let i = moves_searched;
+        if i < 128 {
+            searched_moves[i] = ScoredMove::new(mv, 0);
+        }
         if *timeout_occurred {
             break;
         }
 
-        let is_capture = board.piece_on(mv.get_dest()).is_some();
+        let moving_piece = board.piece_on(mv.get_source());
+        let is_en_passant = moving_piece == Some(chess::Piece::Pawn) && board.en_passant() == Some(mv.get_dest());
+        let is_capture = board.piece_on(mv.get_dest()).is_some() || is_en_passant;
         let is_promotion = mv.get_promotion().is_some();
         let is_quiet = !is_capture && !is_promotion;
         let is_hash_move = hash_move.is_some() && mv == hash_move.unwrap();
         let is_killer = Some(mv) == killer_moves[0] || Some(mv) == killer_moves[1];
         let is_counter = Some(mv) == counter_move;
 
-        let moving_piece = board.piece_on(mv.get_source());
         let next_halfmove_clock = if is_capture || moving_piece == Some(chess::Piece::Pawn) {
             0
         } else {
@@ -695,19 +724,17 @@ fn negamax(
         let (hist_score, cmh_score, _fmh_score, h_avg) = if is_quiet {
             let curr_from = mv.get_source().to_index();
             let curr_to = mv.get_dest().to_index();
-            let hist_score = HISTORY_HEURISTIC.with(|history| {
-                history.borrow()[curr_from][curr_to]
-            });
+            let hist_score = worker.history[curr_from][curr_to];
             let curr_p = moving_piece.map(|p| p.to_index());
             let cmh_score = match (prev_info, curr_p) {
                 (Some((prev_p, prev_t)), Some(cp)) => {
-                    CMH_TABLE.with(|cmh| cmh.borrow()[prev_p][prev_t][cp][curr_to] as i32)
+                    worker.cmh_table[prev_p][prev_t][cp][curr_to] as i32
                 }
                 _ => 0,
             };
             let fmh_score = match (prev_2_info, curr_p) {
                 (Some((p2_p, p2_t)), Some(cp)) => {
-                    FMH_TABLE.with(|fmh| fmh.borrow()[p2_p][p2_t][cp][curr_to] as i32)
+                    worker.fmh_table[p2_p][p2_t][cp][curr_to] as i32
                 }
                 _ => 0,
             };
@@ -718,84 +745,80 @@ fn negamax(
             (0, 0, 0, 0)
         };
 
-        // Late move pruning
-        if !is_pv && !in_check && is_quiet && depth <= LMP_DEPTH {
-            let mut lmp_threshold = match depth {
-                1 => 3,
-                2 => 6,
-                3 => 12,
-                4 => 18,
-                _ => 25,
-            };
+        let new_state = state.make_move(mv);
+        let gives_check = *new_state.board.checkers() != BitBoard(0);
 
-            if static_eval + 200 < alpha {
-                lmp_threshold /= 2;
-            } else if static_eval > alpha + 200 {
-                lmp_threshold = (lmp_threshold * 3) / 2;
+        if !is_pv && !in_check && is_quiet && !gives_check {
+            // Late move pruning
+            if depth <= LMP_DEPTH {
+                let mut lmp_threshold = match depth {
+                    1 => 3,
+                    2 => 6,
+                    3 => 12,
+                    4 => 18,
+                    _ => 25,
+                };
+
+                if static_eval + 200 < alpha {
+                    lmp_threshold /= 2;
+                } else if static_eval > alpha + 200 {
+                    lmp_threshold = (lmp_threshold * 3) / 2;
+                }
+
+                if quiet_moves_searched >= lmp_threshold && !is_killer && !is_counter {
+                    continue;
+                }
             }
 
-            if quiet_moves_searched >= lmp_threshold && !is_killer && !is_counter {
-                continue;
+            // Futility pruning
+            if depth <= FUTILITY_DEPTH && i > 0 {
+                let history_margin_adj = (h_avg / 50).clamp(-100, 50);
+                let futility_margin = FUTILITY_MARGINS[depth.min(4)] + history_margin_adj;
+
+                let futility_value = static_eval + futility_margin;
+                if futility_value <= alpha && !is_killer && !is_counter {
+                    continue;
+                }
             }
-        }
 
-        // Futility pruning
-        if !is_pv && !in_check && is_quiet && depth <= FUTILITY_DEPTH && i > 0 {
-            let history_margin_adj = (h_avg / 50).clamp(-100, 50);
-            let futility_margin = FUTILITY_MARGINS[depth.min(4)] + history_margin_adj;
-
-            let futility_value = static_eval + futility_margin;
-            if futility_value <= alpha && !is_killer && !is_counter {
-                continue;
+            // Futility move count pruning
+            if depth <= 4 && moves_searched > 0 {
+                let futility_value = static_eval + FUTILITY_MARGINS[depth.min(4)];
+                if futility_value <= alpha && !is_killer && !is_counter {
+                    let move_count_limit = FUTILITY_MOVE_COUNTS[depth.min(4)];
+                    if quiet_moves_searched >= move_count_limit {
+                        continue;
+                    }
+                }
             }
-        }
 
-        // Futility move count pruning
-        if !is_pv && !in_check && is_quiet && depth <= 4 && moves_searched > 0 {
-            let futility_value = static_eval + FUTILITY_MARGINS[depth.min(4)];
-            if futility_value <= alpha && !is_killer && !is_counter {
-                let move_count_limit = FUTILITY_MOVE_COUNTS[depth.min(4)];
-                if quiet_moves_searched >= move_count_limit {
+            // CMH Pruning (Continuation History Leaf Pruning)
+            if depth <= CMH_PRUNING_DEPTH 
+                && moves_searched > 0 
+                && !is_hash_move 
+                && !is_killer 
+                && !is_counter 
+            {
+                if cmh_score < CMH_PRUNING_THRESHOLD {
+                    continue;
+                }
+            }
+
+            // History leaf pruning
+            if depth <= HISTORY_PRUNING_DEPTH 
+                && moves_searched > 0 
+                && !is_hash_move
+            {
+                let history_score = hist_score;
+                
+                if history_score < HISTORY_PRUNING_THRESHOLD && !is_counter && cmh_score <= 0 {
                     continue;
                 }
             }
         }
 
-        // CMH Pruning (Continuation History Leaf Pruning)
-        if !is_pv 
-            && !in_check 
-            && is_quiet 
-            && depth <= CMH_PRUNING_DEPTH 
-            && moves_searched > 0 
-            && !is_hash_move 
-            && !is_killer 
-            && !is_counter 
-        {
-            if cmh_score < CMH_PRUNING_THRESHOLD {
-                continue;
-            }
-        }
-
-        // History leaf pruning
-        if !is_pv 
-            && !in_check 
-            && is_quiet 
-            && depth <= HISTORY_PRUNING_DEPTH 
-            && moves_searched > 0 
-            && !is_hash_move
-        {
-            let history_score = hist_score;
-            
-            if history_score < HISTORY_PRUNING_THRESHOLD && !is_counter && cmh_score <= 0 {
-                continue;
-            }
-        }
-
-        let new_state = state.make_move(mv);
         let new_position_hash = new_state.position_hash;
-        update_repetition_table(new_position_hash);
-
-        let gives_check = *new_state.board.checkers() != BitBoard(0);
+        worker.push_repetition(new_position_hash);
 
         // Extensions
         let mut extension = mate_threat_extension;
@@ -866,7 +889,7 @@ fn negamax(
                 -alpha,
                 start_time,
                 ply + 1,
-                stats,
+                worker,
                 root_color,
                 tt,
                 max_time,
@@ -875,6 +898,7 @@ fn negamax(
                 previous_move,
                 contempt,
                 next_halfmove_clock,
+                stop_flag,
             )
         } else {
             let mut search_score = -negamax(
@@ -884,7 +908,7 @@ fn negamax(
                 -alpha,
                 start_time,
                 ply + 1,
-                stats,
+                worker,
                 root_color,
                 tt,
                 max_time,
@@ -893,10 +917,11 @@ fn negamax(
                 previous_move,
                 contempt,
                 next_halfmove_clock,
+                stop_flag,
             );
 
             if *timeout_occurred {
-                evaluate(board, state.material, state.pawn_hash, 0, None)
+                evaluate(board, state.psqt, state.phase, state.pawn_hash, 0, -30000, 30000, &mut worker.pawn_table)
             } else {
                 // Re-search at full depth if reduced
                 if !do_full_search && search_score > alpha {
@@ -908,7 +933,7 @@ fn negamax(
                         -alpha,
                         start_time,
                         ply + 1,
-                        stats,
+                        worker,
                         root_color,
                         tt,
                         max_time,
@@ -917,12 +942,13 @@ fn negamax(
                         previous_move,
                         contempt,
                         next_halfmove_clock,
+                        stop_flag,
                     );
                 }
 
                 // PV re-search
                 if *timeout_occurred {
-                    evaluate(board, state.material, state.pawn_hash, 0, None)
+                    evaluate(board, state.psqt, state.phase, state.pawn_hash, 0, -30000, 30000, &mut worker.pawn_table)
                 } else if search_score > alpha {
                     if is_pv || (search_score < beta) {
                         -negamax(
@@ -932,7 +958,7 @@ fn negamax(
                             -alpha,
                             start_time,
                             ply + 1,
-                            stats,
+                            worker,
                             root_color,
                             tt,
                             max_time,
@@ -941,6 +967,7 @@ fn negamax(
                             previous_move,
                             contempt,
                             next_halfmove_clock,
+                            stop_flag,
                         )
                     } else {
                         search_score
@@ -951,7 +978,7 @@ fn negamax(
             }
         };
 
-        pop_repetition_table();
+        worker.pop_repetition();
 
         if *timeout_occurred {
             break;
@@ -971,94 +998,67 @@ fn negamax(
             alpha = score;
 
             if is_quiet {
-                // Killer moves
-                KILLER_MOVES.with(|killers| {
-                    let mut killers = killers.borrow_mut();
-                    if ply < 64 && killers.len() > ply {
-                        if killers[ply].is_empty() || killers[ply][0] != mv {
-                            if killers[ply].len() >= 2 {
-                                killers[ply][1] = killers[ply][0];
-                            } else if killers[ply].len() == 1 {
-                                let first_killer = killers[ply][0];
-                                killers[ply].push(first_killer);
-                            }
-                            if killers[ply].is_empty() {
-                                killers[ply].push(mv);
-                            } else {
-                                killers[ply][0] = mv;
-                            }
-                        }
-                    }
-                });
+                worker.update_killer(ply, mv);
 
-                HISTORY_HEURISTIC.with(|history| {
-                    let mut history = history.borrow_mut();
-                    let bonus = (depth * depth).min(400) as i32; 
-                    
-                    let from_sq = mv.get_source().to_index();
-                    let to_sq = mv.get_dest().to_index();
-                    
-                    let current = history[from_sq][to_sq];
-                    history[from_sq][to_sq] = current + bonus - (current * bonus.abs()) / 10000;
+                let bonus = (depth * depth).min(400) as i32; 
+                worker.update_history(mv, bonus);
 
-                    // Penalize history for failed quiet moves
-                    let penalty = -bonus;
-                    for prev_scored_mv in &ordered_moves[0..i] {
-                        let prev_mv = prev_scored_mv.mv;
-                        if board.piece_on(prev_mv.get_dest()).is_none()
-                            && prev_mv.get_promotion().is_none()
-                        {
-                            let prev_from = prev_mv.get_source().to_index();
-                            let prev_to = prev_mv.get_dest().to_index();
-                            let current = history[prev_from][prev_to];
-                            history[prev_from][prev_to] = current + penalty - (current * penalty.abs()) / 10000;
-                        }
+                let penalty = -bonus;
+                let count = i.min(128);
+                for prev_scored_mv in &searched_moves[0..count] {
+                    let prev_mv = prev_scored_mv.mv;
+                    if board.piece_on(prev_mv.get_dest()).is_none()
+                        && prev_mv.get_promotion().is_none()
+                    {
+                        worker.penalize_history(prev_mv, penalty);
                     }
-                });
-            }
-            else {
-                update_capture_history_batch(board, mv, &ordered_moves[0..i], depth);
+                }
+            } else {
+                let count = i.min(128);
+                let bonus = if count > 0 { (depth * depth + depth * 2) as i32 } else { (depth * depth) as i32 };
+                worker.update_capture_history_batch(board, mv, &searched_moves[0..count], bonus);
             }
         }
 
         if alpha >= beta {
             if is_quiet {
-                update_counter_move(board, previous_move, mv);
+                worker.update_counter_move(board, previous_move, mv);
 
                 let conthist_bonus = continuation_bonus(depth);
-                let failed_quiets = &ordered_moves[0..i];
+                let count = i.min(128);
+                let failed_quiets = &searched_moves[0..count];
 
                 if previous_move.is_some() {
-                    CMH_TABLE.with(|cmh| {
-                        update_conthist_batch(
-                            &mut cmh.borrow_mut(),
-                            board,
-                            previous_move,
-                            mv,
-                            failed_quiets,
-                            conthist_bonus,
-                        );
-                    });
+                    worker.update_conthist_batch(
+                        true,
+                        board,
+                        previous_move,
+                        mv,
+                        failed_quiets,
+                        conthist_bonus,
+                    );
                 }
 
                 if previous_2_move.is_some() {
-                    FMH_TABLE.with(|fmh| {
-                        update_conthist_batch(
-                            &mut fmh.borrow_mut(),
-                            board,
-                            previous_2_move,
-                            mv,
-                            failed_quiets,
-                            conthist_bonus,
-                        );
-                    });
+                    worker.update_conthist_batch(
+                        false,
+                        board,
+                        previous_2_move,
+                        mv,
+                        failed_quiets,
+                        conthist_bonus,
+                    );
                 }
             }
             break;
         }
     }
 
-    if !*timeout_occurred && moves_searched > 0 {
+    if moves_searched == 0 {
+        return if in_check { -30000 + ply as i32 } else { 0 };
+    }
+
+    if !*timeout_occurred {
         let flag = if best_value <= original_alpha {
             TTFlag::Upper
         } else if best_value >= beta {
@@ -1080,6 +1080,9 @@ pub fn iterative_deepening(
     is_movetime: bool,
     max_depth: Option<usize>,
     halfmove_clock: u16,
+    worker: &mut Worker,
+    tt: &TranspositionTable,
+    stop_flag: &AtomicBool,
 ) -> Option<ChessMove> {
     let start_time = Instant::now();
     let mut best_move = None;
@@ -1087,198 +1090,198 @@ pub fn iterative_deepening(
     let root_color = board.side_to_move();
     let root_state = SearchState::new(*board);
 
-    TRANSPOSITION_TABLE.with(|tt| {
-        let mut tt_guard = tt.borrow_mut();
-        let mut stats = SearchStats::default();
+    worker.stats = SearchStats::default();
 
-        let max_search_depth = max_depth.unwrap_or(MAX_DEPTH);
+    let max_search_depth = max_depth.unwrap_or(MAX_DEPTH);
 
-        for depth in 1..=max_search_depth {
-            if max_depth.is_none() {
-                let elapsed = start_time.elapsed().as_secs_f64();
-                let time_limit = if is_movetime {
-                    max_time * 0.95
-                } else {
-                    max_time * 0.80
-                };
-                if elapsed > time_limit {
-                    break;
-                }
-            }
+    for depth in 1..=max_search_depth {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
 
-            let mut timeout_occurred = false;
-
-            // Aspiration window setup
-            let (initial_alpha, initial_beta) = if depth <= 4 || best_move.is_none() {
-                (-31000, 31000)
+        if max_depth.is_none() {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let time_limit = if is_movetime {
+                max_time * 0.95
             } else {
-                (best_score - INITIAL_WINDOW, best_score + INITIAL_WINDOW)
+                max_time * 0.80
             };
-
-            let mut alpha = initial_alpha;
-            let mut beta = initial_beta;
-            let mut window_size = INITIAL_WINDOW;
-            let mut search_iterations = 0;
-
-            loop {
-                search_iterations += 1;
-
-                let score = negamax(
-                    &root_state,
-                    depth,
-                    alpha,
-                    beta,
-                    start_time,
-                    0,
-                    &mut stats,
-                    root_color,
-                    &mut tt_guard,
-                    max_time,
-                    &mut timeout_occurred,
-                    None,
-                    None,
-                    contempt,
-                    halfmove_clock,
-                );
-
-                if timeout_occurred {
-                    break;
-                }
-
-                if score <= alpha {
-                    // Fail low: widen window
-                    window_size = (window_size * 2).min(MAX_WINDOW);
-
-                    if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
-                        alpha = -31000;
-                        beta = 31000;
-                    } else {
-                        alpha = (best_score - window_size).max(-31000);
-                        beta = (best_score + window_size).min(31000);
-                    }
-                } else if score >= beta {
-                    // Fail high: widen window
-                    window_size = (window_size * 2).min(MAX_WINDOW);
-
-                    if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
-                        alpha = -31000;
-                        beta = 31000;
-                    } else {
-                        alpha = (best_score - window_size).max(-31000);
-                        beta = (best_score + window_size).min(31000);
-                    }
-                } else {
-                    best_score = score;
-
-                    let board_hash = root_state.position_hash;
-                    if let Some(mv) = tt_guard.get_move(board_hash) {
-                        if board.legal(mv) {
-                            best_move = Some(mv);
-
-                            if STATS {
-                                // Extract PV
-                                let mut pv = Vec::new();
-                                let mut temp_board = *board;
-                                let mut temp_hash = board_hash;
-                                let mut pv_hashes = Vec::with_capacity(depth.min(20));
-                                let mut temp_clock = halfmove_clock;
-
-                                for _ in 0..depth.min(20) {
-                                    if temp_clock >= 100 {
-                                        break; 
-                                    }
-
-                                    let h = temp_hash;
-                                    let history_count = REPETITION_TABLE.with(|table| {
-                                        let mut count = 0;
-                                        for &x in table.borrow().iter() {
-                                            if x == h { count += 1; }
-                                        }
-                                        count
-                                    });
-                                    let mut pv_count = 0;
-                                    for &x in pv_hashes.iter() {
-                                        if x == h { pv_count += 1; }
-                                    }
-                                    
-                                    if history_count + pv_count >= 2 {
-                                        break; 
-                                    }
-                                    pv_hashes.push(h);
-
-                                    if let Some(pv_move) = tt_guard.get_move(h) {
-                                        if temp_board.legal(pv_move) {
-                                            pv.push(pv_move);
-                                            
-                                            let is_capture = temp_board.piece_on(pv_move.get_dest()).is_some();
-                                            let is_pawn = temp_board.piece_on(pv_move.get_source()) == Some(chess::Piece::Pawn);
-                                            if is_capture || is_pawn {
-                                                temp_clock = 0;
-                                            } else {
-                                                temp_clock += 1;
-                                            }
-
-                                            let next_board = temp_board.make_move_new(pv_move);
-                                            temp_hash = update_zobrist_hash(&temp_board, &next_board, temp_hash);
-                                            temp_board = next_board;
-                                        } else {
-                                            break;
-                                        }
-                                    } else {
-                                        break;
-                                    }
-                                }
-
-                                let time_ms = (start_time.elapsed().as_secs_f64() * 1000.0) as u64;
-                                let nps = if time_ms > 0 {
-                                    stats.nodes * 1000 / time_ms as usize
-                                } else {
-                                    0
-                                };
-                                use std::fmt::Write;
-                                let mut pv_string = String::new();
-                                for (i, m) in pv.iter().enumerate() {
-                                    if i > 0 {
-                                        pv_string.push(' ');
-                                    }
-                                    write!(&mut pv_string, "{}", m).unwrap();
-                                }
-
-                                let hashfull = tt_guard.hashfull();
-
-                                println!(
-                                    "info depth {} seldepth {} score cp {} nodes {} nps {} time {} hashfull {} pv {}",
-                                    depth,
-                                    stats.seldepth,
-                                    best_score,
-                                    stats.nodes,
-                                    nps,
-                                    time_ms,
-                                    hashfull,
-                                    pv_string
-                                );
-                            }
-
-                            if best_score.abs() > 29000 {
-                                break;
-                            }
-                        }
-                    }
-                    break;
-                }
-
-                if timeout_occurred || search_iterations >= MAX_ASPIRATION_ITERATIONS * 2 {
-                    break;
-                }
-            }
-
-            if timeout_occurred {
+            if elapsed > time_limit {
                 break;
             }
         }
 
-        best_move.or_else(|| {
-            MoveGen::new_legal(board).next()
-        })
+        let mut timeout_occurred = false;
+
+        // Aspiration window setup
+        let (initial_alpha, initial_beta) = if depth <= 4 || best_move.is_none() {
+            (-31000, 31000)
+        } else {
+            (best_score - INITIAL_WINDOW, best_score + INITIAL_WINDOW)
+        };
+
+        let mut alpha = initial_alpha;
+        let mut beta = initial_beta;
+        let mut window_size = INITIAL_WINDOW;
+        let mut search_iterations = 0;
+
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            search_iterations += 1;
+
+            let score = negamax(
+                &root_state,
+                depth,
+                alpha,
+                beta,
+                start_time,
+                0,
+                worker,
+                root_color,
+                tt,
+                max_time,
+                &mut timeout_occurred,
+                None,
+                None,
+                contempt,
+                halfmove_clock,
+                stop_flag,
+            );
+
+            if timeout_occurred || stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            if score <= alpha {
+                // Fail low: widen window
+                window_size = (window_size * 2).min(MAX_WINDOW);
+
+                if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
+                    alpha = -31000;
+                    beta = 31000;
+                } else {
+                    alpha = (best_score - window_size).max(-31000);
+                    beta = (best_score + window_size).min(31000);
+                }
+            } else if score >= beta {
+                // Fail high: widen window
+                window_size = (window_size * 2).min(MAX_WINDOW);
+
+                if window_size >= MAX_WINDOW || search_iterations >= MAX_ASPIRATION_ITERATIONS {
+                    alpha = -31000;
+                    beta = 31000;
+                } else {
+                    alpha = (best_score - window_size).max(-31000);
+                    beta = (best_score + window_size).min(31000);
+                }
+            } else {
+                best_score = score;
+
+                let board_hash = root_state.position_hash;
+                if let Some(mv) = tt.get_move(board_hash) {
+                    if board.legal(mv) {
+                        best_move = Some(mv);
+
+                        if STATS {
+                            // Extract PV
+                            let mut pv = Vec::new();
+                            let mut temp_board = *board;
+                            let mut temp_hash = board_hash;
+                            let mut pv_hashes = Vec::with_capacity(depth.min(20));
+                            let mut temp_clock = halfmove_clock;
+
+                            for _ in 0..depth.min(20) {
+                                if temp_clock >= 100 {
+                                    break; 
+                                }
+
+                                let h = temp_hash;
+                                let history_count = worker.repetition_table.iter().filter(|&&x| x == h).count();
+                                let mut pv_count = 0;
+                                for &x in pv_hashes.iter() {
+                                    if x == h { pv_count += 1; }
+                                }
+                                
+                                if history_count + pv_count >= 2 {
+                                    break; 
+                                }
+                                pv_hashes.push(h);
+
+                                if let Some(pv_move) = tt.get_move(h) {
+                                    if temp_board.legal(pv_move) {
+                                        pv.push(pv_move);
+                                        
+                                        let is_capture = temp_board.piece_on(pv_move.get_dest()).is_some();
+                                        let is_pawn = temp_board.piece_on(pv_move.get_source()) == Some(chess::Piece::Pawn);
+                                        if is_capture || is_pawn {
+                                            temp_clock = 0;
+                                        } else {
+                                            temp_clock += 1;
+                                        }
+
+                                        let next_board = temp_board.make_move_new(pv_move);
+                                        temp_hash = update_zobrist_hash(&temp_board, &next_board, temp_hash);
+                                        temp_board = next_board;
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            let time_ms = (start_time.elapsed().as_secs_f64() * 1000.0) as u64;
+                            let nps = if time_ms > 0 {
+                                worker.stats.nodes * 1000 / time_ms as usize
+                            } else {
+                                0
+                            };
+                            use std::fmt::Write;
+                            let mut pv_string = String::new();
+                            for (i, m) in pv.iter().enumerate() {
+                                if i > 0 {
+                                    pv_string.push(' ');
+                                }
+                                write!(&mut pv_string, "{}", m).unwrap();
+                            }
+
+                            let hashfull = tt.hashfull();
+
+                            println!(
+                                "info depth {} seldepth {} score cp {} nodes {} nps {} time {} hashfull {} pv {}",
+                                depth,
+                                worker.stats.seldepth,
+                                best_score,
+                                worker.stats.nodes,
+                                nps,
+                                time_ms,
+                                hashfull,
+                                pv_string
+                            );
+                        }
+
+                        if best_score.abs() > 29000 {
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+
+            if timeout_occurred || search_iterations >= MAX_ASPIRATION_ITERATIONS * 2 {
+                break;
+            }
+        }
+
+        if timeout_occurred || stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+
+    best_move.or_else(|| {
+        MoveGen::new_legal(board).next()
     })
 }
+

@@ -1,20 +1,9 @@
-use chess::{BitBoard, Board, ChessMove, Color, Piece, Square};
-use std::cell::RefCell;
+use chess::{BitBoard, Board, ChessMove, Color, MoveGen, Piece, Square};
+use crate::engine::worker::Worker;
 
 pub const PIECE_VALUES: [i32; 6] = [100, 320, 330, 500, 900, 0];
 
 pub type ContinuationHistoryTable = [[[[i16; 64]; 6]; 64]; 6];
-
-thread_local! {
-    pub static KILLER_MOVES: RefCell<Vec<Vec<ChessMove>>> = RefCell::new(Vec::new());
-    pub static HISTORY_HEURISTIC: RefCell<[[i32; 64]; 64]> = RefCell::new([[0; 64]; 64]);
-    pub static COUNTER_MOVES: RefCell<[[Option<ChessMove>; 64]; 6]> = RefCell::new([[None; 64]; 6]);
-    pub static CAPTURE_HISTORY: RefCell<[[[i32; 64]; 6]; 6]> = RefCell::new([[[0; 64]; 6]; 6]);
-    pub static CMH_TABLE: RefCell<Box<ContinuationHistoryTable>> = 
-        RefCell::new(Box::new([[[[0; 64]; 6]; 64]; 6]));
-    pub static FMH_TABLE: RefCell<Box<ContinuationHistoryTable>> = 
-        RefCell::new(Box::new([[[[0; 64]; 6]; 64]; 6]));
-}
 
 /// Static Exchange Evaluation with Threshold
 /// Returns TRUE if the capture sequence meets or exceeds the threshold
@@ -32,11 +21,14 @@ pub fn see_capture(board: &Board, mv: ChessMove, threshold: i32) -> bool {
     let captured_piece = match board.piece_on(to_square) {
         Some(p) => p,
         None => {
-            if mv.get_promotion().is_some() {
+            if board.piece_on(from_square) == Some(Piece::Pawn) && board.en_passant() == Some(to_square) {
+                Piece::Pawn
+            } else if mv.get_promotion().is_some() {
                 return PIECE_VALUES[Piece::Queen.to_index()] - PIECE_VALUES[Piece::Pawn.to_index()]
                     >= threshold;
+            } else {
+                return false;
             }
-            return false;
         }
     };
 
@@ -333,6 +325,8 @@ pub fn mvv_lva_score(board: &Board, mv: ChessMove) -> i32 {
         PIECE_VALUES[captured_piece.to_index()]
     } else if mv.get_promotion().is_some() {
         PIECE_VALUES[Piece::Queen.to_index()]
+    } else if board.piece_on(mv.get_source()) == Some(Piece::Pawn) && board.en_passant() == Some(mv.get_dest()) {
+        PIECE_VALUES[Piece::Pawn.to_index()]
     } else {
         0
     };
@@ -362,60 +356,128 @@ impl ScoredMove {
     }
 }
 
-#[inline]
-pub fn order_moves(
-    board: &Board,
-    moves: &mut [ScoredMove],
-    hash_move: Option<ChessMove>,
-    depth: usize,
-    previous_move: Option<ChessMove>,
-    previous_2_move: Option<ChessMove>,
-) {
-    let counter_move = previous_move.and_then(|prev_mv| get_counter_move(board, prev_mv));
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MovePickerStage {
+    TTMove,
+    GenerateCaptures,
+    GoodCaptures,
+    Killer1,
+    Killer2,
+    CounterMove,
+    GenerateQuiets,
+    Quiets,
+    BadCaptures,
+    Done,
+}
 
-    let (killer_1, killer_2) = if depth < 64 {
-        KILLER_MOVES.with(|killers| {
-            let killers = killers.borrow();
-            if killers.len() > depth {
-                let k1 = if !killers[depth].is_empty() { Some(killers[depth][0]) } else { None };
-                let k2 = if killers[depth].len() > 1 { Some(killers[depth][1]) } else { None };
-                (k1, k2)
-            } else {
-                (None, None)
+pub struct MovePicker {
+    pub stage: MovePickerStage,
+    pub hash_move: Option<ChessMove>,
+    pub killer_1: Option<ChessMove>,
+    pub killer_2: Option<ChessMove>,
+    pub counter_move: Option<ChessMove>,
+
+    moves: [ScoredMove; 128],
+    move_count: usize,
+    move_idx: usize,
+
+    bad_captures: [ChessMove; 64],
+    bad_count: usize,
+    bad_idx: usize,
+
+    prev_info: Option<(usize, usize)>,
+    prev_2_info: Option<(usize, usize)>,
+}
+
+impl MovePicker {
+    pub fn new(
+        board: &Board,
+        hash_move: Option<ChessMove>,
+        depth: usize,
+        previous_move: Option<ChessMove>,
+        previous_2_move: Option<ChessMove>,
+        worker: &Worker,
+    ) -> Self {
+        let counter_move = previous_move.and_then(|prev_mv| {
+            let p = board.piece_on(prev_mv.get_dest())?;
+            worker.counter_moves[p.to_index()][prev_mv.get_dest().to_index()]
+        });
+
+        let (killer_1, killer_2) = if depth < 64 {
+            (worker.killers[depth][0], worker.killers[depth][1])
+        } else {
+            (None, None)
+        };
+
+        let prev_info = previous_move.and_then(|prev_mv| {
+            board.piece_on(prev_mv.get_dest()).map(|p| (p.to_index(), prev_mv.get_dest().to_index()))
+        });
+
+        let prev_2_info = previous_2_move.and_then(|prev_mv| {
+            board.piece_on(prev_mv.get_dest()).map(|p| (p.to_index(), prev_mv.get_dest().to_index()))
+        });
+
+        let dummy_mv = ChessMove::new(unsafe { Square::new(0) }, unsafe { Square::new(0) }, None);
+        Self {
+            stage: MovePickerStage::TTMove,
+            hash_move,
+            killer_1,
+            killer_2,
+            counter_move,
+            moves: [ScoredMove::new(dummy_mv, 0); 128],
+            move_count: 0,
+            move_idx: 0,
+            bad_captures: [dummy_mv; 64],
+            bad_count: 0,
+            bad_idx: 0,
+            prev_info,
+            prev_2_info,
+        }
+    }
+
+    #[inline(always)]
+    fn pick_best(&mut self) -> ChessMove {
+        let mut best_score = self.moves[self.move_idx].score;
+        let mut best_idx = self.move_idx;
+
+        for i in (self.move_idx + 1)..self.move_count {
+            if self.moves[i].score > best_score {
+                best_score = self.moves[i].score;
+                best_idx = i;
             }
-        })
-    } else {
-        (None, None)
-    };
+        }
 
-    let prev_info = previous_move.and_then(|prev_mv| {
-        board.piece_on(prev_mv.get_dest()).map(|p| (p.to_index(), prev_mv.get_dest().to_index()))
-    });
+        self.moves.swap(self.move_idx, best_idx);
+        let mv = self.moves[self.move_idx].mv;
+        self.move_idx += 1;
+        mv
+    }
 
-    let prev_2_info = previous_2_move.and_then(|prev_mv| {
-        board.piece_on(prev_mv.get_dest()).map(|p| (p.to_index(), prev_mv.get_dest().to_index()))
-    });
+    pub fn next(&mut self, board: &Board, worker: &Worker) -> Option<ChessMove> {
+        loop {
+            match self.stage {
+                MovePickerStage::TTMove => {
+                    self.stage = MovePickerStage::GenerateCaptures;
+                    if let Some(mv) = self.hash_move {
+                        if board.legal(mv) {
+                            return Some(mv);
+                        }
+                    }
+                }
 
-    HISTORY_HEURISTIC.with(|history| {
-        let history = history.borrow();
-        CMH_TABLE.with(|cmh| {
-            let cmh = cmh.borrow();
-            FMH_TABLE.with(|fmh| {
-                let fmh = fmh.borrow();
-                CAPTURE_HISTORY.with(|capture_hist| {
-                    let capture_hist = capture_hist.borrow();
+                MovePickerStage::GenerateCaptures => {
+                    self.move_idx = 0;
+                    self.move_count = 0;
 
-                    let cmh_sub = prev_info.map(|(p, t)| &cmh[p][t]);
-                    let fmh_sub = prev_2_info.map(|(p, t)| &fmh[p][t]);
-
-                    for scored_move in moves.iter_mut() {
-                        let mv = scored_move.mv;
+                    let capture_hist = &worker.capture_history;
+                    for mv in MoveGen::new_legal(board) {
                         let dest_piece = board.piece_on(mv.get_dest());
                         let is_promotion = mv.get_promotion().is_some();
-
-                        let score = if Some(mv) == hash_move {
-                            10000000
-                        } else if dest_piece.is_some() || is_promotion {
+                        let is_en_passant = board.piece_on(mv.get_source()) == Some(Piece::Pawn) && board.en_passant() == Some(mv.get_dest());
+                        if dest_piece.is_some() || is_promotion || is_en_passant {
+                            if Some(mv) == self.hash_move {
+                                continue;
+                            }
                             let base_mvv_lva = mvv_lva_score(board, mv);
                             let capture_hist_score = match (dest_piece, board.piece_on(mv.get_source())) {
                                 (Some(vic), Some(att)) => {
@@ -423,79 +485,154 @@ pub fn order_moves(
                                 }
                                 _ => 0,
                             };
-                            
-                            if see_capture(board, mv, -50) {
-                                9500000 + base_mvv_lva + capture_hist_score
-                            } else {
-                                500000 + capture_hist_score
+                            let score = base_mvv_lva + capture_hist_score;
+                            if self.move_count < 128 {
+                                self.moves[self.move_count] = ScoredMove::new(mv, score);
+                                self.move_count += 1;
                             }
-                        } else {
-                            let new_board = board.make_move_new(mv);
-                            if *new_board.checkers() != BitBoard(0) {
-                                8000000
-                            } else if Some(mv) == counter_move {
-                                6500000
-                            } else if Some(mv) == killer_1 {
-                                7000000
-                            } else if Some(mv) == killer_2 {
-                                6000000
-                            } else {
-                                let curr_from = mv.get_source().to_index();
-                                let curr_to = mv.get_dest().to_index();
-                                let hist_score = history[curr_from][curr_to];
-                                
-                                let curr_p = board.piece_on(mv.get_source()).map(|p| p.to_index());
-                                let cmh_score = match (cmh_sub, curr_p) {
-                                    (Some(sub), Some(cp)) => sub[cp][curr_to] as i32,
-                                    _ => 0,
-                                };
-                                let fmh_score = match (fmh_sub, curr_p) {
-                                    (Some(sub), Some(cp)) => sub[cp][curr_to] as i32,
-                                    _ => 0,
-                                };
-                                2 * hist_score + 2 * cmh_score + fmh_score
-                            }
-                        };
-                        scored_move.score = score;
+                        }
                     }
-                });
-            });
-        });
-    });
-    
-    moves.sort_by(|a, b| b.score.cmp(&a.score));
-}
 
-#[inline]
-pub fn update_counter_move(board: &Board, previous_move: Option<ChessMove>, refutation: ChessMove) {
-    if let Some(prev_mv) = previous_move {
-        if let Some(piece) = board.piece_on(prev_mv.get_dest()) {
-            let piece_idx = piece.to_index();
-            let to_sq = prev_mv.get_dest().to_index();
-            
-            COUNTER_MOVES.with(|counter_moves| {
-                counter_moves.borrow_mut()[piece_idx][to_sq] = Some(refutation);
-            });
+                    self.stage = MovePickerStage::GoodCaptures;
+                }
+
+                MovePickerStage::GoodCaptures => {
+                    while self.move_idx < self.move_count {
+                        let mv = self.pick_best();
+                        if see_capture(board, mv, 0) {
+                            return Some(mv);
+                        } else {
+                            if self.bad_count < 64 {
+                                self.bad_captures[self.bad_count] = mv;
+                                self.bad_count += 1;
+                            }
+                        }
+                    }
+                    self.stage = MovePickerStage::Killer1;
+                }
+
+                MovePickerStage::Killer1 => {
+                    self.stage = MovePickerStage::Killer2;
+                    if let Some(k1) = self.killer_1 {
+                        let is_ep = board.piece_on(k1.get_source()) == Some(Piece::Pawn) && board.en_passant() == Some(k1.get_dest());
+                        if Some(k1) != self.hash_move 
+                            && board.piece_on(k1.get_dest()).is_none() 
+                            && k1.get_promotion().is_none() 
+                            && !is_ep
+                            && board.legal(k1) 
+                        {
+                            return Some(k1);
+                        }
+                    }
+                }
+
+                MovePickerStage::Killer2 => {
+                    self.stage = MovePickerStage::CounterMove;
+                    if let Some(k2) = self.killer_2 {
+                        let is_ep = board.piece_on(k2.get_source()) == Some(Piece::Pawn) && board.en_passant() == Some(k2.get_dest());
+                        if Some(k2) != self.hash_move 
+                            && Some(k2) != self.killer_1 
+                            && board.piece_on(k2.get_dest()).is_none() 
+                            && k2.get_promotion().is_none() 
+                            && !is_ep
+                            && board.legal(k2) 
+                        {
+                            return Some(k2);
+                        }
+                    }
+                }
+
+                MovePickerStage::CounterMove => {
+                    self.stage = MovePickerStage::GenerateQuiets;
+                    if let Some(cm) = self.counter_move {
+                        let is_ep = board.piece_on(cm.get_source()) == Some(Piece::Pawn) && board.en_passant() == Some(cm.get_dest());
+                        if Some(cm) != self.hash_move 
+                            && Some(cm) != self.killer_1 
+                            && Some(cm) != self.killer_2 
+                            && board.piece_on(cm.get_dest()).is_none() 
+                            && cm.get_promotion().is_none() 
+                            && !is_ep
+                            && board.legal(cm) 
+                        {
+                            return Some(cm);
+                        }
+                    }
+                }
+
+                MovePickerStage::GenerateQuiets => {
+                    self.move_idx = 0;
+                    self.move_count = 0;
+
+                    let prev_info = self.prev_info;
+                    let prev_2_info = self.prev_2_info;
+                    let history = &worker.history;
+                    let cmh = &worker.cmh_table;
+                    let fmh = &worker.fmh_table;
+
+                    let cmh_sub = prev_info.map(|(p, t)| &cmh[p][t]);
+                    let fmh_sub = prev_2_info.map(|(p, t)| &fmh[p][t]);
+
+                    for mv in MoveGen::new_legal(board) {
+                        let is_ep = board.piece_on(mv.get_source()) == Some(Piece::Pawn) && board.en_passant() == Some(mv.get_dest());
+                        if board.piece_on(mv.get_dest()).is_some() || mv.get_promotion().is_some() || is_ep {
+                            continue;
+                        }
+                        if Some(mv) == self.hash_move 
+                            || Some(mv) == self.killer_1 
+                            || Some(mv) == self.killer_2 
+                            || Some(mv) == self.counter_move 
+                        {
+                            continue;
+                        }
+
+                        let curr_from = mv.get_source().to_index();
+                        let curr_to = mv.get_dest().to_index();
+                        let hist_score = history[curr_from][curr_to];
+                        
+                        let curr_p = board.piece_on(mv.get_source()).map(|p| p.to_index());
+                        let cmh_score = match (cmh_sub, curr_p) {
+                            (Some(sub), Some(cp)) => sub[cp][curr_to] as i32,
+                            _ => 0,
+                        };
+                        let fmh_score = match (fmh_sub, curr_p) {
+                            (Some(sub), Some(cp)) => sub[cp][curr_to] as i32,
+                            _ => 0,
+                        };
+
+                        let gives_check = *board.make_move_new(mv).checkers() != BitBoard(0);
+                        let check_bonus = if gives_check { 1_000_000 } else { 0 };
+
+                        let score = check_bonus + 2 * hist_score + 2 * cmh_score + fmh_score;
+                        if self.move_count < 128 {
+                            self.moves[self.move_count] = ScoredMove::new(mv, score);
+                            self.move_count += 1;
+                        }
+                    }
+
+                    self.stage = MovePickerStage::Quiets;
+                }
+
+                MovePickerStage::Quiets => {
+                    if self.move_idx < self.move_count {
+                        let mv = self.pick_best();
+                        return Some(mv);
+                    }
+                    self.stage = MovePickerStage::BadCaptures;
+                }
+
+                MovePickerStage::BadCaptures => {
+                    if self.bad_idx < self.bad_count {
+                        let mv = self.bad_captures[self.bad_idx];
+                        self.bad_idx += 1;
+                        return Some(mv);
+                    }
+                    self.stage = MovePickerStage::Done;
+                }
+
+                MovePickerStage::Done => return None,
+            }
         }
     }
-}
-
-#[inline]
-pub fn get_counter_move(board: &Board, mv: ChessMove) -> Option<ChessMove> {
-    let piece = board.piece_on(mv.get_dest())?;
-    let piece_idx = piece.to_index();
-    let to_sq = mv.get_dest().to_index();
-    
-    COUNTER_MOVES.with(|counter_moves| {
-        counter_moves.borrow()[piece_idx][to_sq]
-    })
-}
-
-#[inline]
-pub fn clear_counter_moves() {
-    COUNTER_MOVES.with(|counter_moves| {
-        *counter_moves.borrow_mut() = [[None; 64]; 6];
-    });
 }
 
 #[inline]
@@ -504,368 +641,3 @@ pub fn continuation_bonus(depth: usize) -> i32 {
     (crate::engine::constants::CONTHIST_BONUS_S * d * d + crate::engine::constants::CONTHIST_BONUS_C * d)
         .min(crate::engine::constants::CONTHIST_MAX_BONUS)
 }
-
-#[inline]
-pub fn update_single_conthist(
-    table: &mut ContinuationHistoryTable,
-    prev_piece: Piece,
-    prev_to: Square,
-    curr_piece: Piece,
-    curr_to: Square,
-    bonus: i32,
-) {
-    let entry = &mut table[prev_piece.to_index()][prev_to.to_index()][curr_piece.to_index()][curr_to.to_index()];
-    let current = *entry as i32;
-    let updated = current + bonus - (current * bonus.abs()) / crate::engine::constants::CONTHIST_GRAVITY;
-    *entry = updated as i16;
-}
-
-#[allow(dead_code)]
-#[inline(always)]
-pub fn get_cmh_score_direct(
-    cmh: &ContinuationHistoryTable,
-    prev_info: Option<(usize, usize)>,
-    curr_piece: Option<Piece>,
-    curr_dest: Square,
-) -> i32 {
-    match (prev_info, curr_piece) {
-        (Some((prev_p, prev_t)), Some(cp)) => {
-            cmh[prev_p][prev_t][cp.to_index()][curr_dest.to_index()] as i32
-        }
-        _ => 0,
-    }
-}
-
-#[allow(dead_code)]
-#[inline(always)]
-pub fn get_fmh_score_direct(
-    fmh: &ContinuationHistoryTable,
-    prev_2_info: Option<(usize, usize)>,
-    curr_piece: Option<Piece>,
-    curr_dest: Square,
-) -> i32 {
-    match (prev_2_info, curr_piece) {
-        (Some((p2_p, p2_t)), Some(cp)) => {
-            fmh[p2_p][p2_t][cp.to_index()][curr_dest.to_index()] as i32
-        }
-        _ => 0,
-    }
-}
-
-#[allow(dead_code)]
-#[inline]
-pub fn get_cmh_score(
-    board: &Board,
-    previous_move: Option<ChessMove>,
-    curr_move: ChessMove,
-) -> i32 {
-    if let Some(prev_mv) = previous_move {
-        if let Some(prev_piece) = board.piece_on(prev_mv.get_dest()) {
-            if let Some(curr_piece) = board.piece_on(curr_move.get_source()) {
-                let prev_p = prev_piece.to_index();
-                let prev_t = prev_mv.get_dest().to_index();
-                let curr_p = curr_piece.to_index();
-                let curr_t = curr_move.get_dest().to_index();
-                return CMH_TABLE.with(|cmh| {
-                    cmh.borrow()[prev_p][prev_t][curr_p][curr_t] as i32
-                });
-            }
-        }
-    }
-    0
-}
-
-#[allow(dead_code)]
-#[inline]
-pub fn update_cmh(
-    board: &Board,
-    previous_move: Option<ChessMove>,
-    curr_move: ChessMove,
-    bonus: i32,
-) {
-    if let Some(prev_mv) = previous_move {
-        if let Some(prev_piece) = board.piece_on(prev_mv.get_dest()) {
-            if let Some(curr_piece) = board.piece_on(curr_move.get_source()) {
-                CMH_TABLE.with(|cmh| {
-                    update_single_conthist(
-                        &mut cmh.borrow_mut(),
-                        prev_piece,
-                        prev_mv.get_dest(),
-                        curr_piece,
-                        curr_move.get_dest(),
-                        bonus,
-                    );
-                });
-            }
-        }
-    }
-}
-
-#[inline]
-pub fn clear_cmh_table() {
-    CMH_TABLE.with(|cmh| {
-        *cmh.borrow_mut() = Box::new([[[[0; 64]; 6]; 64]; 6]);
-    });
-}
-
-#[allow(dead_code)]
-#[inline]
-pub fn get_fmh_score(
-    board: &Board,
-    prev_2_move: Option<ChessMove>,
-    curr_move: ChessMove,
-) -> i32 {
-    if let Some(prev_mv) = prev_2_move {
-        if let Some(prev_piece) = board.piece_on(prev_mv.get_dest()) {
-            if let Some(curr_piece) = board.piece_on(curr_move.get_source()) {
-                let prev_p = prev_piece.to_index();
-                let prev_t = prev_mv.get_dest().to_index();
-                let curr_p = curr_piece.to_index();
-                let curr_t = curr_move.get_dest().to_index();
-                return FMH_TABLE.with(|fmh| {
-                    fmh.borrow()[prev_p][prev_t][curr_p][curr_t] as i32
-                });
-            }
-        }
-    }
-    0
-}
-
-#[allow(dead_code)]
-#[inline]
-pub fn update_fmh(
-    board: &Board,
-    prev_2_move: Option<ChessMove>,
-    curr_move: ChessMove,
-    bonus: i32,
-) {
-    if let Some(prev_mv) = prev_2_move {
-        if let Some(prev_piece) = board.piece_on(prev_mv.get_dest()) {
-            if let Some(curr_piece) = board.piece_on(curr_move.get_source()) {
-                FMH_TABLE.with(|fmh| {
-                    update_single_conthist(
-                        &mut fmh.borrow_mut(),
-                        prev_piece,
-                        prev_mv.get_dest(),
-                        curr_piece,
-                        curr_move.get_dest(),
-                        bonus,
-                    );
-                });
-            }
-        }
-    }
-}
-
-#[inline]
-pub fn clear_fmh_table() {
-    FMH_TABLE.with(|fmh| {
-        *fmh.borrow_mut() = Box::new([[[[0; 64]; 6]; 64]; 6]);
-    });
-}
-
-#[inline]
-pub fn update_conthist_batch(
-    table: &mut ContinuationHistoryTable,
-    board: &Board,
-    prev_move: Option<ChessMove>,
-    cutoff_mv: ChessMove,
-    failed_moves: &[ScoredMove],
-    bonus: i32,
-) {
-    if let Some(prev_mv) = prev_move {
-        if let Some(prev_piece) = board.piece_on(prev_mv.get_dest()) {
-            let prev_dest = prev_mv.get_dest();
-            let malus = -bonus;
-
-            // Reward cutoff move
-            if let Some(curr_piece) = board.piece_on(cutoff_mv.get_source()) {
-                update_single_conthist(
-                    table,
-                    prev_piece,
-                    prev_dest,
-                    curr_piece,
-                    cutoff_mv.get_dest(),
-                    bonus,
-                );
-            }
-
-            // Penalize prior quiet moves that failed to produce a cutoff
-            for scored_mv in failed_moves {
-                let prev_mv_quiet = scored_mv.mv;
-                if board.piece_on(prev_mv_quiet.get_dest()).is_none() && prev_mv_quiet.get_promotion().is_none() {
-                    if let Some(curr_piece) = board.piece_on(prev_mv_quiet.get_source()) {
-                        update_single_conthist(
-                            table,
-                            prev_piece,
-                            prev_dest,
-                            curr_piece,
-                            prev_mv_quiet.get_dest(),
-                            malus,
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[allow(dead_code)]
-#[inline]
-pub fn update_capture_history(mv: ChessMove, board: &Board, depth: usize, failed_quiets: bool) {
-    if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
-        if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
-            let attacker_idx = attacker_piece.to_index();
-            let victim_idx = captured_piece.to_index();
-            let to_sq = mv.get_dest().to_index();
-            
-            let bonus = if failed_quiets {
-                (depth * depth + depth * 2) as i32
-            } else {
-                (depth * depth) as i32
-            };
-            
-            CAPTURE_HISTORY.with(|ch| {
-                let mut ch = ch.borrow_mut();
-                ch[attacker_idx][victim_idx][to_sq] += bonus;
-                
-                if ch[attacker_idx][victim_idx][to_sq] > 16000 {
-                    ch[attacker_idx][victim_idx][to_sq] = 16000;
-                }
-            });
-        }
-    }
-}
-
-#[allow(dead_code)]
-#[inline]
-pub fn penalize_capture_history(mv: ChessMove, board: &Board, depth: usize) {
-    if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
-        if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
-            let attacker_idx = attacker_piece.to_index();
-            let victim_idx = captured_piece.to_index();
-            let to_sq = mv.get_dest().to_index();
-            
-            let penalty = (depth * depth / 2) as i32;
-            
-            CAPTURE_HISTORY.with(|ch| {
-                let mut ch = ch.borrow_mut();
-                ch[attacker_idx][victim_idx][to_sq] -= penalty;
-                
-                if ch[attacker_idx][victim_idx][to_sq] < -4000 {
-                    ch[attacker_idx][victim_idx][to_sq] = -4000;
-                }
-            });
-        }
-    }
-}
-
-#[inline]
-pub fn update_capture_history_batch(
-    board: &Board,
-    cutoff_mv: ChessMove,
-    failed_moves: &[ScoredMove],
-    depth: usize,
-) {
-    let bonus = if !failed_moves.is_empty() {
-        (depth * depth + depth * 2) as i32
-    } else {
-        (depth * depth) as i32
-    };
-    let penalty = (depth * depth / 2) as i32;
-
-    CAPTURE_HISTORY.with(|ch| {
-        let mut ch = ch.borrow_mut();
-        if let Some(captured_piece) = board.piece_on(cutoff_mv.get_dest()) {
-            if let Some(attacker_piece) = board.piece_on(cutoff_mv.get_source()) {
-                let att_idx = attacker_piece.to_index();
-                let vic_idx = captured_piece.to_index();
-                let to_sq = cutoff_mv.get_dest().to_index();
-                let val = &mut ch[att_idx][vic_idx][to_sq];
-                *val = (*val + bonus).min(16000);
-            }
-        }
-
-        for prev_scored_mv in failed_moves {
-            let prev_mv = prev_scored_mv.mv;
-            if board.piece_on(prev_mv.get_dest()).is_some() || prev_mv.get_promotion().is_some() {
-                if let Some(captured_piece) = board.piece_on(prev_mv.get_dest()) {
-                    if let Some(attacker_piece) = board.piece_on(prev_mv.get_source()) {
-                        let att_idx = attacker_piece.to_index();
-                        let vic_idx = captured_piece.to_index();
-                        let to_sq = prev_mv.get_dest().to_index();
-                        let val = &mut ch[att_idx][vic_idx][to_sq];
-                        *val = (*val - penalty).max(-4000);
-                    }
-                }
-            }
-        }
-    });
-}
-
-#[allow(dead_code)]
-#[inline]
-pub fn get_capture_history_score(mv: ChessMove, board: &Board) -> i32 {
-    if let Some(captured_piece) = board.piece_on(mv.get_dest()) {
-        if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
-            let attacker_idx = attacker_piece.to_index();
-            let victim_idx = captured_piece.to_index();
-            let to_sq = mv.get_dest().to_index();
-            
-            return CAPTURE_HISTORY.with(|ch| {
-                ch.borrow()[attacker_idx][victim_idx][to_sq]
-            });
-        }
-    }
-    0
-}
-
-#[inline]
-pub fn clear_capture_history() {
-    CAPTURE_HISTORY.with(|ch| {
-        *ch.borrow_mut() = [[[0; 64]; 6]; 6];
-    });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chess::MoveGen;
-
-    #[test]
-    fn test_continuation_bonus() {
-        let bonus_1 = continuation_bonus(1);
-        let bonus_4 = continuation_bonus(4);
-        assert!(bonus_1 > 0);
-        assert!(bonus_4 > bonus_1);
-        assert!(bonus_4 <= crate::engine::constants::CONTHIST_MAX_BONUS);
-    }
-
-    #[test]
-    fn test_update_single_conthist() {
-        let mut table = Box::new([[[[0i16; 64]; 6]; 64]; 6]);
-        let prev_sq = unsafe { Square::new(12) };
-        let curr_sq = unsafe { Square::new(28) };
-        update_single_conthist(&mut table, Piece::Knight, prev_sq, Piece::Bishop, curr_sq, 150);
-        let val = table[Piece::Knight.to_index()][prev_sq.to_index()][Piece::Bishop.to_index()][curr_sq.to_index()];
-        assert_eq!(val, 150);
-
-        // Test malus
-        update_single_conthist(&mut table, Piece::Knight, prev_sq, Piece::Bishop, curr_sq, -50);
-        let val2 = table[Piece::Knight.to_index()][prev_sq.to_index()][Piece::Bishop.to_index()][curr_sq.to_index()];
-        assert!(val2 < 150);
-    }
-
-    #[test]
-    fn test_order_moves_with_conthist() {
-        let board = Board::default();
-        let mut moves: Vec<ScoredMove> = MoveGen::new_legal(&board).map(|m| ScoredMove::new(m, 0)).collect();
-        let prev_mv = ChessMove::new(unsafe { Square::new(12) }, unsafe { Square::new(28) }, None);
-        order_moves(&board, &mut moves, None, 1, Some(prev_mv), None);
-        assert!(!moves.is_empty());
-        for i in 1..moves.len() {
-            assert!(moves[i - 1].score >= moves[i].score);
-        }
-    }
-}
-

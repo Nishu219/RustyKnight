@@ -1,12 +1,7 @@
 use crate::engine::constants::*;
 use crate::engine::move_ordering::PIECE_VALUES;
-use chess::{BitBoard, Board, Color, MoveGen, Piece, Rank, File, Square};
+use chess::{BitBoard, Board, Color, Piece, Rank, File, Square};
 use lazy_static::lazy_static;
-use std::cell::RefCell;
-
-thread_local! {
-    pub static PAWN_HASH_TABLE: RefCell<PawnHashTable> = RefCell::new(PawnHashTable::new(16));
-}
 
 // Piece-Square Tables
 // Indexed as [piece_index][phase_index][square_index]
@@ -185,6 +180,110 @@ pub fn piece_to_index(piece: Piece) -> usize {
         Piece::Queen => QUEEN_INDEX,
         Piece::King => KING_INDEX,
     }
+}
+
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+pub struct Score {
+    pub mg: i32,
+    pub eg: i32,
+}
+
+impl Score {
+    #[inline(always)]
+    pub fn interpolate(self, phase: i32) -> i32 {
+        ((self.mg * phase) + (self.eg * (24 - phase))) / 24
+    }
+}
+
+impl std::ops::Add for Score {
+    type Output = Self;
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        Score {
+            mg: self.mg + rhs.mg,
+            eg: self.eg + rhs.eg,
+        }
+    }
+}
+
+impl std::ops::Sub for Score {
+    type Output = Self;
+    #[inline(always)]
+    fn sub(self, rhs: Self) -> Self {
+        Score {
+            mg: self.mg - rhs.mg,
+            eg: self.eg - rhs.eg,
+        }
+    }
+}
+
+impl std::ops::AddAssign for Score {
+    #[inline(always)]
+    fn add_assign(&mut self, rhs: Self) {
+        self.mg += rhs.mg;
+        self.eg += rhs.eg;
+    }
+}
+
+impl std::ops::SubAssign for Score {
+    #[inline(always)]
+    fn sub_assign(&mut self, rhs: Self) {
+        self.mg -= rhs.mg;
+        self.eg -= rhs.eg;
+    }
+}
+
+const fn generate_psqt() -> [[[Score; 64]; 2]; 6] {
+    let mut psqt = [[[Score { mg: 0, eg: 0 }; 64]; 2]; 6];
+    let mut piece_idx = 0;
+    while piece_idx < 6 {
+        let piece_val = PIECE_VALUES[piece_idx];
+        let mut sq = 0;
+        while sq < 64 {
+            // White (color 0): table is flipped vertically (sq ^ 56)
+            let w_pst_idx = sq ^ 56;
+            let w_mg = piece_val + PST[piece_idx][0][w_pst_idx];
+            let w_eg = piece_val + PST[piece_idx][1][w_pst_idx];
+            psqt[piece_idx][0][sq] = Score { mg: w_mg, eg: w_eg };
+
+            // Black (color 1): table is accessed directly (sq)
+            let b_pst_idx = sq;
+            let b_mg = piece_val + PST[piece_idx][0][b_pst_idx];
+            let b_eg = piece_val + PST[piece_idx][1][b_pst_idx];
+            psqt[piece_idx][1][sq] = Score { mg: b_mg, eg: b_eg };
+
+            sq += 1;
+        }
+        piece_idx += 1;
+    }
+    psqt
+}
+
+pub static PSQT: [[[Score; 64]; 2]; 6] = generate_psqt();
+pub const PHASE_VALUES: [i32; 6] = [0, 1, 1, 2, 4, 0];
+
+pub fn compute_psqt_and_phase(board: &Board) -> (Score, i32) {
+    let mut score = Score { mg: 0, eg: 0 };
+    let mut phase = 0;
+
+    for piece in chess::ALL_PIECES {
+        let piece_idx = piece_to_index(piece);
+        let white_pieces = board.pieces(piece) & board.color_combined(Color::White);
+        for sq in white_pieces {
+            score += PSQT[piece_idx][0][sq.to_index()];
+        }
+        let black_pieces = board.pieces(piece) & board.color_combined(Color::Black);
+        for sq in black_pieces {
+            score -= PSQT[piece_idx][1][sq.to_index()];
+        }
+    }
+
+    phase += (board.pieces(Piece::Knight).popcnt() + board.pieces(Piece::Bishop).popcnt()) as i32;
+    phase += (board.pieces(Piece::Rook).popcnt() * 2) as i32;
+    phase += (board.pieces(Piece::Queen).popcnt() * 4) as i32;
+    phase = phase.min(24);
+
+    (score, phase)
 }
 
 lazy_static! {
@@ -465,21 +564,14 @@ impl<T: Copy + Default> CacheTable<T> {
     }
 }
 
-pub type PawnHashTable = CacheTable<i32>;
-
-pub fn compute_material_eval(board: &Board) -> i32 {
-    let white = board.color_combined(Color::White);
-    let black = board.color_combined(Color::Black);
-
-    let mut material = 0;
-    material += ((board.pieces(Piece::Pawn) & white).popcnt() as i32 - (board.pieces(Piece::Pawn) & black).popcnt() as i32) * PIECE_VALUES[0];
-    material += ((board.pieces(Piece::Knight) & white).popcnt() as i32 - (board.pieces(Piece::Knight) & black).popcnt() as i32) * PIECE_VALUES[1];
-    material += ((board.pieces(Piece::Bishop) & white).popcnt() as i32 - (board.pieces(Piece::Bishop) & black).popcnt() as i32) * PIECE_VALUES[2];
-    material += ((board.pieces(Piece::Rook) & white).popcnt() as i32 - (board.pieces(Piece::Rook) & black).popcnt() as i32) * PIECE_VALUES[3];
-    material += ((board.pieces(Piece::Queen) & white).popcnt() as i32 - (board.pieces(Piece::Queen) & black).popcnt() as i32) * PIECE_VALUES[4];
-    material += ((board.pieces(Piece::King) & white).popcnt() as i32 - (board.pieces(Piece::King) & black).popcnt() as i32) * PIECE_VALUES[5];
-    material
+#[derive(Copy, Clone, Default)]
+pub struct PawnEntry {
+    pub score: i32,
+    pub white_passed: u64,
+    pub black_passed: u64,
 }
+
+pub type PawnHashTable = CacheTable<PawnEntry>;
 
 fn evaluate_rooks(board: &Board) -> i32 {
     let mut score = 0;
@@ -528,158 +620,173 @@ fn evaluate_rooks(board: &Board) -> i32 {
 
     score
 }
-fn evaluate_pawns(board: &Board, pawn_hash: u64, white_pawn_attacks: BitBoard, black_pawn_attacks: BitBoard) -> i32 {
-    let cached_score = PAWN_HASH_TABLE.with(|cache| {
-        cache.borrow().lookup(pawn_hash)
-    });
-    if let Some(score) = cached_score {
-        return score;
-    }
+fn evaluate_pawns(
+    board: &Board,
+    pawn_hash: u64,
+    white_pawn_attacks: BitBoard,
+    black_pawn_attacks: BitBoard,
+    pawn_table: &mut PawnHashTable,
+) -> i32 {
+    let entry = pawn_table.lookup(pawn_hash);
 
-    let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
-    let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+    let entry = match entry {
+        Some(e) => e,
+        None => {
+            let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+            let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
 
-    let white_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::White))
-        .into_iter()
-        .next()
-        .unwrap();
-    let black_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::Black))
-        .into_iter()
-        .next()
-        .unwrap();
-    
-    let white_king_idx = white_king_sq.to_index();
-    let black_king_idx = black_king_sq.to_index();
+            let mut score = 0;
+            let mut white_passed = 0u64;
+            let mut black_passed = 0u64;
 
-    let mut score = 0;
-    
-    let not_a_file = BitBoard::new(0xFEFEFEFEFEFEFEFE);
-    let not_h_file = BitBoard::new(0x7F7F7F7F7F7F7F7F);
-    
-    let white_pawn_support = BitBoard::new(((white_pawns & not_a_file).0 >> 9) | 
-                                           ((white_pawns & not_h_file).0 >> 7));
-    let black_pawn_support = BitBoard::new(((black_pawns & not_a_file).0 << 7) | 
-                                           ((black_pawns & not_h_file).0 << 9));
+            let not_a_file = BitBoard::new(0xFEFEFEFEFEFEFEFE);
+            let not_h_file = BitBoard::new(0x7F7F7F7F7F7F7F7F);
 
-    let mut white_file_counts = [0u8; 8];
-    let mut black_file_counts = [0u8; 8];
+            let white_pawn_support = BitBoard::new(((white_pawns & not_a_file).0 >> 9) | 
+                                                   ((white_pawns & not_h_file).0 >> 7));
+            let black_pawn_support = BitBoard::new(((black_pawns & not_a_file).0 << 7) | 
+                                                   ((black_pawns & not_h_file).0 << 9));
 
-    for square in white_pawns {
-        white_file_counts[square.get_file().to_index()] += 1;
-    }
-    for square in black_pawns {
-        black_file_counts[square.get_file().to_index()] += 1;
-    }
+            let mut white_file_counts = [0u8; 8];
+            let mut black_file_counts = [0u8; 8];
 
-    // Doubled and isolated pawn penalties
-    for file_idx in 0..8 {
-        let w_count = white_file_counts[file_idx];
-        let b_count = black_file_counts[file_idx];
-        
-        if w_count >= 2 {
-            score -= 15 * (w_count - 1) as i32;
-        }
-        if b_count >= 2 {
-            score += 15 * (b_count - 1) as i32;
-        }
-        
-        if w_count > 0 {
-            let has_adjacent = (file_idx > 0 && white_file_counts[file_idx - 1] > 0) ||
-                               (file_idx < 7 && white_file_counts[file_idx + 1] > 0);
-            if !has_adjacent {
-                score -= 12;
+            for square in white_pawns {
+                white_file_counts[square.get_file().to_index()] += 1;
             }
-        }
-        if b_count > 0 {
-            let has_adjacent = (file_idx > 0 && black_file_counts[file_idx - 1] > 0) ||
-                               (file_idx < 7 && black_file_counts[file_idx + 1] > 0);
-            if !has_adjacent {
-                score += 12;
+            for square in black_pawns {
+                black_file_counts[square.get_file().to_index()] += 1;
             }
-        }
-    }
 
-    // White pawns
-    for square in white_pawns {
-        let sq_idx = square.to_index();
-        let rank = square.get_rank().to_index();
-        let sq_bb = BitBoard::from_square(square);
+            // Doubled and isolated pawn penalties
+            for file_idx in 0..8 {
+                let w_count = white_file_counts[file_idx];
+                let b_count = black_file_counts[file_idx];
 
-        // Passed pawn
-        if (WHITE_PASSED_MASKS[sq_idx] & black_pawns).0 == 0 {
-            score += [0, 5, 10, 20, 35, 55, 80, 0][rank];
-            
-            let friendly_dist = CHEBYSHEV_DISTANCE[white_king_idx][sq_idx];
-            let enemy_dist = CHEBYSHEV_DISTANCE[black_king_idx][sq_idx];
-            let rank_factor = [0, 1, 2, 3, 4, 5, 6, 0][rank];
-            
-            score += (enemy_dist - 2) * rank_factor;
-            score -= (friendly_dist - 1) * rank_factor;
-        }
-        
-        // Phalanx pawn
-        if (PHALANX_SQUARES[sq_idx] & white_pawns).0 != 0 {
-            score += WHITE_PHALANX_BONUS[rank];
-        }
-        
-        // Connected / Backward pawn
-        if (WHITE_PAWN_SUPPORT_SQUARES[sq_idx] & white_pawns).0 != 0 {
-            score += 3;
-        } else {
-            if (sq_bb & white_pawn_support).0 == 0 {
-                let push_sq = WHITE_PAWN_PUSHES[sq_idx];
-                if push_sq.0 != 0 {
-                    if (push_sq & (black_pawns | black_pawn_attacks)).0 != 0 {
-                        score -= 8;
+                if w_count >= 2 {
+                    score -= 15 * (w_count - 1) as i32;
+                }
+                if b_count >= 2 {
+                    score += 15 * (b_count - 1) as i32;
+                }
+
+                if w_count > 0 {
+                    let has_adjacent = (file_idx > 0 && white_file_counts[file_idx - 1] > 0) ||
+                                       (file_idx < 7 && white_file_counts[file_idx + 1] > 0);
+                    if !has_adjacent {
+                        score -= 12;
+                    }
+                }
+                if b_count > 0 {
+                    let has_adjacent = (file_idx > 0 && black_file_counts[file_idx - 1] > 0) ||
+                                       (file_idx < 7 && black_file_counts[file_idx + 1] > 0);
+                    if !has_adjacent {
+                        score -= 12;
                     }
                 }
             }
-        }
-    }
 
-    // Black pawns
-    for square in black_pawns {
-        let sq_idx = square.to_index();
-        let rank = square.get_rank().to_index();
-        let sq_bb = BitBoard::from_square(square);
+            // White pawns
+            for square in white_pawns {
+                let sq_idx = square.to_index();
+                let rank = square.get_rank().to_index();
+                let sq_bb = BitBoard::from_square(square);
 
-        // Passed pawn
-        if (BLACK_PASSED_MASKS[sq_idx] & white_pawns).0 == 0 {
-            score -= [0, 80, 55, 35, 20, 10, 5, 0][rank];
-            
-            let friendly_dist = CHEBYSHEV_DISTANCE[black_king_idx][sq_idx];
-            let enemy_dist = CHEBYSHEV_DISTANCE[white_king_idx][sq_idx];
-            let rank_factor = [0, 6, 5, 4, 3, 2, 1, 0][rank];
-            
-            score -= (enemy_dist - 2) * rank_factor;
-            score += (friendly_dist - 1) * rank_factor;
-        }
-        
-        // Phalanx pawn
-        if (PHALANX_SQUARES[sq_idx] & black_pawns).0 != 0 {
-            score -= BLACK_PHALANX_BONUS[rank];
-        }
-        
-        // Connected / Backward pawn
-        if (BLACK_PAWN_SUPPORT_SQUARES[sq_idx] & black_pawns).0 != 0 {
-            score -= 3;
-        } else {
-            if (sq_bb & black_pawn_support).0 == 0 {
-                let push_sq = BLACK_PAWN_PUSHES[sq_idx];
-                if push_sq.0 != 0 {
-                    if (push_sq & (white_pawns | white_pawn_attacks)).0 != 0 {
-                        score += 8;
+                // Passed pawn
+                if (WHITE_PASSED_MASKS[sq_idx] & black_pawns).0 == 0 {
+                    score += [0, 5, 10, 20, 35, 55, 80, 0][rank];
+                    white_passed |= sq_bb.0;
+                }
+
+                // Phalanx pawn
+                if (PHALANX_SQUARES[sq_idx] & white_pawns).0 != 0 {
+                    score += WHITE_PHALANX_BONUS[rank];
+                }
+
+                // Connected / Backward pawn
+                if (WHITE_PAWN_SUPPORT_SQUARES[sq_idx] & white_pawns).0 != 0 {
+                    score += 3;
+                } else {
+                    if (sq_bb & white_pawn_support).0 == 0 {
+                        let push_sq = WHITE_PAWN_PUSHES[sq_idx];
+                        if push_sq.0 != 0 {
+                            if (push_sq & (black_pawns | black_pawn_attacks)).0 != 0 {
+                                score -= 8;
+                            }
+                        }
                     }
                 }
             }
+
+            // Black pawns
+            for square in black_pawns {
+                let sq_idx = square.to_index();
+                let rank = square.get_rank().to_index();
+                let sq_bb = BitBoard::from_square(square);
+
+                // Passed pawn
+                if (BLACK_PASSED_MASKS[sq_idx] & white_pawns).0 == 0 {
+                    score -= [0, 80, 55, 35, 20, 10, 5, 0][rank];
+                    black_passed |= sq_bb.0;
+                }
+
+                // Phalanx pawn
+                if (PHALANX_SQUARES[sq_idx] & black_pawns).0 != 0 {
+                    score -= BLACK_PHALANX_BONUS[rank];
+                }
+
+                // Connected / Backward pawn
+                if (BLACK_PAWN_SUPPORT_SQUARES[sq_idx] & black_pawns).0 != 0 {
+                    score -= 3;
+                } else {
+                    if (sq_bb & black_pawn_support).0 == 0 {
+                        let push_sq = BLACK_PAWN_PUSHES[sq_idx];
+                        if push_sq.0 != 0 {
+                            if (push_sq & (white_pawns | white_pawn_attacks)).0 != 0 {
+                                score -= 8;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let new_entry = PawnEntry {
+                score,
+                white_passed,
+                black_passed,
+            };
+
+            pawn_table.store(pawn_hash, new_entry);
+
+            new_entry
         }
+    };
+
+    let white_king_idx = board.king_square(Color::White).to_index();
+    let black_king_idx = board.king_square(Color::Black).to_index();
+
+    let mut total_score = entry.score;
+
+    for square in BitBoard(entry.white_passed) {
+        let sq_idx = square.to_index();
+        let rank = square.get_rank().to_index();
+        let friendly_dist = CHEBYSHEV_DISTANCE[white_king_idx][sq_idx];
+        let enemy_dist = CHEBYSHEV_DISTANCE[black_king_idx][sq_idx];
+        let rank_factor = [0, 1, 2, 3, 4, 5, 6, 0][rank];
+        total_score += (enemy_dist - 2) * rank_factor;
+        total_score -= (friendly_dist - 1) * rank_factor;
     }
 
-    PAWN_HASH_TABLE.with(|cache| {
-        cache.borrow_mut().store(pawn_hash, score);
-    });
+    for square in BitBoard(entry.black_passed) {
+        let sq_idx = square.to_index();
+        let rank = square.get_rank().to_index();
+        let friendly_dist = CHEBYSHEV_DISTANCE[black_king_idx][sq_idx];
+        let enemy_dist = CHEBYSHEV_DISTANCE[white_king_idx][sq_idx];
+        let rank_factor = [0, 6, 5, 4, 3, 2, 1, 0][rank];
+        total_score -= (enemy_dist - 2) * rank_factor;
+        total_score += (friendly_dist - 1) * rank_factor;
+    }
 
-    score
+    total_score
 }
 fn compute_tropism_score(
     piece_bb: BitBoard,
@@ -721,14 +828,8 @@ fn compute_tropism_score(
 }
 
 fn evaluate_king_tropism(board: &Board, phase: i32) -> i32 {
-    let white_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::White))
-        .into_iter()
-        .next()
-        .unwrap();
-    let black_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::Black))
-        .into_iter()
-        .next()
-        .unwrap();
+    let white_king_sq = board.king_square(Color::White);
+    let black_king_sq = board.king_square(Color::Black);
 
     let white_king_file = white_king_sq.get_file().to_index() as i32;
     let white_king_rank = white_king_sq.get_rank().to_index() as i32;
@@ -771,8 +872,8 @@ fn evaluate_pieces_and_king_safety(
     let black_pieces = board.color_combined(Color::Black);
     let occupied = *board.combined();
 
-    let white_king_sq = (board.pieces(Piece::King) & white_pieces).into_iter().next().unwrap();
-    let black_king_sq = (board.pieces(Piece::King) & black_pieces).into_iter().next().unwrap();
+    let white_king_sq = board.king_square(Color::White);
+    let black_king_sq = board.king_square(Color::Black);
     
     let white_king_ring = get_king_ring(white_king_sq);
     let black_king_ring = get_king_ring(black_king_sq);
@@ -947,14 +1048,8 @@ fn evaluate_space(board: &Board, phase: i32) -> i32 {
 fn evaluate_king_pawn_shield(board: &Board, phase: i32) -> i32 {
     let mut score = 0;
 
-    let white_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::White))
-        .into_iter()
-        .next()
-        .unwrap();
-    let black_king_sq = (board.pieces(Piece::King) & board.color_combined(Color::Black))
-        .into_iter()
-        .next()
-        .unwrap();
+    let white_king_sq = board.king_square(Color::White);
+    let black_king_sq = board.king_square(Color::Black);
 
     if phase < 12 {
         return 0;
@@ -1121,99 +1216,90 @@ fn evaluate_pawn_threats(
     
     score
 }
-pub fn evaluate(board: &Board, material: i32, pawn_hash: u64, contempt: i32, beta: Option<i32>) -> i32 {
-    let in_check = *board.checkers() != BitBoard(0);
-    let has_legal_moves = MoveGen::new_legal(board).next().is_some();
-
-    if !has_legal_moves {
-        return if in_check {
-            if board.side_to_move() == Color::White { -30000 } else { 30000 }
-        } else {
-            if board.side_to_move() == Color::White { contempt } else { -contempt }
-        };
-    }
-    let mut score = material;
-    let mut phase = 0;
-    phase += (board.pieces(Piece::Knight).popcnt() + board.pieces(Piece::Bishop).popcnt()) as i32;
-    phase += (board.pieces(Piece::Rook).popcnt() * 2) as i32;
-    phase += (board.pieces(Piece::Queen).popcnt() * 4) as i32;
-    phase = phase.min(24);
-
-    let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
-    let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
-    
-    // PST Evaluation
-    let white_pieces = board.color_combined(Color::White);
-    let black_pieces = board.color_combined(Color::Black);
-
-    for piece in chess::ALL_PIECES {
-        let piece_idx = piece_to_index(piece);
-        
-        // White pieces
-        for square in board.pieces(piece) & white_pieces {
-            let sq_idx = square.to_index();
-            let pst_index = sq_idx ^ 56;
-            let mg_pst = PST[piece_idx][0][pst_index];
-            let eg_pst = PST[piece_idx][1][pst_index];
-            score += ((mg_pst * phase) + (eg_pst * (24 - phase))) / 24;
-
-            // Bonus for minor pieces with a pawn directly in front and penalty for undefended knight
-            if (piece == Piece::Knight || piece == Piece::Bishop) && square.get_rank().to_index() < 7 {
-                let ahead_sq = unsafe { Square::new((sq_idx + 8) as u8) };
-                if (white_pawns & BitBoard::from_square(ahead_sq)) != BitBoard::new(0) {
-                    score += 15;
-                }
+fn evaluate_minor_piece_outposts(
+    board: &Board,
+    phase: i32,
+    white_pawns: BitBoard,
+    black_pawns: BitBoard,
+) -> i32 {
+    let mut score = 0;
+    let white_minors = (board.pieces(Piece::Knight) | board.pieces(Piece::Bishop)) & board.color_combined(Color::White);
+    for sq in white_minors {
+        let sq_idx = sq.to_index();
+        if sq.get_rank().to_index() < 7 {
+            let ahead_sq = unsafe { Square::new((sq_idx + 8) as u8) };
+            if (white_pawns & BitBoard::from_square(ahead_sq)) != BitBoard::new(0) {
+                score += 15;
+            }
+            if board.piece_on(sq) == Some(Piece::Knight) {
                 let defended = (WHITE_PAWN_SUPPORT_SQUARES[sq_idx] & white_pawns) != BitBoard::new(0);
-                if !defended && piece == Piece::Knight {
+                if !defended {
                     score -= ((13 * phase) + (8 * (24 - phase))) / 24;
                 }
             }
         }
-        
-        // Black pieces
-        for square in board.pieces(piece) & black_pieces {
-            let sq_idx = square.to_index();
-            let pst_index = sq_idx;
-            let mg_pst = PST[piece_idx][0][pst_index];
-            let eg_pst = PST[piece_idx][1][pst_index];
-            score -= ((mg_pst * phase) + (eg_pst * (24 - phase))) / 24;
+    }
 
-            if (piece == Piece::Knight || piece == Piece::Bishop) && square.get_rank().to_index() > 0 {
-                let ahead_sq = unsafe { Square::new((sq_idx - 8) as u8) };
-                if (black_pawns & BitBoard::from_square(ahead_sq)) != BitBoard::new(0) {
-                    score -= 15;
-                }
+    let black_minors = (board.pieces(Piece::Knight) | board.pieces(Piece::Bishop)) & board.color_combined(Color::Black);
+    for sq in black_minors {
+        let sq_idx = sq.to_index();
+        if sq.get_rank().to_index() > 0 {
+            let ahead_sq = unsafe { Square::new((sq_idx - 8) as u8) };
+            if (black_pawns & BitBoard::from_square(ahead_sq)) != BitBoard::new(0) {
+                score -= 15;
+            }
+            if board.piece_on(sq) == Some(Piece::Knight) {
                 let defended = (BLACK_PAWN_SUPPORT_SQUARES[sq_idx] & black_pawns) != BitBoard::new(0);
-                if !defended && piece == Piece::Knight {
+                if !defended {
                     score += ((13 * phase) + (8 * (24 - phase))) / 24;
                 }
             }
         }
     }
 
+    score
+}
+
+pub fn evaluate(
+    board: &Board,
+    psqt: Score,
+    phase: i32,
+    pawn_hash: u64,
+    _contempt: i32,
+    _alpha: i32,
+    beta: i32,
+    pawn_table: &mut PawnHashTable,
+) -> i32 {
+    let mut score = psqt.interpolate(phase);
+
+    let white_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+    let black_pawns = board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+
+    // Minor piece outposts (pawn in front and undefended knight)
+    score += evaluate_minor_piece_outposts(board, phase, white_pawns, black_pawns);
+
+    // Safe Lazy Evaluation: fail-high against beta only (identical to 145d5d1)
     let current_lazy_score = if board.side_to_move() == Color::White { score } else { -score };
-    
-    if let Some(beta_val) = beta {
-        if current_lazy_score - LAZY_EVAL_MARGIN >= beta_val {
-            return current_lazy_score;
-        }
+    if current_lazy_score - LAZY_EVAL_MARGIN >= beta {
+        return current_lazy_score;
     }
-    
+
     let not_a_file = BitBoard::new(0xFEFEFEFEFEFEFEFE);
     let not_h_file = BitBoard::new(0x7F7F7F7F7F7F7F7F);
     let white_pawn_attacks = BitBoard::new(((white_pawns & not_a_file).0 << 7) | 
                                            ((white_pawns & not_h_file).0 << 9));
     let black_pawn_attacks = BitBoard::new(((black_pawns & not_a_file).0 >> 9) | 
                                            ((black_pawns & not_h_file).0 >> 7));
-    
+
     score += evaluate_rooks(board);
-    score += evaluate_pawns(board, pawn_hash, white_pawn_attacks, black_pawn_attacks);
+    score += evaluate_pawns(board, pawn_hash, white_pawn_attacks, black_pawn_attacks, pawn_table);
     score += evaluate_king_tropism(board, phase);
     score += evaluate_king_pawn_shield(board, phase);
     score += evaluate_pieces_and_king_safety(board, phase, white_pawn_attacks, black_pawn_attacks);
     score += evaluate_space(board, phase);
     score += evaluate_bad_bishops(board, phase);
-    score += evaluate_pawn_threats(board, white_pawn_attacks, black_pawn_attacks, phase);   
+    score += evaluate_pawn_threats(board, white_pawn_attacks, black_pawn_attacks, phase);
+
     if (board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() >= 2 {
         score += ((25 * phase) + (40 * (24 - phase))) / 24;
     }
@@ -1221,12 +1307,9 @@ pub fn evaluate(board: &Board, material: i32, pawn_hash: u64, contempt: i32, bet
         score -= ((25 * phase) + (40 * (24 - phase))) / 24;
     }
 
-    let final_score = if board.side_to_move() == Color::White {
+    if board.side_to_move() == Color::White {
         score
     } else {
         -score
-    };
-    final_score
+    }
 }
-
-
